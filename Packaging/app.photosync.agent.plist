@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.photosync.agent</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>app.photosync.mac</string>
+    </array>
+    <key>BundleProgram</key>
+    <string>Contents/Helpers/StorageSyncAgent</string>
+    <!-- Quitting StorageSync is meant to stop syncing entirely, so the agent must
+         be allowed to exit and stay stopped. KeepAlive would respawn it within
+         ThrottleInterval, and RunAtLoad would start it at login without the
+         manager. It is started on demand instead: launchd holds the Mach port
+         below and spawns the agent the moment StorageSync connects, which happens
+         on every launch, so a crash is also recovered within one poll. -->
+    <key>MachServices</key>
+    <dict>
+        <key>app.photosync.agent</key>
+        <true/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
