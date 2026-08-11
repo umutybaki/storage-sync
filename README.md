@@ -70,6 +70,26 @@ Signing with an Apple-issued identity is optional for local use and required onl
 STORAGESYNC_SIGNING_IDENTITY="Apple Development: Your Name (TEAMID)" ./scripts/package-app.sh
 ```
 
+## Installing a downloaded beta
+
+Beta archives on the [Releases page](https://github.com/umutybaki/storage-sync/releases) are ad-hoc signed, not notarized, because the project has no Apple Developer ID yet. macOS quarantines them on download and will refuse the first open with a message about being unable to verify the developer.
+
+Unzip, move `StorageSync.app` to `/Applications`, then either open **System Settings → Privacy & Security**, scroll to the blocked-app notice and choose **Open Anyway** — or clear the quarantine flag directly:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/StorageSync.app
+```
+
+The right-click → Open shortcut that used to work no longer does on macOS 15 and later. Verify the download against the SHA-256 published in the release notes before doing either.
+
+Build a beta archive yourself with:
+
+```sh
+./scripts/package-beta.sh
+```
+
+It stages the bundle out of iCloud Drive before archiving — a bundle zipped directly from `.build` carries file-provider extended attributes that invalidate its signature — verifies the signature on the clean copy, and prints the archive path and SHA-256.
+
 ## Direct release
 
 For public distribution, first store notarization credentials in the Keychain:
