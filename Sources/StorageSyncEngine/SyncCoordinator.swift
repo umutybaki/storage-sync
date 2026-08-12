@@ -39,6 +39,9 @@ private actor TransferProgressAccumulator {
 private struct ManifestScanResult: Sendable {
     var generation: Int64
     var invalidRemoteKeyCount: Int
+    /// Entries this side could not offer for reconciliation because another
+    /// entry on the same side folds to the same canonical path.
+    var caseCollisionCount: Int
     var entryCount: Int
     /// Summed while scanning. The manifest keeps each entry as an encoded
     /// payload, so there is no column for SQLite to total afterwards.
@@ -148,9 +151,25 @@ public actor SyncCoordinator {
         }
     }
 
-    public func stop() {
-        for task in jobTasks.values { task.cancel() }
+    /// Cancels every running job and waits for the cancelled work to unwind.
+    ///
+    /// The waiting is the point. A download can be one statement short of
+    /// `savePart` with its 32 MiB already written and synchronized, and an
+    /// upload can be between `uploadPart` returning and the checkpoint that
+    /// records the part S3 has already acknowledged. Returning before those
+    /// finish loses the checkpoint and re-transfers the part on the next run,
+    /// which on a multi-day sync is exactly the progress this app promises to
+    /// keep. `pause`, `remove` and `prepareForVolumeUnmount` all await their
+    /// cancelled tasks for the same reason; only quitting did not.
+    ///
+    /// The tasks are collected and the dictionary emptied before the first
+    /// suspension, so nothing can observe the actor still holding jobs it has
+    /// already cancelled.
+    public func stop() async {
+        let runningTasks = Array(jobTasks.values)
         jobTasks.removeAll()
+        for task in runningTasks { task.cancel() }
+        for task in runningTasks { await task.value }
     }
 
     public func jobs() async throws -> [SyncJob] {
@@ -720,6 +739,7 @@ public actor SyncCoordinator {
             )
             let (localScan, remoteScan) = try await (localTask, remoteTask)
             var invalidRemoteKeyCount = remoteScan.invalidRemoteKeyCount
+            let caseCollisionCount = localScan.caseCollisionCount + remoteScan.caseCollisionCount
             try await repository.pruneBaselinesAbsentFromManifest(
                 jobID: job.id,
                 side: job.direction == .upload ? .local : .remote,
@@ -753,7 +773,13 @@ public actor SyncCoordinator {
                 adoptions.reserveCapacity(rows.count)
                 obsoleteTransferPaths.reserveCapacity(rows.count)
                 for row in rows {
-                    if row.hasRemotePathCollision {
+                    // An ambiguous pairing on either side is skipped whole,
+                    // and any transfer already queued for it is discarded
+                    // before it can run. A local collision is the dangerous
+                    // one: without this, the second of two files that differ
+                    // only by capitalization is handed the first one's remote
+                    // key below and uploaded over its contents.
+                    if row.hasRemotePathCollision || row.hasLocalPathCollision {
                         obsoleteTransferPaths.append(row.relativePath)
                         continue
                     }
@@ -890,13 +916,21 @@ public actor SyncCoordinator {
                 snapshot.recentlyQueuedPaths = nil
                 snapshot.recentlyQueuedAt = nil
             }
-            snapshot.message = queue.count == 0
-                ? "All caught up"
+            // Files that fail outright are counted rather than allowed to stop
+            // the run, so the headline has to be rebuilt as they accumulate.
+            var failedFileCount = 0
+            var jobWideAttention = false
+            let transferHeadline = queue.count == 0
+                ? nil
                 : "Syncing \(queue.count) item\(queue.count == 1 ? "" : "s")…"
-            if invalidRemoteKeyCount > 0 {
-                let skipped = "Skipped \(invalidRemoteKeyCount) unsafe object path\(invalidRemoteKeyCount == 1 ? "" : "s")"
-                snapshot.message = queue.count == 0 ? skipped : snapshot.message + " \(skipped)."
+            func cycleNotices() -> [String] {
+                Self.notices(
+                    invalidRemoteKeys: invalidRemoteKeyCount,
+                    caseCollisions: caseCollisionCount,
+                    failedFiles: failedFileCount
+                )
             }
+            snapshot.message = Self.message(headline: transferHeadline, notices: cycleNotices())
             try await repository.setSnapshot(snapshot)
 
             let executor = TransferExecutor(
@@ -1001,11 +1035,35 @@ public actor SyncCoordinator {
                             shouldStopScheduling = true
                             group.cancelAll()
                         case .attention(let blocker, let message):
-                            snapshot.phase = .attention
-                            if let blocker { snapshot.blockers.insert(blocker) }
-                            snapshot.message = message
-                            shouldStopScheduling = true
-                            group.cancelAll()
+                            if let blocker {
+                                // A blocker names something the whole job runs
+                                // on — keys that no longer work fail every
+                                // remaining file — so there is nothing to gain
+                                // from starting the rest of the batch.
+                                jobWideAttention = true
+                                snapshot.phase = .attention
+                                snapshot.blockers.insert(blocker)
+                                snapshot.message = message
+                                shouldStopScheduling = true
+                                group.cancelAll()
+                            } else {
+                                // Without a blocker this is one file that will
+                                // never transfer: larger than S3 or the
+                                // destination filesystem allows, unplannable
+                                // parts, a response that cannot be read. It is
+                                // already `.failed` in the database and so is
+                                // out of this cycle's queue. Cancelling the
+                                // group here parked the entire job on it: one
+                                // oversized file stopped a healthy 5,000-file
+                                // library for good, and Sync Now only re-hit
+                                // the same file. The rest of the batch runs;
+                                // the count is reported with the cycle.
+                                failedFileCount += 1
+                                snapshot.message = Self.message(
+                                    headline: transferHeadline,
+                                    notices: cycleNotices()
+                                )
+                            }
                         case .superseded(let reliableNotice):
                             if let reliableNotice {
                                 snapshot.sourceChangeNotice = "\(attempt.transfer.relativePath): \(reliableNotice) The latest version will be checked automatically."
@@ -1030,7 +1088,10 @@ public actor SyncCoordinator {
                 }
             }
 
-            if snapshot.phase != .attention, snapshot.blockers.isEmpty {
+            // Only a job-wide stop keeps its own snapshot. A cycle that merely
+            // left some files behind still owes the user the inventory and the
+            // storage balance for everything that did move.
+            if !jobWideAttention, snapshot.blockers.isEmpty {
                 let remaining = try await repository.activeTransferSummary(jobID: job.id)
                 let rescanPending = pendingWakeJobIDs.contains(job.id)
                 snapshot.phase = rescanPending ? .scanning : .watching
@@ -1056,17 +1117,28 @@ public actor SyncCoordinator {
                     snapshot.recentlyQueuedPaths = nil
                     snapshot.recentlyQueuedAt = nil
                     snapshot.lastSuccessfulSync = Date()
-                    snapshot.message = invalidRemoteKeyCount == 0
-                        ? "All caught up"
-                        : "Skipped \(invalidRemoteKeyCount) unsafe object path\(invalidRemoteKeyCount == 1 ? "" : "s")"
+                    snapshot.message = Self.message(headline: nil, notices: cycleNotices())
+                    // Nothing is queued to retry, so a file that failed will
+                    // not move again on its own. Saying "All caught up" in that
+                    // state would claim a destination copy that does not exist,
+                    // and the phase is what turns the count into something the
+                    // user is shown rather than something they have to notice.
+                    if failedFileCount > 0 { snapshot.phase = .attention }
                 } else {
-                    snapshot.message = "Waiting to retry \(remaining.count) item\(remaining.count == 1 ? "" : "s")…"
+                    snapshot.message = Self.message(
+                        headline: "Waiting to retry \(remaining.count) item\(remaining.count == 1 ? "" : "s")…",
+                        notices: cycleNotices()
+                    )
                 }
                 try await repository.setSnapshot(snapshot)
             }
+            // Deliberately not `snapshot.phase`: a cycle that ends in attention
+            // over individual files is still a healthy job that should keep its
+            // timers and be woken normally. Only a job-wide blocker parks it
+            // until the user fixes something.
             return CycleOutcome(
                 direction: direction,
-                disposition: snapshot.phase == .attention ? .attention : .normal
+                disposition: jobWideAttention ? .attention : .normal
             )
         } catch is CancellationError {
             return CycleOutcome(direction: direction, disposition: .normal)
@@ -1136,6 +1208,46 @@ public actor SyncCoordinator {
         }
     }
 
+    /// What a cycle left behind, in the order the user can act on it. These are
+    /// independent of each other — an unsafe key says nothing about an
+    /// ambiguous name or a file that was refused — so reporting only the first
+    /// would hide the others until that one was fixed.
+    private static func notices(
+        invalidRemoteKeys: Int,
+        caseCollisions: Int,
+        failedFiles: Int
+    ) -> [String] {
+        var sentences: [String] = []
+        if invalidRemoteKeys > 0 {
+            sentences.append(
+                "Skipped \(invalidRemoteKeys) unsafe object path\(invalidRemoteKeys == 1 ? "" : "s")"
+            )
+        }
+        if caseCollisions > 0 {
+            sentences.append(
+                caseCollisions == 1
+                    ? "Skipped 1 name that differs only by capitalization"
+                    : "Skipped \(caseCollisions) names that differ only by capitalization"
+            )
+        }
+        if failedFiles > 0 {
+            sentences.append(
+                "\(failedFiles) file\(failedFiles == 1 ? "" : "s") could not be copied"
+            )
+        }
+        return sentences
+    }
+
+    /// A headline of `nil` means there is nothing in flight to describe, so the
+    /// notices become the whole message rather than a footnote to "All caught
+    /// up" — which would otherwise read as a contradiction of itself.
+    private static func message(headline: String?, notices: [String]) -> String {
+        guard !notices.isEmpty else { return headline ?? "All caught up" }
+        let sentences = notices.joined(separator: ". ")
+        guard let headline else { return sentences }
+        return "\(headline) \(sentences)."
+    }
+
     private func stageLocalManifest(
         jobID: SyncJobID,
         root: URL,
@@ -1170,9 +1282,24 @@ public actor SyncCoordinator {
             )
         }
         try await repository.finishManifestScan(jobID: jobID, side: .local, generation: generation)
+        // The mirror of the remote-side check. Both halves are needed: a
+        // volume whose case-sensitivity probe returned nothing is treated as
+        // case-insensitive, and on a volume that is in fact case-sensitive
+        // that assumption pairs two different local files with one remote key
+        // and lets them overwrite each other's contents there, cycle after
+        // cycle. Neither of the pair is reconciled until the names differ by
+        // more than capitalization.
+        var caseCollisionCount = 0
+        if !caseSensitive {
+            caseCollisionCount = try await repository.recordCaseCollidingLocalManifestEntries(
+                jobID: jobID,
+                generation: generation
+            )
+        }
         return ManifestScanResult(
             generation: generation,
             invalidRemoteKeyCount: 0,
+            caseCollisionCount: caseCollisionCount,
             entryCount: entryCount,
             byteCount: byteCount
         )
@@ -1248,8 +1375,9 @@ public actor SyncCoordinator {
             )
         }
         try await repository.finishManifestScan(jobID: jobID, side: .remote, generation: generation)
+        var caseCollisionCount = 0
         if !caseSensitive {
-            invalidRemoteKeyCount += try await repository.removeCaseCollidingRemoteManifestEntries(
+            caseCollisionCount = try await repository.removeCaseCollidingRemoteManifestEntries(
                 jobID: jobID,
                 generation: generation
             )
@@ -1257,6 +1385,7 @@ public actor SyncCoordinator {
         return ManifestScanResult(
             generation: generation,
             invalidRemoteKeyCount: invalidRemoteKeyCount,
+            caseCollisionCount: caseCollisionCount,
             entryCount: entryCount,
             byteCount: byteCount
         )
