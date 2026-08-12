@@ -17,7 +17,22 @@ final class AppModel: ObservableObject {
     /// The last complete storage balance seen for each sync, so an unplugged
     /// drive dims the picture instead of erasing it. See `BalanceReading`.
     @Published private(set) var lastKnownBalances: [SyncJobID: StorageBalance] = [:]
-    @Published var selection: ManagerSelection?
+    @Published var selection: ManagerSelection? {
+        didSet {
+            guard selection != oldValue else { return }
+            selectionActivityTask?.cancel()
+            transferActivityItems = []
+            transferActivityCounts = TransferActivityCounts()
+            transferActivityRevision = 0
+            transferActivityNextCursor = nil
+            transferActivityError = nil
+            requiredActivityRevision = 0
+            guard case .sync(let jobID) = selection else { return }
+            selectionActivityTask = Task { [weak self] in
+                await self?.loadTransferActivity(jobID: jobID, reset: true)
+            }
+        }
+    }
     @Published var isCreatingSync = false
     @Published var credentialsJob: SyncJob?
     @Published var credentialEditor: CredentialEditorRequest?
@@ -27,36 +42,77 @@ final class AppModel: ObservableObject {
     @Published var jobPendingRemoval: SyncJob?
     @Published var errorMessage: String?
     @Published private(set) var isAgentAvailable = false
+    /// Manual checks acknowledge the click locally instead of waiting for the
+    /// agent's committed scanning snapshot. A fast no-change scan can otherwise
+    /// begin and finish between UI renders, making a working button look inert.
+    @Published private var manualCheckJobIDs: Set<SyncJobID> = []
     /// True only while macOS is holding the agent behind an explicit user
     /// approval in Login Items. Nothing else the app can do will start it.
     @Published private(set) var needsLoginItemsApproval = false
+    @Published private(set) var transferActivityItems: [TransferActivityItem] = []
+    @Published private(set) var transferActivityCounts = TransferActivityCounts()
+    @Published private(set) var transferActivityRevision: Int64 = 0
+    @Published private(set) var transferActivityNextCursor: TransferActivityCursor?
+    @Published private(set) var isLoadingTransferActivity = false
+    @Published private(set) var transferActivityError: String?
+    @Published var transferActivityFilter: TransferActivityFilter = .all {
+        didSet {
+            guard transferActivityFilter != oldValue,
+                  case .sync(let jobID) = selection else { return }
+            selectionActivityTask?.cancel()
+            selectionActivityTask = Task { [weak self] in
+                await self?.loadTransferActivity(jobID: jobID, reset: true)
+            }
+        }
+    }
 
     private let client = AgentClient()
-    /// Not published: it changes on every poll and only matters once a reading
-    /// has gone stale, so republishing the whole model for it would be waste.
+    /// Not published: it changes on every state read and only matters once a
+    /// reading has gone stale, so republishing the whole model for it is waste.
     private var balancesSeenAt: [SyncJobID: Date] = [:]
-    private var pollingTask: Task<Void, Never>?
+    private var initialRefreshTask: Task<Void, Never>?
     private var registrationTask: Task<Void, Never>?
+    private var selectionActivityTask: Task<Void, Never>?
+    private var stateRefreshTask: Task<Void, Never>?
+    private var stateEventGeneration: UInt64 = 0
+    private var requiredActivityRevision: Int64 = 0
     /// When the agent first stopped answering, so a momentary gap is not
     /// mistaken for a broken registration.
     private var unreachableSince: Date?
 
     init() {
         ActiveAppModel.current = self
+        client.onTransferActivityChange { [weak self] jobID, revision in
+            Task { @MainActor [weak self] in
+                await self?.transferActivityDidChange(jobID: jobID, revision: revision)
+            }
+        }
+        client.onStateChange { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.scheduleStateRefresh()
+            }
+        }
+        client.onConnectionLost { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.markAgentUnavailable()
+            }
+        }
         registrationTask = Task { [weak self] in
             await self?.maintainBackgroundServices()
         }
-        pollingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refresh()
-                try? await Task.sleep(for: .seconds(1))
-            }
+        initialRefreshTask = Task { [weak self] in
+            await self?.refresh()
         }
     }
 
     deinit {
         registrationTask?.cancel()
-        pollingTask?.cancel()
+        initialRefreshTask?.cancel()
+        selectionActivityTask?.cancel()
+        stateRefreshTask?.cancel()
+        client.onTransferActivityChange(nil)
+        client.onStateChange(nil)
+        client.onConnectionLost(nil)
     }
 
     var overallStatus: OverallStatus {
@@ -95,15 +151,45 @@ final class AppModel: ObservableObject {
     }
 
     func snapshot(for jobID: SyncJobID) -> SyncSnapshot {
-        snapshots[jobID] ?? SyncSnapshot(jobID: jobID, phase: .idle, message: "Starting…")
+        var snapshot = snapshots[jobID]
+            ?? SyncSnapshot(jobID: jobID, phase: .idle, message: "Starting…")
+        if manualCheckJobIDs.contains(jobID) {
+            snapshot.isRescanPending = true
+            // During a transfer the click queues a bounded rescan; it must not
+            // replace the truthful "Syncing…" headline. A dormant job can show
+            // the scan immediately because no copy is already in progress.
+            if snapshot.phase != .transferring && snapshot.phase != .verifying {
+                snapshot.phase = .scanning
+                snapshot.blockers = []
+                snapshot.currentRelativePath = nil
+                snapshot.message = "Checking for changes…"
+            }
+        }
+        return snapshot
+    }
+
+    func isCheckingForChanges(_ jobID: SyncJobID) -> Bool {
+        manualCheckJobIDs.contains(jobID)
+            || snapshots[jobID]?.isRescanPending == true
+            || snapshots[jobID]?.phase == .scanning
+    }
+
+    /// Transfers may accept a bounded rescan request. Only a paused sync, an
+    /// active scan, or a request already acknowledged by the agent disables
+    /// the action, so a long backlog never leaves Sync Now permanently grey.
+    func canSyncNow(_ job: SyncJob) -> Bool {
+        guard !job.isPaused,
+              !manualCheckJobIDs.contains(job.id),
+              snapshots[job.id]?.isRescanPending != true else { return false }
+        return snapshots[job.id]?.phase != .scanning
     }
 
     func status(for job: SyncJob) -> SyncStatus {
         SyncStatus(job: job, snapshot: snapshot(for: job.id))
     }
 
-    /// The balance to draw for a sync: the live one when the last poll carried
-    /// the numbers, otherwise the last one that did.
+    /// The balance to draw for a sync: the live one when the latest agent event
+    /// carried the numbers, otherwise the last one that did.
     func balanceReading(for job: SyncJob) -> BalanceReading? {
         if let balance = StorageBalance(snapshot: snapshot(for: job.id), direction: job.direction) {
             return BalanceReading(balance: balance, isCurrent: true, asOf: balancesSeenAt[job.id])
@@ -114,6 +200,95 @@ final class AppModel: ObservableObject {
 
     func connection(for job: SyncJob) -> S3Connection? {
         connections[job.connectionID]
+    }
+
+    /// Selection and disclosure never start a sync scan. This reads only the
+    /// compact activity ledger, and subsequent reloads are caused solely by a
+    /// newer committed revision announced by the agent.
+    func loadTransferActivity(jobID: SyncJobID, reset: Bool) async {
+        guard case .sync(let selectedID) = selection, selectedID == jobID else { return }
+        if isLoadingTransferActivity && !reset { return }
+        isLoadingTransferActivity = true
+        if reset {
+            transferActivityError = nil
+        }
+        defer { isLoadingTransferActivity = false }
+
+        let cursor = reset ? nil : transferActivityNextCursor
+        do {
+            let page = try await client.perform(
+                .transferActivityPage,
+                payload: JSONEncoder().encode(
+                    TransferActivityPageRequest(
+                        jobID: jobID,
+                        filter: transferActivityFilter,
+                        cursor: cursor,
+                        limit: 150
+                    )
+                ),
+                response: TransferActivityPage.self
+            )
+            guard !Task.isCancelled,
+                  case .sync(let selectedID) = selection,
+                  selectedID == jobID else { return }
+
+            // A page from an older batch/revision can arrive after a push. It
+            // is never rendered, even briefly; ask for the committed revision
+            // the callback named instead.
+            if page.revision < requiredActivityRevision {
+                selectionActivityTask = Task { [weak self] in
+                    await self?.loadTransferActivity(jobID: jobID, reset: true)
+                }
+                return
+            }
+
+            if !reset, page.revision != transferActivityRevision {
+                selectionActivityTask = Task { [weak self] in
+                    await self?.loadTransferActivity(jobID: jobID, reset: true)
+                }
+                return
+            }
+
+            transferActivityRevision = page.revision
+            transferActivityCounts = page.counts
+            transferActivityNextCursor = page.nextCursor
+            transferActivityItems = reset
+                ? page.items
+                : Self.mergingActivityRows(transferActivityItems, page.items)
+            transferActivityError = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            guard case .sync(let selectedID) = selection, selectedID == jobID else { return }
+            transferActivityError = error.localizedDescription
+        }
+    }
+
+    func loadMoreTransferActivity() {
+        guard case .sync(let jobID) = selection,
+              transferActivityNextCursor != nil,
+              !isLoadingTransferActivity else { return }
+        selectionActivityTask = Task { [weak self] in
+            await self?.loadTransferActivity(jobID: jobID, reset: false)
+        }
+    }
+
+    private func transferActivityDidChange(jobID: SyncJobID, revision: Int64) async {
+        guard case .sync(let selectedID) = selection, selectedID == jobID else { return }
+        requiredActivityRevision = max(requiredActivityRevision, revision)
+        guard revision > transferActivityRevision else { return }
+        selectionActivityTask?.cancel()
+        selectionActivityTask = Task { [weak self] in
+            await self?.loadTransferActivity(jobID: jobID, reset: true)
+        }
+    }
+
+    private static func mergingActivityRows(
+        _ existing: [TransferActivityItem],
+        _ next: [TransferActivityItem]
+    ) -> [TransferActivityItem] {
+        let known = Set(existing.map(\.id))
+        return existing + next.filter { !known.contains($0.id) }
     }
 
     /// - Parameter credential: Which saved credentials the sheet should start
@@ -133,6 +308,30 @@ final class AppModel: ObservableObject {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    func canRevealInFinder(_ item: TransferActivityItem, for job: SyncJob) -> Bool {
+        guard let url = try? SafePath.resolve(
+            item.relativePath,
+            beneath: URL(fileURLWithPath: job.localRoot.fallbackPath)
+        ) else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    func revealInFinder(_ item: TransferActivityItem, for job: SyncJob) {
+        guard let url = try? SafePath.resolve(
+            item.relativePath,
+            beneath: URL(fileURLWithPath: job.localRoot.fallbackPath)
+        ), FileManager.default.fileExists(atPath: url.path) else {
+            errorMessage = "“\(item.relativePath)” isn’t available on this Mac right now."
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func copyRelativePath(_ path: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(path, forType: .string)
     }
 
     func refresh() async {
@@ -167,6 +366,32 @@ final class AppModel: ObservableObject {
             isAgentAvailable = false
             if unreachableSince == nil { unreachableSince = Date() }
         }
+    }
+
+    /// Coalesces bursts of committed snapshot updates (for example several
+    /// parallel files finishing together) without using a timer to discover
+    /// state. Every refresh is downstream of an actual agent event, and an
+    /// event that arrives during the read schedules one more authoritative
+    /// read before the task exits.
+    private func scheduleStateRefresh() {
+        stateEventGeneration &+= 1
+        guard stateRefreshTask == nil else { return }
+        stateRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let generation = self.stateEventGeneration
+                try? await Task.sleep(for: .milliseconds(80))
+                guard !Task.isCancelled else { break }
+                await self.refresh()
+                if generation == self.stateEventGeneration { break }
+            }
+            self.stateRefreshTask = nil
+        }
+    }
+
+    private func markAgentUnavailable() {
+        isAgentAvailable = false
+        if unreachableSince == nil { unreachableSince = Date() }
     }
 
     /// Keeps the sidebar pointing at something that still exists, without ever
@@ -311,7 +536,31 @@ final class AppModel: ObservableObject {
     }
 
     func syncNow(_ job: SyncJob) async {
-        await sendJobCommand(.syncNow, jobID: job.id)
+        guard canSyncNow(job) else { return }
+
+        manualCheckJobIDs.insert(job.id)
+        let clock = ContinuousClock()
+        let feedbackStartedAt = clock.now
+        defer { manualCheckJobIDs.remove(job.id) }
+
+        do {
+            try await client.perform(
+                .syncNow,
+                payload: JSONEncoder().encode(JobCommandPayload(jobID: job.id))
+            )
+
+            // Keep a successful acknowledgement visible long enough to be
+            // perceived even when there is nothing to copy. Longer scans stay
+            // visible through the real snapshot returned by the agent.
+            let minimumFeedback = Duration.milliseconds(800)
+            let elapsed = feedbackStartedAt.duration(to: clock.now)
+            if elapsed < minimumFeedback {
+                try? await Task.sleep(for: minimumFeedback - elapsed)
+            }
+            await refresh()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     func requestRemoval(of job: SyncJob) {
@@ -334,18 +583,20 @@ final class AppModel: ObservableObject {
     /// Stops the background agent so quitting StorageSync closes everything
     /// rather than leaving the engine running.
     ///
-    /// Polling and registration are cancelled *first*. Both would otherwise
+    /// Event refreshes and registration are cancelled *first*. Both would otherwise
     /// undo the shutdown: any request over XPC makes launchd start the agent
     /// again on demand, and the maintenance loop would re-register it.
     func shutdownAgentForQuit() async {
-        pollingTask?.cancel()
+        initialRefreshTask?.cancel()
+        stateRefreshTask?.cancel()
         registrationTask?.cancel()
-        pollingTask = nil
+        initialRefreshTask = nil
+        stateRefreshTask = nil
         registrationTask = nil
 
         let client = self.client
         // The command is sent even when the agent looks unreachable, because
-        // "unreachable" can just mean a slow poll while it is busy transferring,
+        // "unreachable" can just mean a slow request while it is busy transferring,
         // and leaving it running is the one outcome quitting must not produce.
         // The wait is shortened in that case so a genuinely absent agent does
         // not stall the quit.
@@ -535,6 +786,12 @@ final class AppModel: ObservableObject {
             guard !Task.isCancelled else { return }
 
             let unreachableFor = unreachableSince.map { Date().timeIntervalSince($0) } ?? 0
+            if !isAgentAvailable {
+                // There is no normal-state polling. This retry runs only after
+                // XPC is actually unavailable and is what reconnects to an
+                // agent that launchd has restarted.
+                await refresh()
+            }
             guard !isAgentAvailable, unreachableFor >= 30 else {
                 delay = .seconds(10)
                 continue
@@ -567,11 +824,12 @@ final class AppModel: ObservableObject {
                 UserDefaults.standard.set(stamp, forKey: Self.agentStampKey)
                 needsLoginItemsApproval = agent.status == .requiresApproval
                 // The cached connection was made to a service that launchd has
-                // now replaced, so let the next poll open a fresh one.
+                // now replaced, so the recovery read opens a fresh one.
                 client.invalidate()
                 // Give the replacement agent the full grace period before it is
                 // judged unreachable again.
                 unreachableSince = Date()
+                await refresh()
             } catch {
                 // A failure here is reported by the ordinary "background agent
                 // not running" status. An alert on every launch would be noise

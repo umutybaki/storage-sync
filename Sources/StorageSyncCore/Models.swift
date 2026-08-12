@@ -367,6 +367,144 @@ public struct TransferRecord: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+/// A compact, user-facing record of one transfer in the current sync batch.
+/// It deliberately excludes resumable implementation details such as upload
+/// IDs and partial-file paths, and remains after a successful queue row is
+/// removed so the UI can show what just finished.
+public struct TransferActivityItem: Codable, Hashable, Sendable, Identifiable {
+    public let id: TransferID
+    public let jobID: SyncJobID
+    public let batchID: UUID
+    public var relativePath: String
+    public var kind: TransferKind
+    public var status: TransferStatus
+    public var totalBytes: Int64
+    public var completedBytes: Int64
+    public var retryCount: Int
+    public var nextAttemptAt: Date?
+    public var lastError: String?
+    public let createdAt: Date
+    public var updatedAt: Date
+
+    public init(transfer: TransferRecord, batchID: UUID) {
+        id = transfer.id
+        jobID = transfer.jobID
+        self.batchID = batchID
+        relativePath = transfer.relativePath
+        kind = transfer.kind
+        status = transfer.status
+        totalBytes = transfer.totalBytes
+        completedBytes = transfer.completedBytes
+        retryCount = transfer.retryCount
+        nextAttemptAt = transfer.nextAttemptAt
+        lastError = transfer.lastError
+        createdAt = transfer.createdAt
+        updatedAt = transfer.updatedAt
+    }
+}
+
+public enum TransferActivityFilter: String, Codable, CaseIterable, Sendable {
+    case all
+    case active
+    case waiting
+    case completed
+    case issues
+}
+
+/// Keyset pagination remains stable without reading a full activity manifest.
+public struct TransferActivityCursor: Codable, Hashable, Sendable {
+    public var updatedAtMilliseconds: Int64
+    public var transferID: TransferID
+
+    public init(updatedAtMilliseconds: Int64, transferID: TransferID) {
+        self.updatedAtMilliseconds = updatedAtMilliseconds
+        self.transferID = transferID
+    }
+}
+
+public struct TransferActivityCounts: Codable, Hashable, Sendable {
+    public var all: Int
+    public var active: Int
+    public var waiting: Int
+    public var completed: Int
+    public var issues: Int
+
+    public init(all: Int = 0, active: Int = 0, waiting: Int = 0, completed: Int = 0, issues: Int = 0) {
+        self.all = all
+        self.active = active
+        self.waiting = waiting
+        self.completed = completed
+        self.issues = issues
+    }
+
+    public subscript(filter: TransferActivityFilter) -> Int {
+        switch filter {
+        case .all: all
+        case .active: active
+        case .waiting: waiting
+        case .completed: completed
+        case .issues: issues
+        }
+    }
+}
+
+public struct TransferActivityPageRequest: Codable, Hashable, Sendable {
+    public var jobID: SyncJobID
+    public var filter: TransferActivityFilter
+    public var cursor: TransferActivityCursor?
+    public var limit: Int
+
+    public init(
+        jobID: SyncJobID,
+        filter: TransferActivityFilter = .all,
+        cursor: TransferActivityCursor? = nil,
+        limit: Int = 150
+    ) {
+        self.jobID = jobID
+        self.filter = filter
+        self.cursor = cursor
+        self.limit = limit
+    }
+}
+
+public struct TransferActivityPage: Codable, Hashable, Sendable {
+    public var jobID: SyncJobID
+    public var batchID: UUID?
+    public var revision: Int64
+    public var items: [TransferActivityItem]
+    public var nextCursor: TransferActivityCursor?
+    public var counts: TransferActivityCounts
+
+    public init(
+        jobID: SyncJobID,
+        batchID: UUID?,
+        revision: Int64,
+        items: [TransferActivityItem],
+        nextCursor: TransferActivityCursor?,
+        counts: TransferActivityCounts
+    ) {
+        self.jobID = jobID
+        self.batchID = batchID
+        self.revision = revision
+        self.items = items
+        self.nextCursor = nextCursor
+        self.counts = counts
+    }
+}
+
+/// Published only after the SQLite transaction carrying the matching revision
+/// has committed. Consumers may therefore use it as a reload signal without
+/// ever observing a half-written queue transition.
+public struct TransferActivityUpdate: Hashable, Sendable {
+    public var jobID: SyncJobID
+    public var revision: Int64
+
+    public init(jobID: SyncJobID, revision: Int64) {
+        self.jobID = jobID
+        self.revision = revision
+    }
+}
+
 public struct TransferPart: Codable, Hashable, Sendable {
     public let transferID: TransferID
     public let number: Int
@@ -423,6 +561,18 @@ public struct SyncSnapshot: Codable, Hashable, Sendable {
     /// would count the same bytes twice; the coordinator folds the run's
     /// finished work in once, when the transfer loop ends.
     public var destinationBytesInPlace: Int64?
+    /// A filesystem event or explicit Sync Now request arrived while a cycle
+    /// was active. The engine finishes only the already-admitted transfer
+    /// batch before scanning again.
+    public var isRescanPending: Bool?
+    /// Work first discovered by the latest scan that added anything to the
+    /// durable queue. Optional additive fields keep old snapshots decodable.
+    public var recentlyQueuedCount: Int?
+    public var recentlyQueuedPaths: [String]?
+    public var recentlyQueuedAt: Date?
+    /// A secondary notice for a source mutation proved by content metadata.
+    /// Unstable filesystem identity alone never produces this user-facing text.
+    public var sourceChangeNotice: String?
 
     public init(
         jobID: SyncJobID,
@@ -439,7 +589,12 @@ public struct SyncSnapshot: Codable, Hashable, Sendable {
         destinationFilesFound: Int? = nil,
         filesAlreadyPresent: Int? = nil,
         sourceBytesFound: Int64? = nil,
-        destinationBytesInPlace: Int64? = nil
+        destinationBytesInPlace: Int64? = nil,
+        isRescanPending: Bool? = nil,
+        recentlyQueuedCount: Int? = nil,
+        recentlyQueuedPaths: [String]? = nil,
+        recentlyQueuedAt: Date? = nil,
+        sourceChangeNotice: String? = nil
     ) {
         self.jobID = jobID
         self.phase = phase
@@ -456,5 +611,10 @@ public struct SyncSnapshot: Codable, Hashable, Sendable {
         self.filesAlreadyPresent = filesAlreadyPresent
         self.sourceBytesFound = sourceBytesFound
         self.destinationBytesInPlace = destinationBytesInPlace
+        self.isRescanPending = isRescanPending
+        self.recentlyQueuedCount = recentlyQueuedCount
+        self.recentlyQueuedPaths = recentlyQueuedPaths
+        self.recentlyQueuedAt = recentlyQueuedAt
+        self.sourceChangeNotice = sourceChangeNotice
     }
 }

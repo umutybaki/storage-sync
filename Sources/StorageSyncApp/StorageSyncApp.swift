@@ -34,7 +34,7 @@ struct StorageSyncApplication: App {
                     Task { await model.syncNow(job) }
                 }
                 .keyboardShortcut("r")
-                .disabled(model.selectedJob == nil)
+                .disabled(model.selectedJob.map { !model.canSyncNow($0) } ?? true)
             }
             // There is no help book to open, so an entry that does nothing is
             // worse than no entry.

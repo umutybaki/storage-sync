@@ -41,6 +41,12 @@ final class AgentService: NSObject, StorageSyncAgentXPCProtocol, @unchecked Send
             return try JSONEncoder().encode(try await coordinator.jobs())
         case .connections:
             return try JSONEncoder().encode(try await coordinator.connections())
+        case .transferActivityPage:
+            let request = try JSONDecoder().decode(
+                TransferActivityPageRequest.self,
+                from: requiredPayload(command)
+            )
+            return try JSONEncoder().encode(try await coordinator.transferActivityPage(request))
         case .saveConnection:
             let connection = try JSONDecoder().decode(S3Connection.self, from: requiredPayload(command))
             try await coordinator.save(connection: connection)
@@ -87,7 +93,7 @@ final class AgentService: NSObject, StorageSyncAgentXPCProtocol, @unchecked Send
             return nil
         case .syncNow:
             let payload = try JSONDecoder().decode(JobCommandPayload.self, from: requiredPayload(command))
-            await coordinator.syncNow(jobID: payload.jobID)
+            try await coordinator.syncNow(jobID: payload.jobID)
             return nil
         case .shutdown:
             AgentLog.shared.log("Shutting down at the manager's request.")
@@ -117,6 +123,56 @@ final class AgentService: NSObject, StorageSyncAgentXPCProtocol, @unchecked Send
     }
 }
 
+private final class ActivityBroadcaster: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connections: [ObjectIdentifier: NSXPCConnection] = [:]
+
+    func add(_ connection: NSXPCConnection) {
+        lock.lock()
+        connections[ObjectIdentifier(connection)] = connection
+        lock.unlock()
+    }
+
+    func remove(_ identifier: ObjectIdentifier) {
+        lock.lock()
+        connections.removeValue(forKey: identifier)
+        lock.unlock()
+    }
+
+    func broadcast(_ update: TransferActivityUpdate) {
+        lock.lock()
+        let current = connections
+        lock.unlock()
+        for (identifier, connection) in current {
+            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ [weak self] _ in
+                self?.remove(identifier)
+            }) as? StorageSyncAgentClientXPCProtocol else {
+                remove(identifier)
+                continue
+            }
+            proxy.transferActivityDidChange(
+                jobID: update.jobID.description,
+                revision: update.revision
+            )
+        }
+    }
+
+    func broadcastStateChange() {
+        lock.lock()
+        let current = connections
+        lock.unlock()
+        for (identifier, connection) in current {
+            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ [weak self] _ in
+                self?.remove(identifier)
+            }) as? StorageSyncAgentClientXPCProtocol else {
+                remove(identifier)
+                continue
+            }
+            proxy.stateDidChange()
+        }
+    }
+}
+
 private final class ReplyBox: @unchecked Sendable {
     private let reply: (Data?, NSError?) -> Void
     init(_ reply: @escaping (Data?, NSError?) -> Void) { self.reply = reply }
@@ -126,6 +182,7 @@ private final class ReplyBox: @unchecked Sendable {
 final class AgentDelegate: NSObject, NSXPCListenerDelegate {
     private let service: AgentService
     private let peerValidator: XPCPeerValidator?
+    private let activityBroadcaster = ActivityBroadcaster()
 
     init(coordinator: SyncCoordinator) {
         service = AgentService(coordinator: coordinator)
@@ -145,8 +202,25 @@ final class AgentDelegate: NSObject, NSXPCListenerDelegate {
         }
         newConnection.exportedInterface = NSXPCInterface(with: StorageSyncAgentXPCProtocol.self)
         newConnection.exportedObject = service
+        newConnection.remoteObjectInterface = NSXPCInterface(with: StorageSyncAgentClientXPCProtocol.self)
+        let identifier = ObjectIdentifier(newConnection)
+        newConnection.invalidationHandler = { [weak broadcaster = activityBroadcaster] in
+            broadcaster?.remove(identifier)
+        }
+        newConnection.interruptionHandler = { [weak broadcaster = activityBroadcaster] in
+            broadcaster?.remove(identifier)
+        }
+        activityBroadcaster.add(newConnection)
         newConnection.resume()
         return true
+    }
+
+    func broadcast(_ update: TransferActivityUpdate) {
+        activityBroadcaster.broadcast(update)
+    }
+
+    func broadcastStateChange() {
+        activityBroadcaster.broadcastStateChange()
     }
 }
 
@@ -160,6 +234,20 @@ let delegate = AgentDelegate(coordinator: coordinator)
 let listener = NSXPCListener(machServiceName: AgentConstants.machServiceName)
 listener.delegate = delegate
 listener.resume()
+
+Task {
+    let updates = await repository.transferActivityUpdates()
+    for await update in updates {
+        delegate.broadcast(update)
+    }
+}
+
+Task {
+    let updates = await repository.stateUpdates()
+    for await _ in updates {
+        delegate.broadcastStateChange()
+    }
+}
 
 Task {
     do {
@@ -180,7 +268,6 @@ Task {
             _ = await coordinator.prepareForVolumeUnmount(at: volumeURL)
         case .mounted(let volumeURL), .unmounted(let volumeURL), .renamed(let volumeURL):
             try? await coordinator.finishVolumeChange(at: volumeURL)
-            try? await coordinator.wakeAll()
         }
     }
 }
@@ -206,8 +293,13 @@ if volumeUnmountApprover == nil {
 
 let networkMonitor = NetworkAvailabilityMonitor()
 Task {
-    for await _ in networkMonitor.updates() {
-        try? await coordinator.wakeAll()
+    var previous: NetworkAvailability?
+    for await availability in networkMonitor.updates() {
+        if case .unavailable = previous,
+           case .available = availability {
+            try? await coordinator.wakeAll()
+        }
+        previous = availability
     }
 }
 

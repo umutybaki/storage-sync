@@ -1,4 +1,5 @@
 import Foundation
+import StorageSyncCore
 import StorageSyncShared
 
 enum AgentClientError: Error, LocalizedError {
@@ -16,6 +17,21 @@ enum AgentClientError: Error, LocalizedError {
 final class AgentClient: @unchecked Sendable {
     private let lock = NSLock()
     private var connection: NSXPCConnection?
+    private let eventReceiver = AgentEventReceiver()
+
+    func onTransferActivityChange(
+        _ handler: (@Sendable (SyncJobID, Int64) -> Void)?
+    ) {
+        eventReceiver.setHandler(handler)
+    }
+
+    func onStateChange(_ handler: (@Sendable () -> Void)?) {
+        eventReceiver.setStateHandler(handler)
+    }
+
+    func onConnectionLost(_ handler: (@Sendable () -> Void)?) {
+        eventReceiver.setConnectionLostHandler(handler)
+    }
 
     func perform<Response: Decodable & Sendable>(
         _ kind: AgentCommandKind,
@@ -63,8 +79,10 @@ final class AgentClient: @unchecked Sendable {
         if let connection { return connection }
         let newConnection = NSXPCConnection(machServiceName: AgentConstants.machServiceName, options: [])
         newConnection.remoteObjectInterface = NSXPCInterface(with: StorageSyncAgentXPCProtocol.self)
-        newConnection.interruptionHandler = { [weak self] in self?.discardConnection() }
-        newConnection.invalidationHandler = { [weak self] in self?.discardConnection() }
+        newConnection.exportedInterface = NSXPCInterface(with: StorageSyncAgentClientXPCProtocol.self)
+        newConnection.exportedObject = eventReceiver
+        newConnection.interruptionHandler = { [weak self] in self?.connectionWasLost() }
+        newConnection.invalidationHandler = { [weak self] in self?.connectionWasLost() }
         newConnection.resume()
         connection = newConnection
         return newConnection
@@ -74,6 +92,58 @@ final class AgentClient: @unchecked Sendable {
         lock.lock()
         connection = nil
         lock.unlock()
+    }
+
+    private func connectionWasLost() {
+        discardConnection()
+        eventReceiver.connectionWasLost()
+    }
+}
+
+private final class AgentEventReceiver: NSObject, StorageSyncAgentClientXPCProtocol, @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable (SyncJobID, Int64) -> Void)?
+    private var stateHandler: (@Sendable () -> Void)?
+    private var connectionLostHandler: (@Sendable () -> Void)?
+
+    func setHandler(_ handler: (@Sendable (SyncJobID, Int64) -> Void)?) {
+        lock.lock()
+        self.handler = handler
+        lock.unlock()
+    }
+
+    func setStateHandler(_ handler: (@Sendable () -> Void)?) {
+        lock.lock()
+        stateHandler = handler
+        lock.unlock()
+    }
+
+    func setConnectionLostHandler(_ handler: (@Sendable () -> Void)?) {
+        lock.lock()
+        connectionLostHandler = handler
+        lock.unlock()
+    }
+
+    func transferActivityDidChange(jobID: String, revision: Int64) {
+        guard let rawValue = UUID(uuidString: jobID) else { return }
+        lock.lock()
+        let handler = handler
+        lock.unlock()
+        handler?(SyncJobID(rawValue: rawValue), revision)
+    }
+
+    func stateDidChange() {
+        lock.lock()
+        let handler = stateHandler
+        lock.unlock()
+        handler?()
+    }
+
+    func connectionWasLost() {
+        lock.lock()
+        let handler = connectionLostHandler
+        lock.unlock()
+        handler?()
     }
 }
 

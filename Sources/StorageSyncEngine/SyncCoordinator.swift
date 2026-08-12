@@ -110,7 +110,6 @@ public actor SyncCoordinator {
     private let scanRetryPolicy: RetryPolicy
     private let transferPermitPool: TransferPermitPool
     private var jobTasks: [SyncJobID: Task<Void, Never>] = [:]
-    private var watcherTasks: [SyncJobID: Task<Void, Never>] = [:]
     private var activeJobIDs: Set<SyncJobID> = []
     private var pendingWakeJobIDs: Set<SyncJobID> = []
     private var attentionJobIDs: Set<SyncJobID> = []
@@ -146,15 +145,12 @@ public actor SyncCoordinator {
                 continue
             }
             schedule(jobID: job.id, immediate: true)
-            await installWatcher(for: job, replace: false)
         }
     }
 
     public func stop() {
         for task in jobTasks.values { task.cancel() }
-        for task in watcherTasks.values { task.cancel() }
         jobTasks.removeAll()
-        watcherTasks.removeAll()
     }
 
     public func jobs() async throws -> [SyncJob] {
@@ -163,6 +159,12 @@ public actor SyncCoordinator {
 
     public func snapshots() async throws -> [SyncSnapshot] {
         try await repository.snapshots()
+    }
+
+    public func transferActivityPage(
+        _ request: TransferActivityPageRequest
+    ) async throws -> TransferActivityPage {
+        try await repository.transferActivityPage(request)
     }
 
     public func connections() async throws -> [S3Connection] {
@@ -204,7 +206,7 @@ public actor SyncCoordinator {
         try await repository.saveConnection(connection)
         for job in try await repository.jobs() where job.connectionID == connection.id && !job.isPaused {
             attentionJobIDs.remove(job.id)
-            requestRun(jobID: job.id, allowAttention: true)
+            await requestRun(jobID: job.id, allowAttention: true)
         }
     }
 
@@ -328,7 +330,7 @@ public actor SyncCoordinator {
         guard let dependents = try? await jobsUsing(credentialReference: credentialReference) else { return }
         for job in dependents where !job.isPaused {
             attentionJobIDs.remove(job.id)
-            requestRun(jobID: job.id, allowAttention: true)
+            await requestRun(jobID: job.id, allowAttention: true)
         }
     }
 
@@ -390,7 +392,6 @@ public actor SyncCoordinator {
         try await repository.saveJob(job)
         attentionJobIDs.remove(job.id)
         schedule(jobID: job.id, immediate: true)
-        await installWatcher(for: job, replace: true)
     }
 
     public func pause(jobID: SyncJobID) async throws {
@@ -401,7 +402,6 @@ public actor SyncCoordinator {
         let task = jobTasks.removeValue(forKey: jobID)
         task?.cancel()
         await task?.value
-        watcherTasks.removeValue(forKey: jobID)?.cancel()
         try await repository.setSnapshot(
             SyncSnapshot(jobID: jobID, phase: .paused, message: "Paused")
         )
@@ -415,7 +415,6 @@ public actor SyncCoordinator {
         pendingWakeJobIDs.remove(jobID)
         attentionJobIDs.remove(jobID)
         schedule(jobID: jobID, immediate: true)
-        await installWatcher(for: job, replace: true)
     }
 
     /// Removes StorageSync's configuration and resumable state for a job. This
@@ -433,9 +432,6 @@ public actor SyncCoordinator {
         let jobTask = jobTasks.removeValue(forKey: jobID)
         jobTask?.cancel()
         await jobTask?.value
-        let watcherTask = watcherTasks.removeValue(forKey: jobID)
-        watcherTask?.cancel()
-        await watcherTask?.value
         activeJobIDs.remove(jobID)
 
         let transfers = (try? await repository.activeTransfers(jobID: jobID)) ?? []
@@ -454,7 +450,6 @@ public actor SyncCoordinator {
             removingJobIDs.remove(jobID)
             if !job.isPaused {
                 schedule(jobID: jobID, immediate: true)
-                await installWatcher(for: job, replace: true)
             }
             throw error
         }
@@ -493,10 +488,16 @@ public actor SyncCoordinator {
         }
     }
 
-    public func syncNow(jobID: SyncJobID) async {
-        try? await repository.makeWaitingTransfersRunnable(jobID: jobID)
+    public func syncNow(jobID: SyncJobID) async throws {
+        guard let job = try await repository.job(id: jobID),
+              !job.isPaused,
+              !removingJobIDs.contains(jobID),
+              !unmountingJobIDs.contains(jobID) else { return }
+
+        try await repository.makeWaitingTransfersRunnable(jobID: jobID)
         attentionJobIDs.remove(jobID)
-        requestRun(jobID: jobID, allowAttention: true)
+
+        await requestRun(jobID: jobID, allowAttention: true)
     }
 
     public func wakeAll() async throws {
@@ -505,8 +506,7 @@ public actor SyncCoordinator {
             && !attentionJobIDs.contains(job.id)
             && !unmountingJobIDs.contains(job.id) {
             try await repository.makeWaitingTransfersRunnable(jobID: job.id)
-            requestRun(jobID: job.id)
-            await installWatcher(for: job, replace: true)
+            await requestRun(jobID: job.id)
         }
     }
 
@@ -526,20 +526,14 @@ public actor SyncCoordinator {
 
         unmountingJobIDs.formUnion(affectedJobs.map(\.id))
         var runningTasks: [Task<Void, Never>] = []
-        var watchers: [Task<Void, Never>] = []
         for job in affectedJobs {
             pendingWakeJobIDs.remove(job.id)
             if let task = jobTasks.removeValue(forKey: job.id) {
                 task.cancel()
                 runningTasks.append(task)
             }
-            if let watcher = watcherTasks.removeValue(forKey: job.id) {
-                watcher.cancel()
-                watchers.append(watcher)
-            }
         }
         for task in runningTasks { await task.value }
-        for watcher in watchers { await watcher.value }
 
         for job in affectedJobs {
             activeJobIDs.remove(job.id)
@@ -566,39 +560,30 @@ public actor SyncCoordinator {
             unmountingJobIDs.remove(job.id)
             guard !job.isPaused else { continue }
             try await repository.makeWaitingTransfersRunnable(jobID: job.id)
-            requestRun(jobID: job.id)
-            await installWatcher(for: job, replace: true)
+            await requestRun(jobID: job.id)
         }
     }
 
-    private func installWatcher(for job: SyncJob, replace: Bool) async {
-        guard !removingJobIDs.contains(job.id),
-              !unmountingJobIDs.contains(job.id) else { return }
-        if replace {
-            watcherTasks[job.id]?.cancel()
-            watcherTasks[job.id] = nil
-        } else if watcherTasks[job.id] != nil {
-            return
-        }
-        guard job.direction == .upload,
-              let access = try? await bookmarks.resolve(reference: job.localRoot.bookmarkReference) else { return }
-        let root = access.url
-        watcherTasks[job.id] = Task { [weak self] in
-            for await _ in FileSystemEventMonitor().updates(root: root) {
-                guard !Task.isCancelled else { return }
-                await self?.requestRun(jobID: job.id)
-            }
-            _ = access
-        }
-    }
-
-    private func requestRun(jobID: SyncJobID, allowAttention: Bool = false) {
+    private func requestRun(jobID: SyncJobID, allowAttention: Bool = false) async {
         guard !removingJobIDs.contains(jobID),
               !unmountingJobIDs.contains(jobID) else { return }
         guard allowAttention || !attentionJobIDs.contains(jobID) else { return }
         if activeJobIDs.contains(jobID) {
-            pendingWakeJobIDs.insert(jobID)
+            let isNewRequest = pendingWakeJobIDs.insert(jobID).inserted
+            if isNewRequest, var snapshot = try? await repository.snapshot(jobID: jobID) {
+                snapshot.isRescanPending = true
+                try? await repository.setSnapshot(snapshot)
+            }
         } else {
+            if var snapshot = try? await repository.snapshot(jobID: jobID) {
+                snapshot.phase = .scanning
+                snapshot.blockers = []
+                snapshot.currentRelativePath = nil
+                snapshot.isRescanPending = false
+                snapshot.sourceChangeNotice = nil
+                snapshot.message = "Checking for changes…"
+                try? await repository.setSnapshot(snapshot)
+            }
             schedule(jobID: jobID, immediate: true)
         }
     }
@@ -639,10 +624,15 @@ public actor SyncCoordinator {
                     transientFailureAttempt = 0
                     await self.clearAttention(jobID: jobID)
                 }
-                let pollSeconds: TimeInterval = outcome.direction == .download ? 5 * 60 : 30 * 60
-                let nextAttempt = try? await self.repository.nextWaitingAttempt(jobID: jobID)
-                let retrySeconds = nextAttempt.map { max(1, $0.timeIntervalSinceNow) }
-                let interval = Duration.seconds(min(pollSeconds, retrySeconds ?? pollSeconds))
+                // A caught-up or completed run stays parked until an explicit
+                // Sync Now or a real lifecycle/recovery event wakes it. The
+                // only timer retained here belongs to already-interrupted work
+                // whose durable retry time has arrived; it is not an inventory
+                // polling interval.
+                guard let nextAttempt = try? await self.repository.nextWaitingAttempt(jobID: jobID) else {
+                    return
+                }
+                let interval = Duration.seconds(max(1, nextAttempt.timeIntervalSinceNow))
                 do {
                     try await Task.sleep(for: interval)
                 } catch {
@@ -686,7 +676,20 @@ public actor SyncCoordinator {
                 throw CoordinatorError.missingConnection
             }
 
-            var snapshot = SyncSnapshot(jobID: jobID, phase: .scanning, message: "Checking for changes…")
+            let previousSnapshot = try await repository.snapshot(jobID: jobID)
+            // Completed activity belongs to one scan batch. A new scan clears
+            // it only after the prior resumable queue is empty; interrupted or
+            // restarted backlogs keep their exact batch and history.
+            _ = try await repository.beginTransferActivityBatchIfIdle(jobID: jobID)
+            var snapshot = SyncSnapshot(
+                jobID: jobID,
+                phase: .scanning,
+                message: "Checking for changes…",
+                isRescanPending: false,
+                recentlyQueuedCount: previousSnapshot?.recentlyQueuedCount,
+                recentlyQueuedPaths: previousSnapshot?.recentlyQueuedPaths,
+                recentlyQueuedAt: previousSnapshot?.recentlyQueuedAt
+            )
             try await repository.setSnapshot(snapshot)
             let access: ScopedURLAccess
             do {
@@ -727,6 +730,10 @@ public actor SyncCoordinator {
             var reconciliationCursor: String?
             var alreadyPresentCount = 0
             var supersededDestinationBytes: Int64 = 0
+            var newlyQueuedCount = 0
+            // A bounded sample makes detection visible without letting an
+            // initial multi-million-file pairing grow the snapshot in memory.
+            var recentlyQueuedPaths: [String] = []
             while true {
                 try Task.checkCancellation()
                 let rows = try await repository.reconciliationRows(
@@ -842,7 +849,12 @@ public actor SyncCoordinator {
                         )
                     }
                 }
-                try await repository.enqueueTransfersIfNeeded(plans, jobID: job.id)
+                let enqueuedPaths = try await repository.enqueueTransfersIfNeeded(plans, jobID: job.id)
+                newlyQueuedCount += enqueuedPaths.count
+                for path in enqueuedPaths {
+                    recentlyQueuedPaths.append(path)
+                    if recentlyQueuedPaths.count > 3 { recentlyQueuedPaths.removeFirst() }
+                }
                 reconciliationCursor = rows.last?.relativePath
                 if rows.count < reconciliationPageSize { break }
             }
@@ -868,6 +880,16 @@ public actor SyncCoordinator {
                 ? localScan.byteCount
                 : remoteScan.byteCount
             snapshot.destinationBytesInPlace = destinationBytesAtScan
+            snapshot.isRescanPending = pendingWakeJobIDs.contains(job.id)
+            if newlyQueuedCount > 0 {
+                snapshot.recentlyQueuedCount = newlyQueuedCount
+                snapshot.recentlyQueuedPaths = recentlyQueuedPaths
+                snapshot.recentlyQueuedAt = Date()
+            } else if queue.count == 0 {
+                snapshot.recentlyQueuedCount = nil
+                snapshot.recentlyQueuedPaths = nil
+                snapshot.recentlyQueuedAt = nil
+            }
             snapshot.message = queue.count == 0
                 ? "All caught up"
                 : "Syncing \(queue.count) item\(queue.count == 1 ? "" : "s")…"
@@ -890,6 +912,11 @@ public actor SyncCoordinator {
             var shouldStopScheduling = false
             while !shouldStopScheduling {
                 try Task.checkCancellation()
+                // A pending Sync Now or recovery request never cancels an
+                // admitted upload/download. It stops the next in-flight batch
+                // from being admitted, which bounds rescan latency without
+                // losing a part checkpoint.
+                if pendingWakeJobIDs.contains(job.id) { break }
                 let transfers = try await repository.runnableTransfers(
                     jobID: job.id,
                     limit: transferBatchSize
@@ -979,26 +1006,37 @@ public actor SyncCoordinator {
                             snapshot.message = message
                             shouldStopScheduling = true
                             group.cancelAll()
-                        case .superseded(let message):
-                            snapshot.message = message
+                        case .superseded(let reliableNotice):
+                            if let reliableNotice {
+                                snapshot.sourceChangeNotice = "\(attempt.transfer.relativePath): \(reliableNotice) The latest version will be checked automatically."
+                            }
                             // The source or destination changed after this scan.
                             // Reconcile the new version immediately instead of
                             // reporting success until the next polling interval.
                             pendingWakeJobIDs.insert(job.id)
                         }
                         snapshot.bytesCompleted = await progressAccumulator.totalCompleted()
+                        snapshot.isRescanPending = pendingWakeJobIDs.contains(job.id)
                         try await repository.setSnapshot(snapshot)
 
-                        if !shouldStopScheduling { startNextTransfer() }
+                        // Drain only the files already in flight after a rescan
+                        // request. The rest of this disk-backed fetch remains
+                        // queued and is reconsidered after the new manifest.
+                        if !shouldStopScheduling,
+                           !pendingWakeJobIDs.contains(job.id) {
+                            startNextTransfer()
+                        }
                     }
                 }
             }
 
             if snapshot.phase != .attention, snapshot.blockers.isEmpty {
-                snapshot.phase = .watching
-                snapshot.currentRelativePath = nil
-                snapshot.filesCompleted = 0
                 let remaining = try await repository.activeTransferSummary(jobID: job.id)
+                let rescanPending = pendingWakeJobIDs.contains(job.id)
+                snapshot.phase = rescanPending ? .scanning : .watching
+                snapshot.currentRelativePath = nil
+                snapshot.isRescanPending = rescanPending
+                snapshot.filesCompleted = 0
                 let movedBytes = snapshot.bytesCompleted
                 snapshot.filesTotal = remaining.count
                 snapshot.bytesCompleted = remaining.completedBytes
@@ -1011,7 +1049,12 @@ public actor SyncCoordinator {
                 // of this line: `atScan + movedBytes`, before and after.
                 snapshot.destinationBytesInPlace = destinationBytesAtScan
                     + max(0, movedBytes - remaining.completedBytes)
-                if remaining.count == 0 {
+                if rescanPending {
+                    snapshot.message = "Checking for changes…"
+                } else if remaining.count == 0 {
+                    snapshot.recentlyQueuedCount = nil
+                    snapshot.recentlyQueuedPaths = nil
+                    snapshot.recentlyQueuedAt = nil
                     snapshot.lastSuccessfulSync = Date()
                     snapshot.message = invalidRemoteKeyCount == 0
                         ? "All caught up"

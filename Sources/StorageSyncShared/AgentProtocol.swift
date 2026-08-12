@@ -5,6 +5,8 @@ public enum AgentCommandKind: String, Codable, Sendable {
     case snapshots
     case jobs
     case connections
+    /// One bounded page from the selected sync's durable activity batch.
+    case transferActivityPage
     case saveConnection
     case testConnection
     /// Saved provider keys, described without their secrets.
@@ -86,6 +88,14 @@ public struct JobCommandPayload: Codable, Sendable {
 
 @objc public protocol StorageSyncAgentXPCProtocol {
     func perform(commandData: Data, reply: @escaping (Data?, NSError?) -> Void)
+}
+
+/// Agent-to-manager wake-up. The revision was committed before this callback;
+/// it contains no activity payload and therefore cannot race SQLite as a
+/// competing source of truth.
+@objc public protocol StorageSyncAgentClientXPCProtocol {
+    func transferActivityDidChange(jobID: String, revision: Int64)
+    func stateDidChange()
 }
 
 public enum AgentConstants {

@@ -141,6 +141,7 @@ private final class ReliabilitySuite {
         try await packageContentsScanCheck()
         try await partialDirectorySymlinkCheck()
         try await persistenceRecoveryCheck()
+        try await transferActivityCheck()
         try await persistenceJobRemovalCheck()
         try await credentialStoreCheck()
         try await gracefulUnmountPreparationCheck()
@@ -1270,6 +1271,173 @@ private final class ReliabilitySuite {
         let discardedParts = try await recoveredRepository.parts(transferID: transferID)
         try check(discarded == nil, "Obsolete work survived reconciliation queue cleanup")
         try check(discardedParts.isEmpty, "Obsolete multipart checkpoints survived reconciliation queue cleanup")
+
+        let visiblePlans = ["new/photo.raw", "changed/video.mov"].map { path in
+            TransferPlan(
+                relativePath: path,
+                remoteKey: path,
+                kind: .upload,
+                totalBytes: 10,
+                localFingerprint: FileFingerprint(
+                    relativePath: path,
+                    size: 10,
+                    modificationTimeNanoseconds: 1
+                ),
+                remoteObject: nil
+            )
+        }
+        let reportedPaths = try await recoveredRepository.enqueueTransfersIfNeeded(
+            visiblePlans,
+            jobID: jobID
+        )
+        let duplicatePaths = try await recoveredRepository.enqueueTransfersIfNeeded(
+            visiblePlans,
+            jobID: jobID
+        )
+        try check(
+            reportedPaths == visiblePlans.map(\.relativePath) && duplicatePaths.isEmpty,
+            "The durable queue did not report exactly the newly visible paths"
+        )
+    }
+
+    private func transferActivityCheck() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("activity.sqlite")
+        let jobID = SyncJobID()
+        var repository: SyncRepository? = try SyncRepository(databaseURL: databaseURL)
+
+        let started = try await repository?.beginTransferActivityBatchIfIdle(jobID: jobID)
+        try check(started == true, "An idle scan did not start a transfer-activity batch")
+        let emptyPage = try await repository?.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, limit: 150)
+        )
+        guard let firstBatchID = emptyPage?.batchID else {
+            throw CheckFailure.failed("An empty activity batch had no durable identity")
+        }
+
+        let plans = (0..<320).map { index in
+            let path = String(format: "roll/%04d.raw", index)
+            return TransferPlan(
+                relativePath: path,
+                remoteKey: path,
+                kind: .upload,
+                totalBytes: Int64(index + 1),
+                localFingerprint: FileFingerprint(
+                    relativePath: path,
+                    size: Int64(index + 1),
+                    modificationTimeNanoseconds: Int64(index)
+                ),
+                remoteObject: nil
+            )
+        }
+        let enqueued = try await repository?.enqueueTransfersIfNeeded(plans, jobID: jobID) ?? []
+        try check(enqueued.count == plans.count, "The activity fixture did not enqueue every planned file")
+        let didReplaceBusyBatch = try await repository?.beginTransferActivityBatchIfIdle(jobID: jobID)
+        try check(
+            didReplaceBusyBatch == false,
+            "Starting another scan replaced activity while resumable work was still queued"
+        )
+
+        let firstPage = try await repository?.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, limit: 1)
+        )
+        guard let firstID = firstPage?.items.first?.id,
+              var first = try await repository?.transfer(id: firstID) else {
+            throw CheckFailure.failed("The activity fixture could not reload its first transfer")
+        }
+        // Exercise every status family the filters expose.
+        first.status = .running
+        first.completedBytes = max(1, first.totalBytes / 2)
+        first.updatedAt = Date().addingTimeInterval(1)
+        try await repository?.saveTransfer(first)
+
+        let activeTransfers = try await repository?.activeTransfers(jobID: jobID) ?? []
+        guard activeTransfers.count >= 3 else {
+            throw CheckFailure.failed("The activity fixture lost active queue rows")
+        }
+        var waiting = activeTransfers[1]
+        waiting.status = .waiting
+        waiting.retryCount = 2
+        waiting.lastError = "The network is unavailable"
+        waiting.updatedAt = Date().addingTimeInterval(2)
+        try await repository?.saveTransfer(waiting)
+        var failed = activeTransfers[2]
+        failed.status = .failed
+        failed.lastError = "Injected attention state"
+        failed.updatedAt = Date().addingTimeInterval(3)
+        try await repository?.saveTransfer(failed)
+
+        try await repository?.finalizeSuccessfulTransfer(
+            transferID: first.id,
+            baseline: ReconciliationBaseline(
+                relativePath: first.relativePath,
+                localFingerprint: first.sourceFingerprint ?? FileFingerprint(
+                    relativePath: first.relativePath,
+                    size: first.totalBytes,
+                    modificationTimeNanoseconds: 0
+                ),
+                remoteETag: "complete",
+                remoteChecksum: nil,
+                remoteSize: first.totalBytes
+            ),
+            jobID: jobID
+        )
+        let completedQueueRow = try await repository?.transfer(id: first.id)
+        try check(
+            completedQueueRow == nil,
+            "A completed transfer remained in the resumable queue"
+        )
+
+        var cursor: TransferActivityCursor?
+        var observed: [TransferActivityItem] = []
+        var revision: Int64 = 0
+        repeat {
+            let page = try await repository?.transferActivityPage(
+                TransferActivityPageRequest(jobID: jobID, cursor: cursor, limit: 150)
+            )
+            guard let page else { break }
+            try check(page.items.count <= 150, "An activity page exceeded its requested memory bound")
+            if revision != 0 {
+                try check(page.revision == revision, "A stable activity batch changed revision during pagination")
+            }
+            revision = page.revision
+            observed += page.items
+            cursor = page.nextCursor
+        } while cursor != nil
+        try check(observed.count == 320, "Paged transfer activity lost or duplicated rows")
+        try check(Set(observed.map(\.id)).count == 320, "Paged transfer activity returned a duplicate row")
+
+        let summary = try await repository?.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, limit: 1)
+        )
+        try check(summary?.counts.completed == 1, "Completed activity vanished with its queue row")
+        try check(summary?.counts.issues == 1, "The Issues activity count omitted a failed transfer")
+        try check(summary?.counts.waiting == 318, "Queued and retrying activity counts disagreed")
+        let completedPage = try await repository?.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, filter: .completed, limit: 150)
+        )
+        try check(
+            completedPage?.items.map(\.id) == [first.id],
+            "The Completed filter did not preserve the successful file"
+        )
+
+        repository = nil
+        repository = try SyncRepository(databaseURL: databaseURL)
+        let restored = try await repository?.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, limit: 1)
+        )
+        try check(restored?.batchID == firstBatchID, "Process restart replaced the current activity batch")
+        try check(restored?.revision == revision, "Process restart changed the durable activity revision")
+
+        try await repository?.discardTransfers(jobID: jobID, relativePaths: plans.map(\.relativePath))
+        let nextBatchStarted = try await repository?.beginTransferActivityBatchIfIdle(jobID: jobID)
+        let nextBatch = try await repository?.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, limit: 150)
+        )
+        try check(nextBatchStarted == true, "A completed workload could not begin a fresh activity batch")
+        try check(nextBatch?.batchID != firstBatchID, "A fresh scan reused the prior batch identity")
+        try check(nextBatch?.items.isEmpty == true, "A fresh scan retained completed activity from the prior batch")
     }
 
     private func persistenceJobRemovalCheck() async throws {
@@ -1356,6 +1524,9 @@ private final class ReliabilitySuite {
         let partsAfterward = try await repository.parts(transferID: transfer.id)
         let baselinesAfterward = try await repository.baselines(jobID: removedJob.id)
         let snapshotAfterward = try await repository.snapshot(jobID: removedJob.id)
+        let activityAfterward = try await repository.transferActivityPage(
+            TransferActivityPageRequest(jobID: removedJob.id)
+        )
         try check(removedJobAfterward == nil, "A removed sync job remained in SQLite")
         try check(survivingJobAfterward != nil, "Removing one sync deleted a different job")
         try check(sharedConnectionAfterward != nil, "Removing a job deleted its shared S3 connection")
@@ -1363,6 +1534,10 @@ private final class ReliabilitySuite {
         try check(partsAfterward.isEmpty, "A removed sync left multipart checkpoints")
         try check(baselinesAfterward.isEmpty, "A removed sync left baselines")
         try check(snapshotAfterward == nil, "A removed sync left its snapshot")
+        try check(
+            activityAfterward.batchID == nil && activityAfterward.items.isEmpty,
+            "A removed sync left its transfer activity"
+        )
         let manifestRows = try await repository.reconciliationRows(
             jobID: removedJob.id,
             direction: .upload,
@@ -2020,7 +2195,7 @@ private final class ReliabilitySuite {
         await fixture.store.mutateSourceAfterAcceptingPart(1, url: source, replacement: replacement)
 
         let result = await fixture.executor().execute(transfer, job: fixture.job, root: fixture.root)
-        guard case .superseded = result else {
+        guard case .superseded(let notice) = result, notice != nil else {
             throw CheckFailure.failed("A source mutation was not detected: \(result)")
         }
         let committedData = await fixture.store.data(for: transfer.remoteKey)
@@ -2117,7 +2292,7 @@ private final class ReliabilitySuite {
         try await fixture.repository.saveTransfer(transfer)
         await fixture.store.removeSourceAfterAcceptingPart(1, url: source)
         let result = await fixture.executor().execute(transfer, job: fixture.job, root: fixture.root)
-        guard case .superseded = result else {
+        guard case .superseded(let notice) = result, notice != nil else {
             throw CheckFailure.failed("Deleting a source file was mistaken for a disconnected volume: \(result)")
         }
         let committed = await fixture.store.data(for: transfer.remoteKey)

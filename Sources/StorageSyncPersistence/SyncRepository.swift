@@ -37,6 +37,8 @@ public actor SyncRepository {
     private let database: SQLiteDatabase
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+    private var activityContinuations: [UUID: AsyncStream<TransferActivityUpdate>.Continuation] = [:]
+    private var stateContinuations: [UUID: AsyncStream<Void>.Continuation] = [:]
 
     public init(databaseURL: URL) throws {
         database = try SQLiteDatabase(url: databaseURL)
@@ -48,8 +50,53 @@ public actor SyncRepository {
         if needsTransferMetricsBackfill {
             try Self.backfillTransferMetrics(database: database, decoder: decoder)
         }
-        try database.execute("PRAGMA user_version=2")
+        try database.execute("PRAGMA user_version=3")
         try Self.recoverInterruptedTransfers(database: database, encoder: encoder, decoder: decoder)
+        try Self.backfillTransferActivityIfNeeded(database: database, encoder: encoder, decoder: decoder)
+    }
+
+    /// A wake-up channel, not a second source of truth. Each value is yielded
+    /// only after the transaction carrying that revision has committed; the
+    /// receiver then reads the authoritative paginated rows from SQLite.
+    public func transferActivityUpdates() -> AsyncStream<TransferActivityUpdate> {
+        let token = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(64)) { continuation in
+            activityContinuations[token] = continuation
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { await self?.removeActivityContinuation(token) }
+            }
+        }
+    }
+
+    private func removeActivityContinuation(_ token: UUID) {
+        activityContinuations.removeValue(forKey: token)
+    }
+
+    private func publishActivityUpdate(jobID: SyncJobID, revision: Int64) {
+        let update = TransferActivityUpdate(jobID: jobID, revision: revision)
+        for continuation in activityContinuations.values {
+            continuation.yield(update)
+        }
+    }
+
+    public func stateUpdates() -> AsyncStream<Void> {
+        let token = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            stateContinuations[token] = continuation
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { await self?.removeStateContinuation(token) }
+            }
+        }
+    }
+
+    private func removeStateContinuation(_ token: UUID) {
+        stateContinuations.removeValue(forKey: token)
+    }
+
+    private func publishStateUpdate() {
+        for continuation in stateContinuations.values {
+            continuation.yield()
+        }
     }
 
     public func saveConnection(_ connection: S3Connection) throws {
@@ -58,6 +105,7 @@ public actor SyncRepository {
             id: connection.id.description,
             payload: encoder.encode(connection)
         )
+        publishStateUpdate()
     }
 
     public func connections() throws -> [S3Connection] {
@@ -77,6 +125,7 @@ public actor SyncRepository {
             id: credential.id.description,
             payload: encoder.encode(credential)
         )
+        publishStateUpdate()
     }
 
     public func credentials() throws -> [StoredCredential] {
@@ -92,10 +141,12 @@ public actor SyncRepository {
             "DELETE FROM credentials WHERE id = ?",
             bindings: [.text(id.description)]
         )
+        publishStateUpdate()
     }
 
     public func saveJob(_ job: SyncJob) throws {
         try upsert(table: "jobs", id: job.id.description, payload: encoder.encode(job))
+        publishStateUpdate()
     }
 
     public func jobs() throws -> [SyncJob] {
@@ -123,6 +174,14 @@ public actor SyncRepository {
                 bindings: [.text(identifier)]
             )
             try database.execute(
+                "DELETE FROM transfer_activity WHERE job_id = ?",
+                bindings: [.text(identifier)]
+            )
+            try database.execute(
+                "DELETE FROM transfer_activity_state WHERE job_id = ?",
+                bindings: [.text(identifier)]
+            )
+            try database.execute(
                 "DELETE FROM manifest WHERE job_id = ?",
                 bindings: [.text(identifier)]
             )
@@ -143,6 +202,7 @@ public actor SyncRepository {
                 bindings: [.text(identifier)]
             )
         }
+        publishStateUpdate()
     }
 
     public func removeConnection(id: ConnectionID) throws {
@@ -150,9 +210,19 @@ public actor SyncRepository {
             "DELETE FROM connections WHERE id = ?",
             bindings: [.text(id.description)]
         )
+        publishStateUpdate()
     }
 
     public func saveTransfer(_ transfer: TransferRecord) throws {
+        var revision: Int64 = 0
+        try database.transaction {
+            try saveTransferInsideTransaction(transfer)
+            revision = try bumpActivityRevisionInsideTransaction(jobID: transfer.jobID)
+        }
+        publishActivityUpdate(jobID: transfer.jobID, revision: revision)
+    }
+
+    private func saveTransferInsideTransaction(_ transfer: TransferRecord) throws {
         let payload = try encoder.encode(transfer)
         try database.execute(
             """
@@ -183,6 +253,7 @@ public actor SyncRepository {
                 .blob(payload)
             ]
         )
+        try saveActivityInsideTransaction(transfer)
     }
 
     public func transfer(id: TransferID) throws -> TransferRecord? {
@@ -270,6 +341,116 @@ public actor SyncRepository {
         )
     }
 
+    /// Starts a fresh visible batch only when no resumable work remains. A
+    /// restart in the middle of a backlog therefore preserves its rows, while
+    /// an explicit new check after completion gets a clean activity history.
+    @discardableResult
+    public func beginTransferActivityBatchIfIdle(jobID: SyncJobID) throws -> Bool {
+        var hasActiveTransfer = false
+        try database.query(
+            """
+            SELECT 1 FROM transfers
+            WHERE job_id = ? AND status IN ('queued', 'running', 'waiting', 'verifying')
+            LIMIT 1
+            """,
+            bindings: [.text(jobID.description)]
+        ) { _ in hasActiveTransfer = true }
+        guard !hasActiveTransfer else { return false }
+
+        var revision: Int64 = 0
+        let batchID = UUID()
+        try database.transaction {
+            try database.execute(
+                "DELETE FROM transfer_activity WHERE job_id = ?",
+                bindings: [.text(jobID.description)]
+            )
+            revision = try replaceActivityStateInsideTransaction(jobID: jobID, batchID: batchID)
+        }
+        publishActivityUpdate(jobID: jobID, revision: revision)
+        return true
+    }
+
+    public func transferActivityPage(_ request: TransferActivityPageRequest) throws -> TransferActivityPage {
+        let limit = min(500, max(1, request.limit))
+        guard let state = try activityState(jobID: request.jobID) else {
+            return TransferActivityPage(
+                jobID: request.jobID,
+                batchID: nil,
+                revision: 0,
+                items: [],
+                nextCursor: nil,
+                counts: TransferActivityCounts()
+            )
+        }
+
+        let statusClause: String
+        switch request.filter {
+        case .all:
+            statusClause = "1 = 1"
+        case .active:
+            statusClause = "status IN ('running', 'verifying')"
+        case .waiting:
+            statusClause = "status IN ('queued', 'waiting')"
+        case .completed:
+            statusClause = "status = 'completed'"
+        case .issues:
+            statusClause = "status IN ('failed', 'superseded')"
+        }
+
+        var cursorClause = ""
+        var bindings: [SQLiteValue] = [.text(request.jobID.description), .text(state.batchID.uuidString)]
+        if let cursor = request.cursor {
+            cursorClause = "AND (updated_at_ms < ? OR (updated_at_ms = ? AND id < ?))"
+            bindings += [
+                .integer(cursor.updatedAtMilliseconds),
+                .integer(cursor.updatedAtMilliseconds),
+                .text(cursor.transferID.description)
+            ]
+        }
+
+        var items: [TransferActivityItem] = []
+        var lastCursor: TransferActivityCursor?
+        try database.query(
+            """
+            SELECT updated_at_ms, id, payload
+            FROM transfer_activity
+            WHERE job_id = ? AND batch_id = ? AND \(statusClause) \(cursorClause)
+            ORDER BY updated_at_ms DESC, id DESC
+            LIMIT \(limit + 1)
+            """,
+            bindings: bindings
+        ) { statement in
+            guard let identifier = database.text(statement, column: 1),
+                  let transferID = UUID(uuidString: identifier).map(TransferID.init(rawValue:)),
+                  let payload = database.blob(statement, column: 2) else { return }
+            let item = try decoder.decode(TransferActivityItem.self, from: payload)
+            items.append(item)
+            lastCursor = TransferActivityCursor(
+                updatedAtMilliseconds: database.integer(statement, column: 0),
+                transferID: transferID
+            )
+        }
+        let hasMore = items.count > limit
+        if hasMore { items.removeLast() }
+        if !hasMore {
+            lastCursor = nil
+        } else if let last = items.last {
+            lastCursor = TransferActivityCursor(
+                updatedAtMilliseconds: Self.milliseconds(since1970: last.updatedAt),
+                transferID: last.id
+            )
+        }
+
+        return TransferActivityPage(
+            jobID: request.jobID,
+            batchID: state.batchID,
+            revision: state.revision,
+            items: items,
+            nextCursor: lastCursor,
+            counts: try transferActivityCounts(jobID: request.jobID, batchID: state.batchID)
+        )
+    }
+
     public func removeTerminalTransfers(jobID: SyncJobID, relativePath: String) throws {
         var identifiers: [String] = []
         try database.query(
@@ -278,6 +459,7 @@ public actor SyncRepository {
         ) { statement in
             if let identifier = database.text(statement, column: 0) { identifiers.append(identifier) }
         }
+        var revision: Int64?
         try database.transaction {
             for identifier in identifiers {
                 try database.execute(
@@ -288,8 +470,16 @@ public actor SyncRepository {
                     "DELETE FROM transfers WHERE id = ?",
                     bindings: [.text(identifier)]
                 )
+                try database.execute(
+                    "DELETE FROM transfer_activity WHERE job_id = ? AND id = ?",
+                    bindings: [.text(jobID.description), .text(identifier)]
+                )
+            }
+            if !identifiers.isEmpty {
+                revision = try bumpActivityRevisionInsideTransaction(jobID: jobID)
             }
         }
+        if let revision { publishActivityUpdate(jobID: jobID, revision: revision) }
     }
 
     /// Atomically avoids duplicate work for a path, replaces stale terminal
@@ -297,26 +487,37 @@ public actor SyncRepository {
     @discardableResult
     public func enqueueTransferIfNeeded(_ plan: TransferPlan, jobID: SyncJobID) throws -> Bool {
         var didEnqueue = false
+        var revision: Int64?
         try database.transaction {
             didEnqueue = try enqueueTransferInsideTransaction(plan, jobID: jobID)
+            if didEnqueue {
+                revision = try bumpActivityRevisionInsideTransaction(jobID: jobID)
+            }
         }
+        if let revision { publishActivityUpdate(jobID: jobID, revision: revision) }
         return didEnqueue
     }
 
     /// Enqueues a reconciliation page under one durable transaction. With
     /// synchronous SQLite durability this avoids one filesystem sync per file.
     @discardableResult
-    public func enqueueTransfersIfNeeded(_ plans: [TransferPlan], jobID: SyncJobID) throws -> Int {
-        guard !plans.isEmpty else { return 0 }
-        var count = 0
+    public func enqueueTransfersIfNeeded(_ plans: [TransferPlan], jobID: SyncJobID) throws -> [String] {
+        guard !plans.isEmpty else { return [] }
+        var enqueuedPaths: [String] = []
+        var revision: Int64?
+        enqueuedPaths.reserveCapacity(plans.count)
         try database.transaction {
             for plan in plans {
                 if try enqueueTransferInsideTransaction(plan, jobID: jobID) {
-                    count += 1
+                    enqueuedPaths.append(plan.relativePath)
                 }
             }
+            if !enqueuedPaths.isEmpty {
+                revision = try bumpActivityRevisionInsideTransaction(jobID: jobID)
+            }
         }
-        return count
+        if let revision { publishActivityUpdate(jobID: jobID, revision: revision) }
+        return enqueuedPaths
     }
 
     public func makeWaitingTransfersRunnable(jobID: SyncJobID) throws {
@@ -330,13 +531,16 @@ public actor SyncRepository {
             )
             guard !waiting.isEmpty else { return }
             let now = Date()
+            var revision: Int64 = 0
             try database.transaction {
                 for var transfer in waiting {
                     transfer.nextAttemptAt = nil
                     transfer.updatedAt = now
-                    try saveTransfer(transfer)
+                    try saveTransferInsideTransaction(transfer)
                 }
+                revision = try bumpActivityRevisionInsideTransaction(jobID: jobID)
             }
+            publishActivityUpdate(jobID: jobID, revision: revision)
         }
     }
 
@@ -390,8 +594,16 @@ public actor SyncRepository {
         baseline: ReconciliationBaseline,
         jobID: SyncJobID
     ) throws {
+        guard var transfer = try transfer(id: transferID) else { return }
+        transfer.status = .completed
+        transfer.completedBytes = transfer.totalBytes
+        transfer.lastError = nil
+        transfer.nextAttemptAt = nil
+        transfer.updatedAt = Date()
+        var revision: Int64 = 0
         try database.transaction {
             try saveBaselineInsideTransaction(baseline, jobID: jobID)
+            try saveActivityInsideTransaction(transfer)
             try database.execute(
                 "DELETE FROM transfer_parts WHERE transfer_id = ?",
                 bindings: [.text(transferID.description)]
@@ -400,7 +612,9 @@ public actor SyncRepository {
                 "DELETE FROM transfers WHERE id = ?",
                 bindings: [.text(transferID.description)]
             )
+            revision = try bumpActivityRevisionInsideTransaction(jobID: jobID)
         }
+        publishActivityUpdate(jobID: jobID, revision: revision)
     }
 
     /// Records pre-existing source/destination pairs and removes obsolete work
@@ -410,6 +624,7 @@ public actor SyncRepository {
         jobID: SyncJobID
     ) throws {
         guard !baselines.isEmpty else { return }
+        var revision: Int64 = 0
         try database.transaction {
             try deleteTransfersInsideTransaction(
                 jobID: jobID,
@@ -418,7 +633,9 @@ public actor SyncRepository {
             for baseline in baselines {
                 try saveBaselineInsideTransaction(baseline, jobID: jobID)
             }
+            revision = try bumpActivityRevisionInsideTransaction(jobID: jobID)
         }
+        publishActivityUpdate(jobID: jobID, revision: revision)
     }
 
     /// Chunked so the bound parameter count stays well inside SQLite's default
@@ -438,9 +655,12 @@ public actor SyncRepository {
 
     public func discardTransfers(jobID: SyncJobID, relativePaths: [String]) throws {
         guard !relativePaths.isEmpty else { return }
+        var revision: Int64 = 0
         try database.transaction {
             try deleteTransfersInsideTransaction(jobID: jobID, relativePaths: relativePaths)
+            revision = try bumpActivityRevisionInsideTransaction(jobID: jobID)
         }
+        publishActivityUpdate(jobID: jobID, revision: revision)
     }
 
     /// Removes the queue rows and part checkpoints for a set of paths.
@@ -471,6 +691,10 @@ public actor SyncRepository {
             )
             try database.execute(
                 "DELETE FROM transfers WHERE job_id = ? AND relative_path IN (\(placeholders))",
+                bindings: bindings
+            )
+            try database.execute(
+                "DELETE FROM transfer_activity WHERE job_id = ? AND relative_path IN (\(placeholders))",
                 bindings: bindings
             )
         }
@@ -774,6 +998,7 @@ public actor SyncRepository {
             id: snapshot.jobID.description,
             payload: encoder.encode(snapshot)
         )
+        publishStateUpdate()
     }
 
     public func snapshots() throws -> [SyncSnapshot] {
@@ -852,6 +1077,35 @@ public actor SyncRepository {
               PRIMARY KEY(transfer_id, part_number)
             )
             """
+        )
+        try database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transfer_activity_state(
+              job_id TEXT PRIMARY KEY,
+              batch_id TEXT NOT NULL,
+              revision INTEGER NOT NULL
+            )
+            """
+        )
+        try database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transfer_activity(
+              job_id TEXT NOT NULL,
+              batch_id TEXT NOT NULL,
+              id TEXT NOT NULL,
+              relative_path TEXT NOT NULL,
+              status TEXT NOT NULL,
+              updated_at_ms INTEGER NOT NULL,
+              payload BLOB NOT NULL,
+              PRIMARY KEY(job_id, id)
+            )
+            """
+        )
+        try database.execute(
+            "CREATE INDEX IF NOT EXISTS transfer_activity_page ON transfer_activity(job_id, batch_id, updated_at_ms DESC, id DESC)"
+        )
+        try database.execute(
+            "CREATE INDEX IF NOT EXISTS transfer_activity_status ON transfer_activity(job_id, batch_id, status, updated_at_ms DESC, id DESC)"
         )
         try database.execute(
             """
@@ -944,22 +1198,117 @@ public actor SyncRepository {
             transfer.lastError = nil
             transfer.nextAttemptAt = nil
             transfer.updatedAt = Date()
-            try database.execute(
-                """
-                UPDATE transfers
-                SET status = ?, next_attempt_at = NULL, updated_at = ?,
-                    total_bytes = ?, completed_bytes = ?, payload = ?
-                WHERE id = ?
-                """,
-                bindings: [
-                    .text(transfer.status.rawValue),
-                    .real(transfer.updatedAt.timeIntervalSince1970),
-                    .integer(transfer.totalBytes),
-                    .integer(transfer.completedBytes),
-                    .blob(try encoder.encode(transfer)),
-                    .text(transfer.id.description)
-                ]
-            )
+            var batchID: UUID?
+            try database.query(
+                "SELECT batch_id FROM transfer_activity_state WHERE job_id = ?",
+                bindings: [.text(transfer.jobID.description)]
+            ) { statement in
+                batchID = database.text(statement, column: 0).flatMap(UUID.init(uuidString:))
+            }
+            let activityBatchID = batchID ?? UUID()
+            let item = TransferActivityItem(transfer: transfer, batchID: activityBatchID)
+            try database.transaction {
+                try database.execute(
+                    """
+                    UPDATE transfers
+                    SET status = ?, next_attempt_at = NULL, updated_at = ?,
+                        total_bytes = ?, completed_bytes = ?, payload = ?
+                    WHERE id = ?
+                    """,
+                    bindings: [
+                        .text(transfer.status.rawValue),
+                        .real(transfer.updatedAt.timeIntervalSince1970),
+                        .integer(transfer.totalBytes),
+                        .integer(transfer.completedBytes),
+                        .blob(try encoder.encode(transfer)),
+                        .text(transfer.id.description)
+                    ]
+                )
+                if batchID == nil {
+                    try database.execute(
+                        "INSERT INTO transfer_activity_state(job_id, batch_id, revision) VALUES (?, ?, 0)",
+                        bindings: [.text(transfer.jobID.description), .text(activityBatchID.uuidString)]
+                    )
+                }
+                try database.execute(
+                    """
+                    INSERT INTO transfer_activity(
+                      job_id, batch_id, id, relative_path, status, updated_at_ms, payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(job_id, id) DO UPDATE SET
+                      batch_id = excluded.batch_id,
+                      relative_path = excluded.relative_path,
+                      status = excluded.status,
+                      updated_at_ms = excluded.updated_at_ms,
+                      payload = excluded.payload
+                    """,
+                    bindings: [
+                        .text(transfer.jobID.description),
+                        .text(activityBatchID.uuidString),
+                        .text(transfer.id.description),
+                        .text(transfer.relativePath),
+                        .text(transfer.status.rawValue),
+                        .integer(Int64((transfer.updatedAt.timeIntervalSince1970 * 1_000).rounded(.down))),
+                        .blob(try encoder.encode(item))
+                    ]
+                )
+                try database.execute(
+                    "UPDATE transfer_activity_state SET revision = revision + 1 WHERE job_id = ?",
+                    bindings: [.text(transfer.jobID.description)]
+                )
+            }
+        }
+    }
+
+    /// Additive upgrade path for queue rows written before the activity ledger
+    /// existed. Once a job has an activity state, later launches never rebuild
+    /// it from terminal queue history; they preserve the exact current batch.
+    private static func backfillTransferActivityIfNeeded(
+        database: SQLiteDatabase,
+        encoder: JSONEncoder,
+        decoder: JSONDecoder
+    ) throws {
+        var transfersByJob: [SyncJobID: [TransferRecord]] = [:]
+        try database.query("SELECT payload FROM transfers ORDER BY job_id, updated_at ASC") { statement in
+            guard let payload = database.blob(statement, column: 0) else { return }
+            let transfer = try decoder.decode(TransferRecord.self, from: payload)
+            transfersByJob[transfer.jobID, default: []].append(transfer)
+        }
+
+        for (jobID, transfers) in transfersByJob {
+            var hasState = false
+            try database.query(
+                "SELECT 1 FROM transfer_activity_state WHERE job_id = ? LIMIT 1",
+                bindings: [.text(jobID.description)]
+            ) { _ in hasState = true }
+            guard !hasState else { continue }
+
+            let batchID = UUID()
+            try database.transaction {
+                try database.execute(
+                    "INSERT INTO transfer_activity_state(job_id, batch_id, revision) VALUES (?, ?, 1)",
+                    bindings: [.text(jobID.description), .text(batchID.uuidString)]
+                )
+                for transfer in transfers {
+                    let item = TransferActivityItem(transfer: transfer, batchID: batchID)
+                    try database.execute(
+                        """
+                        INSERT INTO transfer_activity(
+                          job_id, batch_id, id, relative_path, status, updated_at_ms, payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        bindings: [
+                            .text(jobID.description),
+                            .text(batchID.uuidString),
+                            .text(transfer.id.description),
+                            .text(transfer.relativePath),
+                            .text(transfer.status.rawValue),
+                            .integer(Int64((transfer.updatedAt.timeIntervalSince1970 * 1_000).rounded(.down))),
+                            .blob(try encoder.encode(item))
+                        ]
+                    )
+                }
+            }
         }
     }
 
@@ -967,6 +1316,114 @@ public actor SyncRepository {
     /// interpolated SQL. Kept in one place so a caller cannot reach a table
     /// that is not shaped this way, and so adding one is a single edit.
     private static let documentTables: Set<String> = ["connections", "credentials", "jobs", "snapshots"]
+
+    private static func milliseconds(since1970 date: Date) -> Int64 {
+        Int64((date.timeIntervalSince1970 * 1_000).rounded(.down))
+    }
+
+    private func activityState(jobID: SyncJobID) throws -> (batchID: UUID, revision: Int64)? {
+        var result: (UUID, Int64)?
+        try database.query(
+            "SELECT batch_id, revision FROM transfer_activity_state WHERE job_id = ?",
+            bindings: [.text(jobID.description)]
+        ) { statement in
+            guard let text = database.text(statement, column: 0),
+                  let batchID = UUID(uuidString: text) else { return }
+            result = (batchID, database.integer(statement, column: 1))
+        }
+        return result
+    }
+
+    private func ensureActivityBatchInsideTransaction(jobID: SyncJobID) throws -> UUID {
+        if let state = try activityState(jobID: jobID) { return state.batchID }
+        let batchID = UUID()
+        try database.execute(
+            "INSERT INTO transfer_activity_state(job_id, batch_id, revision) VALUES (?, ?, 0)",
+            bindings: [.text(jobID.description), .text(batchID.uuidString)]
+        )
+        return batchID
+    }
+
+    private func replaceActivityStateInsideTransaction(jobID: SyncJobID, batchID: UUID) throws -> Int64 {
+        let revision = (try activityState(jobID: jobID)?.revision ?? 0) + 1
+        try database.execute(
+            """
+            INSERT INTO transfer_activity_state(job_id, batch_id, revision)
+            VALUES (?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+              batch_id = excluded.batch_id,
+              revision = excluded.revision
+            """,
+            bindings: [.text(jobID.description), .text(batchID.uuidString), .integer(revision)]
+        )
+        return revision
+    }
+
+    private func bumpActivityRevisionInsideTransaction(jobID: SyncJobID) throws -> Int64 {
+        _ = try ensureActivityBatchInsideTransaction(jobID: jobID)
+        try database.execute(
+            "UPDATE transfer_activity_state SET revision = revision + 1 WHERE job_id = ?",
+            bindings: [.text(jobID.description)]
+        )
+        return try activityState(jobID: jobID)?.revision ?? 0
+    }
+
+    private func saveActivityInsideTransaction(_ transfer: TransferRecord) throws {
+        let batchID = try ensureActivityBatchInsideTransaction(jobID: transfer.jobID)
+        let item = TransferActivityItem(transfer: transfer, batchID: batchID)
+        try database.execute(
+            """
+            INSERT INTO transfer_activity(
+              job_id, batch_id, id, relative_path, status, updated_at_ms, payload
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id, id) DO UPDATE SET
+              batch_id = excluded.batch_id,
+              relative_path = excluded.relative_path,
+              status = excluded.status,
+              updated_at_ms = excluded.updated_at_ms,
+              payload = excluded.payload
+            """,
+            bindings: [
+                .text(transfer.jobID.description),
+                .text(batchID.uuidString),
+                .text(transfer.id.description),
+                .text(transfer.relativePath),
+                .text(transfer.status.rawValue),
+                .integer(Self.milliseconds(since1970: transfer.updatedAt)),
+                .blob(try encoder.encode(item))
+            ]
+        )
+    }
+
+    private func transferActivityCounts(
+        jobID: SyncJobID,
+        batchID: UUID
+    ) throws -> TransferActivityCounts {
+        var counts = TransferActivityCounts()
+        try database.query(
+            """
+            SELECT
+              COUNT(*),
+              COALESCE(SUM(CASE WHEN status IN ('running', 'verifying') THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN status IN ('queued', 'waiting') THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN status IN ('failed', 'superseded') THEN 1 ELSE 0 END), 0)
+            FROM transfer_activity
+            WHERE job_id = ? AND batch_id = ?
+            """,
+            bindings: [.text(jobID.description), .text(batchID.uuidString)]
+        ) { statement in
+            counts = TransferActivityCounts(
+                all: Int(database.integer(statement, column: 0)),
+                active: Int(database.integer(statement, column: 1)),
+                waiting: Int(database.integer(statement, column: 2)),
+                completed: Int(database.integer(statement, column: 3)),
+                issues: Int(database.integer(statement, column: 4))
+            )
+        }
+        return counts
+    }
 
     private func upsert(table: String, id: String, payload: Data) throws {
         precondition(Self.documentTables.contains(table))
@@ -1013,8 +1470,12 @@ public actor SyncRepository {
                 "DELETE FROM transfers WHERE id = ?",
                 bindings: [.text(identifier)]
             )
+            try database.execute(
+                "DELETE FROM transfer_activity WHERE job_id = ? AND id = ?",
+                bindings: [.text(jobID.description), .text(identifier)]
+            )
         }
-        try saveTransfer(
+        try saveTransferInsideTransaction(
             TransferRecord(
                 jobID: jobID,
                 relativePath: plan.relativePath,

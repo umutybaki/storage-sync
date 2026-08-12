@@ -29,6 +29,9 @@ let package = Package(
         .target(
             name: "StorageSyncSystem",
             dependencies: ["StorageSyncCore"],
+            // An old iCloud conflict copy imports the pre-rename PhotoSyncCore
+            // module and is retained on disk for recovery, but is not source.
+            exclude: ["KeychainStore 2.swift"],
             linkerSettings: [.linkedFramework("DiskArbitration")]
         ),
         .target(name: "StorageSyncShared", dependencies: ["StorageSyncCore"]),

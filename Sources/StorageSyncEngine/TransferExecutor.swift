@@ -9,11 +9,16 @@ public enum TransferExecutionResult: Sendable {
     case cancelled
     case waiting(SyncBlocker, String)
     case attention(SyncBlocker?, String)
-    case superseded(String)
+    /// The optional message is suitable for a secondary user-facing notice.
+    /// Identity-only changes still supersede the attempt for safety, but are
+    /// silent because removable filesystems can change those identifiers
+    /// without changing content.
+    case superseded(String?)
 }
 
 public enum TransferExecutionError: Error, LocalizedError {
     case sourceChanged
+    case sourceIdentityChanged
     case remoteChanged
     case destinationChanged
     case shortRead(expected: Int64, actual: Int)
@@ -25,6 +30,7 @@ public enum TransferExecutionError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .sourceChanged: "The source file changed while it was being uploaded."
+        case .sourceIdentityChanged: "The source file identity changed while it was being uploaded."
         case .remoteChanged: "The S3 object changed while it was being downloaded."
         case .destinationChanged: "The local destination changed while it was being downloaded."
         case .shortRead(let expected, let actual): "Expected \(expected) bytes but read \(actual)."
@@ -117,16 +123,26 @@ public struct TransferExecutor: Sendable {
             transfer.multipartUploadID = nil
             await mark(&transfer, status: .superseded, message: TransferExecutionError.sourceChanged.localizedDescription)
             return .superseded(TransferExecutionError.sourceChanged.localizedDescription)
+        } catch TransferExecutionError.sourceIdentityChanged {
+            await abortIfNecessary(transfer)
+            await discardCheckpoints(for: transfer, root: root)
+            transfer.multipartUploadID = nil
+            await mark(
+                &transfer,
+                status: .superseded,
+                message: TransferExecutionError.sourceIdentityChanged.localizedDescription
+            )
+            return .superseded(nil)
         } catch TransferExecutionError.remoteChanged {
             await discardCheckpoints(for: transfer, root: root)
             transfer.temporaryPath = nil
             await mark(&transfer, status: .superseded, message: TransferExecutionError.remoteChanged.localizedDescription)
-            return .superseded(TransferExecutionError.remoteChanged.localizedDescription)
+            return .superseded(nil)
         } catch TransferExecutionError.destinationChanged {
             await discardCheckpoints(for: transfer, root: root)
             transfer.temporaryPath = nil
             await mark(&transfer, status: .superseded, message: TransferExecutionError.destinationChanged.localizedDescription)
-            return .superseded(TransferExecutionError.destinationChanged.localizedDescription)
+            return .superseded(nil)
         } catch let error as TransferExecutionError {
             switch error {
             case .insufficientSpace:
@@ -150,7 +166,7 @@ public struct TransferExecutor: Sendable {
             case .notFound where transfer.kind == .download:
                 await discardCheckpoints(for: transfer, root: root)
                 await mark(&transfer, status: .superseded, message: "The remote object no longer exists.")
-                return .superseded("The remote object no longer exists.")
+                return .superseded(nil)
             case .checksumMismatch:
                 await discardCheckpoints(for: transfer, root: root)
                 await wait(&transfer, error: error)
@@ -228,7 +244,7 @@ public struct TransferExecutor: Sendable {
             transfer.completedBytes = before.size
             await progress(transfer.completedBytes)
             let after = try scanner.fingerprint(url: sourceURL, relativePath: transfer.relativePath)
-            guard after.representsSameFileState(as: before) else { throw TransferExecutionError.sourceChanged }
+            try validateSourceAfterUpload(after, against: before)
             var verified = after
             verified.checksum = checksum
             guard remote.size == before.size else {
@@ -251,7 +267,7 @@ public struct TransferExecutor: Sendable {
                alreadyCompleted.size == before.size,
                alreadyCompleted.metadata["storagesync-transfer-id"] == transfer.id.description {
                 let after = try scanner.fingerprint(url: sourceURL, relativePath: transfer.relativePath)
-                guard after.representsSameFileState(as: before) else { throw TransferExecutionError.sourceChanged }
+                try validateSourceAfterUpload(after, against: before)
                 return ReconciliationBaseline(
                     relativePath: transfer.relativePath,
                     localFingerprint: after,
@@ -373,7 +389,7 @@ public struct TransferExecutor: Sendable {
 
         try Task.checkCancellation()
         let after = try scanner.fingerprint(url: sourceURL, relativePath: transfer.relativePath)
-        guard after.representsSameFileState(as: before) else { throw TransferExecutionError.sourceChanged }
+        try validateSourceAfterUpload(after, against: before)
         let orderedCompleted = try plannedParts.map { part -> UploadedPart in
             guard let uploaded = completed[part.number] else { throw TransferExecutionError.invalidTransfer }
             return uploaded
@@ -399,6 +415,21 @@ public struct TransferExecutor: Sendable {
             remoteSize: remote.size,
             remoteLastModified: remote.lastModified
         )
+    }
+
+    /// Preserve the existing conservative transfer behavior while separating
+    /// reliable content metadata from an opaque identity-only mismatch. Both
+    /// restart safely; only the first is honest enough to show to the user.
+    private func validateSourceAfterUpload(
+        _ after: FileFingerprint,
+        against before: FileFingerprint
+    ) throws {
+        guard after.representsSameContent(as: before) else {
+            throw TransferExecutionError.sourceChanged
+        }
+        guard after.representsSameFileState(as: before) else {
+            throw TransferExecutionError.sourceIdentityChanged
+        }
     }
 
     private func download(
