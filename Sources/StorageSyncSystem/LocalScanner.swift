@@ -24,7 +24,15 @@ public struct LocalScanner: Sendable {
                         at: scanRoot,
                         includingPropertiesForKeys: keys,
                         options: [],
-                        errorHandler: { _, error in
+                        errorHandler: { url, error in
+                            // One unreadable path — a permission-denied folder, a
+                            // briefly locked file — must not end the whole scan.
+                            // Aborting surfaces as a CocoaError, which the cycle
+                            // reads as a disconnected volume and retries forever;
+                            // only a failure on the root itself really is that.
+                            guard url.standardizedFileURL.pathComponents == rootComponents else {
+                                return true
+                            }
                             continuation.finish(throwing: error)
                             return false
                         }
@@ -34,7 +42,17 @@ public struct LocalScanner: Sendable {
 
                     while let url = enumerator.nextObject() as? URL {
                         try Task.checkCancellation()
-                        let values = try url.resourceValues(forKeys: Set(keys))
+                        // A file can be removed, replaced, or briefly locked
+                        // between the enumerator yielding it and this fetch,
+                        // which is routine on a library the user is still
+                        // using. Failing the scan here is the same trap the
+                        // error handler above avoids: the cycle reads the
+                        // CocoaError as a disconnected volume and retries the
+                        // same doomed pass forever. Skipping costs at most one
+                        // scan's knowledge of the entry — deletion never
+                        // propagates to the destination, so an entry missing
+                        // from one manifest cannot remove anything.
+                        guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
                         let fileComponents = url.standardizedFileURL.pathComponents
                         guard fileComponents.starts(with: rootComponents) else {
                             throw CocoaError(.fileReadInvalidFileName)
@@ -59,7 +77,7 @@ public struct LocalScanner: Sendable {
                         var pending = FileFingerprint(
                             relativePath: relativePath,
                             size: Int64(values.fileSize ?? 0),
-                            modificationTimeNanoseconds: Int64(modified * 1_000_000_000),
+                            modificationTimeNanoseconds: Self.modificationTimeNanoseconds(modified),
                             fileIdentifier: values.fileResourceIdentifier.map { String(describing: $0) },
                             generationIdentifier: values.generationIdentifier.map { String(describing: $0) }
                         )
@@ -115,10 +133,24 @@ public struct LocalScanner: Sendable {
         return FileFingerprint(
             relativePath: relativePath,
             size: Int64(values.fileSize ?? 0),
-            modificationTimeNanoseconds: Int64(modified * 1_000_000_000),
+            modificationTimeNanoseconds: Self.modificationTimeNanoseconds(modified),
             fileIdentifier: values.fileResourceIdentifier.map { String(describing: $0) },
             generationIdentifier: values.generationIdentifier.map { String(describing: $0) }
         )
+    }
+
+    // Converting the scaled interval straight to Int64 traps, so one file dated
+    // beyond ±292 years from the epoch — a bogus `touch`, a restored archive, a
+    // corrupt exFAT directory entry — crashed the scanning process, and the
+    // relaunched scan reached the same file again. Clamping is deterministic, so
+    // such a file still fingerprints and reconciles; the only cost is that two
+    // equally out-of-range timestamps compare as unchanged.
+    private static func modificationTimeNanoseconds(_ interval: TimeInterval) -> Int64 {
+        let nanoseconds = (interval * 1_000_000_000).rounded(.towardZero)
+        guard let exact = Int64(exactly: nanoseconds) else {
+            return nanoseconds < 0 ? .min : .max
+        }
+        return exact
     }
 
     public func sha256(url: URL) async throws -> String {

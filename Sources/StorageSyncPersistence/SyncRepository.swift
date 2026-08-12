@@ -19,6 +19,10 @@ public struct ManifestReconciliationRow: Sendable {
     public var remote: RemoteObject?
     public var baseline: ReconciliationBaseline?
     public var hasRemotePathCollision: Bool
+    /// Two local files whose names differ only by capitalization fold to this
+    /// row's canonical path. Which of them a single remote key belongs to is
+    /// unknowable, so neither may be paired with it.
+    public var hasLocalPathCollision: Bool
 }
 
 public struct TransferQueueSummary: Sendable, Equatable {
@@ -485,37 +489,6 @@ public actor SyncRepository {
         )
     }
 
-    public func removeTerminalTransfers(jobID: SyncJobID, relativePath: String) throws {
-        var identifiers: [String] = []
-        try database.query(
-            "SELECT id FROM transfers WHERE job_id = ? AND relative_path = ? AND status IN ('completed', 'superseded', 'failed')",
-            bindings: [.text(jobID.description), .text(relativePath)]
-        ) { statement in
-            if let identifier = database.text(statement, column: 0) { identifiers.append(identifier) }
-        }
-        var revision: Int64?
-        try database.transaction {
-            for identifier in identifiers {
-                try database.execute(
-                    "DELETE FROM transfer_parts WHERE transfer_id = ?",
-                    bindings: [.text(identifier)]
-                )
-                try database.execute(
-                    "DELETE FROM transfers WHERE id = ?",
-                    bindings: [.text(identifier)]
-                )
-                try database.execute(
-                    "DELETE FROM transfer_activity WHERE job_id = ? AND id = ?",
-                    bindings: [.text(jobID.description), .text(identifier)]
-                )
-            }
-            if !identifiers.isEmpty {
-                revision = try bumpActivityRevisionInsideTransaction(jobID: jobID)
-            }
-        }
-        if let revision { publishActivityUpdate(jobID: jobID, revision: revision) }
-    }
-
     /// Atomically avoids duplicate work for a path, replaces stale terminal
     /// history, and enqueues the new plan without loading the whole active queue.
     @discardableResult
@@ -848,12 +821,14 @@ public actor SyncRepository {
             "DELETE FROM manifest WHERE job_id = ? AND side = ? AND scan_generation != ?",
             bindings: [.text(jobID.description), .text(side.rawValue), .integer(generation)]
         )
-        if side == .remote {
-            try database.execute(
-                "DELETE FROM manifest_conflicts WHERE job_id = ? AND scan_generation != ?",
-                bindings: [.text(jobID.description), .integer(generation)]
-            )
-        }
+        // Only this side's stale conflicts. The two sides number their scan
+        // generations independently, and the two manifests are staged
+        // concurrently, so a cleanup that ignored the side would delete the
+        // other one's freshly recorded collisions.
+        try database.execute(
+            "DELETE FROM manifest_conflicts WHERE job_id = ? AND side = ? AND scan_generation != ?",
+            bindings: [.text(jobID.description), .text(side.rawValue), .integer(generation)]
+        )
     }
 
     public func pruneBaselinesAbsentFromManifest(
@@ -891,49 +866,103 @@ public actor SyncRepository {
         let bindings: [SQLiteValue] = [.text(jobID.description), .integer(generation)]
         var count = 0
         try database.transaction {
-            try database.execute(
-                "DELETE FROM manifest_conflicts WHERE job_id = ? AND scan_generation = ?",
-                bindings: bindings
+            count = try recordCaseCollisionsInsideTransaction(
+                jobID: jobID,
+                side: .remote,
+                generation: generation
             )
-            try database.query(
-                """
-                SELECT COALESCE(SUM(entry_count), 0)
-                FROM (
-                  SELECT COUNT(*) AS entry_count
-                  FROM manifest
-                  WHERE job_id = ? AND side = 'remote' AND scan_generation = ?
-                  GROUP BY canonical_path
-                  HAVING COUNT(*) > 1
-                )
-                """,
-                bindings: bindings
-            ) { statement in
-                count = Int(database.integer(statement, column: 0))
-            }
             guard count > 0 else { return }
-            try database.execute(
-                """
-                INSERT INTO manifest_conflicts(job_id, scan_generation, canonical_path)
-                SELECT ?, ?, canonical_path
-                FROM manifest
-                WHERE job_id = ? AND side = 'remote' AND scan_generation = ?
-                GROUP BY canonical_path
-                HAVING COUNT(*) > 1
-                """,
-                bindings: bindings + bindings
-            )
             try database.execute(
                 """
                 DELETE FROM manifest
                 WHERE job_id = ? AND side = 'remote' AND scan_generation = ?
                   AND canonical_path IN (
                     SELECT canonical_path FROM manifest_conflicts
-                    WHERE job_id = ? AND scan_generation = ?
+                    WHERE job_id = ? AND side = 'remote' AND scan_generation = ?
                   )
                 """,
                 bindings: bindings + bindings
             )
         }
+        return count
+    }
+
+    /// The local half of the same rule, returning the number of local entries
+    /// that cannot be reconciled this scan.
+    ///
+    /// `isCaseSensitive` comes from a volume probe that is allowed to answer
+    /// "unknown", and an unknown answer is read as case-insensitive. On a
+    /// volume that really is case-sensitive, `A.jpg` and `a.jpg` are then two
+    /// manifest rows folding to one canonical path, and both join to the one
+    /// remote object under that name: each upload rewrites the object the
+    /// other one just wrote, so the destination ends up holding neither file
+    /// intact. Skipping the whole group is the only answer that cannot destroy
+    /// data, exactly as on the remote side.
+    ///
+    /// Unlike the remote side the colliding rows stay in the manifest.
+    /// Reconciliation still has to see those paths — that is how a transfer
+    /// already queued against one of them gets discarded before it can run,
+    /// and how their baselines avoid being pruned as if the files had been
+    /// deleted.
+    public func recordCaseCollidingLocalManifestEntries(
+        jobID: SyncJobID,
+        generation: Int64
+    ) throws -> Int {
+        var count = 0
+        try database.transaction {
+            count = try recordCaseCollisionsInsideTransaction(
+                jobID: jobID,
+                side: .local,
+                generation: generation
+            )
+        }
+        return count
+    }
+
+    /// Records the canonical path of every group that more than one entry on
+    /// this side folds to, and returns how many entries those groups hold.
+    private func recordCaseCollisionsInsideTransaction(
+        jobID: SyncJobID,
+        side: ManifestSide,
+        generation: Int64
+    ) throws -> Int {
+        let bindings: [SQLiteValue] = [
+            .text(jobID.description),
+            .text(side.rawValue),
+            .integer(generation)
+        ]
+        try database.execute(
+            "DELETE FROM manifest_conflicts WHERE job_id = ? AND side = ? AND scan_generation = ?",
+            bindings: bindings
+        )
+        var count = 0
+        try database.query(
+            """
+            SELECT COALESCE(SUM(entry_count), 0)
+            FROM (
+              SELECT COUNT(*) AS entry_count
+              FROM manifest
+              WHERE job_id = ? AND side = ? AND scan_generation = ?
+              GROUP BY canonical_path
+              HAVING COUNT(*) > 1
+            )
+            """,
+            bindings: bindings
+        ) { statement in
+            count = Int(database.integer(statement, column: 0))
+        }
+        guard count > 0 else { return 0 }
+        try database.execute(
+            """
+            INSERT INTO manifest_conflicts(job_id, side, scan_generation, canonical_path)
+            SELECT ?, ?, ?, canonical_path
+            FROM manifest
+            WHERE job_id = ? AND side = ? AND scan_generation = ?
+            GROUP BY canonical_path
+            HAVING COUNT(*) > 1
+            """,
+            bindings: bindings + bindings
+        )
         return count
     }
 
@@ -962,6 +991,7 @@ public actor SyncRepository {
             .text(secondarySide),
             .integer(secondaryGeneration),
             .integer(remoteGeneration),
+            .integer(localGeneration),
             .text(jobID.description),
             .text(primarySide),
             .integer(primaryGeneration)
@@ -970,20 +1000,31 @@ public actor SyncRepository {
         bindings.append(.integer(Int64(limit)))
 
         var rows: [ManifestReconciliationRow] = []
+        // Both sides' collisions are reported against whichever side is the
+        // source of this direction, because either one makes the pairing
+        // ambiguous: two objects that one local name would have to hold, or
+        // two local files that one object would have to represent.
         try database.query(
             """
             SELECT source.relative_path, source.payload, secondary.payload, baseline.payload,
-                   conflict.canonical_path IS NOT NULL
+                   remote_conflict.canonical_path IS NOT NULL,
+                   local_conflict.canonical_path IS NOT NULL
             FROM manifest AS source
             LEFT JOIN manifest AS secondary
               ON secondary.job_id = source.job_id
              AND secondary.side = ?
              AND secondary.scan_generation = ?
              AND \(joinPath)
-            LEFT JOIN manifest_conflicts AS conflict
-              ON conflict.job_id = source.job_id
-             AND conflict.scan_generation = ?
-             AND conflict.canonical_path = source.canonical_path
+            LEFT JOIN manifest_conflicts AS remote_conflict
+              ON remote_conflict.job_id = source.job_id
+             AND remote_conflict.side = 'remote'
+             AND remote_conflict.scan_generation = ?
+             AND remote_conflict.canonical_path = source.canonical_path
+            LEFT JOIN manifest_conflicts AS local_conflict
+              ON local_conflict.job_id = source.job_id
+             AND local_conflict.side = 'local'
+             AND local_conflict.scan_generation = ?
+             AND local_conflict.canonical_path = source.canonical_path
             LEFT JOIN baselines AS baseline
               ON baseline.job_id = source.job_id
              AND baseline.relative_path = source.relative_path
@@ -1019,7 +1060,8 @@ public actor SyncRepository {
                     local: local,
                     remote: remote,
                     baseline: try baselinePayload.map { try decoder.decode(ReconciliationBaseline.self, from: $0) },
-                    hasRemotePathCollision: database.integer(statement, column: 4) != 0
+                    hasRemotePathCollision: database.integer(statement, column: 4) != 0,
+                    hasLocalPathCollision: database.integer(statement, column: 5) != 0
                 )
             )
         }
@@ -1158,13 +1200,28 @@ public actor SyncRepository {
         try database.execute("CREATE INDEX IF NOT EXISTS manifest_scan_generation ON manifest(job_id, side, scan_generation)")
         try database.execute("CREATE INDEX IF NOT EXISTS manifest_reconcile_path ON manifest(job_id, side, scan_generation, relative_path)")
         try database.execute("CREATE INDEX IF NOT EXISTS manifest_reconcile_canonical ON manifest(job_id, side, scan_generation, canonical_path)")
+        // `manifest_conflicts` gained a side once local collisions were
+        // detected as well. A local and a remote group can name the same
+        // canonical path in the same cycle, and the two sides number their
+        // generations independently, so the old primary key would have made
+        // them one row. A primary key cannot be widened in place, and the
+        // table holds nothing but state the next scan recomputes before
+        // anything reads it, so an older one is dropped rather than migrated.
+        var conflictColumns: Set<String> = []
+        try database.query("PRAGMA table_info(manifest_conflicts)") { statement in
+            if let column = database.text(statement, column: 1) { conflictColumns.insert(column) }
+        }
+        if !conflictColumns.isEmpty, !conflictColumns.contains("side") {
+            try database.execute("DROP TABLE manifest_conflicts")
+        }
         try database.execute(
             """
             CREATE TABLE IF NOT EXISTS manifest_conflicts(
               job_id TEXT NOT NULL,
+              side TEXT NOT NULL,
               scan_generation INTEGER NOT NULL,
               canonical_path TEXT NOT NULL,
-              PRIMARY KEY(job_id, scan_generation, canonical_path)
+              PRIMARY KEY(job_id, side, scan_generation, canonical_path)
             )
             """
         )
@@ -1297,26 +1354,37 @@ public actor SyncRepository {
     /// Additive upgrade path for queue rows written before the activity ledger
     /// existed. Once a job has an activity state, later launches never rebuild
     /// it from terminal queue history; they preserve the exact current batch.
+    /// Jobs that already have one are excluded in SQL rather than after
+    /// loading, because `init` is synchronous and runs before the XPC listener
+    /// resumes: an already-migrated database must not pay to fetch and decode
+    /// an outstanding queue that the product contract lets grow to millions of
+    /// rows. It reads no payloads at all, and the ordering below still governs
+    /// the rows of any job that does need building.
     private static func backfillTransferActivityIfNeeded(
         database: SQLiteDatabase,
         encoder: JSONEncoder,
         decoder: JSONDecoder
     ) throws {
         var transfersByJob: [SyncJobID: [TransferRecord]] = [:]
-        try database.query("SELECT payload FROM transfers ORDER BY job_id, updated_at ASC") { statement in
+        // NOT EXISTS rather than NOT IN: SQLite does not imply NOT NULL on a
+        // TEXT PRIMARY KEY, and one NULL job_id would make NOT IN match nothing
+        // and silently skip the backfill for every job.
+        try database.query(
+            """
+            SELECT payload FROM transfers
+            WHERE NOT EXISTS (
+              SELECT 1 FROM transfer_activity_state
+              WHERE transfer_activity_state.job_id = transfers.job_id
+            )
+            ORDER BY job_id, updated_at ASC
+            """
+        ) { statement in
             guard let payload = database.blob(statement, column: 0) else { return }
             let transfer = try decoder.decode(TransferRecord.self, from: payload)
             transfersByJob[transfer.jobID, default: []].append(transfer)
         }
 
         for (jobID, transfers) in transfersByJob {
-            var hasState = false
-            try database.query(
-                "SELECT 1 FROM transfer_activity_state WHERE job_id = ? LIMIT 1",
-                bindings: [.text(jobID.description)]
-            ) { _ in hasState = true }
-            guard !hasState else { continue }
-
             let batchID = UUID()
             try database.transaction {
                 try database.execute(
