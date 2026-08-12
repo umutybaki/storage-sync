@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import SQLite3
 import StorageSyncCore
 import StorageSyncEngine
 import StorageSyncPersistence
@@ -75,6 +76,13 @@ private final class KeychainReferenceBox: @unchecked Sendable {
     }
 }
 
+/// One column of a table as SQLite itself describes it, so a schema assertion
+/// reads the file rather than the code that wrote it.
+private struct SQLiteColumn {
+    var name: String
+    var primaryKeyPosition: Int32
+}
+
 private actor ByteProgressRecorder {
     private var values: [Int64] = []
 
@@ -147,10 +155,13 @@ private final class ReliabilitySuite {
         try initialDestinationAdoptionCheck()
         try storageBalanceCheck()
         try await diskBackedManifestCheck()
+        try await localCaseCollisionCheck()
+        try await legacyManifestConflictSchemaCheck()
         try await localScannerBackpressureCheck()
         try await packageContentsScanCheck()
         try await partialDirectorySymlinkCheck()
         try await persistenceRecoveryCheck()
+        try await failedTransferQueueSemanticsCheck()
         try await transferActivityCheck()
         try await persistenceJobRemovalCheck()
         try await credentialStoreCheck()
@@ -1215,6 +1226,398 @@ private final class ReliabilitySuite {
         )
     }
 
+    /// Two files on this Mac whose names differ only by capitalization, and one
+    /// object in the bucket under that name. Nothing is ambiguous remotely, so
+    /// the remote half of the collision rule reports nothing at all — and with
+    /// only that half, reconciliation hands `A.jpg` the key belonging to
+    /// `a.jpg` and uploads one file over the other's contents, then the other
+    /// back over it on the next cycle. Neither version survives at the
+    /// destination, which is the one thing this product may never do.
+    ///
+    /// The fixture stages the two sides at deliberately different scan
+    /// generations, because the manifests number them independently: a
+    /// collision join that read the wrong side's generation would find nothing.
+    /// It also carries baselines for the pair, so this is a second cycle — the
+    /// state where the destination is overwritten — rather than a first pairing
+    /// that would be adopted instead of copied.
+    private func localCaseCollisionCheck() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try SyncRepository(
+            databaseURL: directory.appendingPathComponent("local-collision.sqlite")
+        )
+        let jobID = SyncJobID()
+        let prefix = "backup"
+
+        // An earlier local scan, so that the local and remote sides cannot
+        // share a generation number by accident.
+        let earlierLocalGeneration = try await repository.nextManifestGeneration(jobID: jobID, side: .local)
+        try await repository.upsertLocalManifestEntries(
+            [FileFingerprint(relativePath: "Solo.jpg", size: 30, modificationTimeNanoseconds: 1)],
+            jobID: jobID,
+            generation: earlierLocalGeneration,
+            caseSensitive: false
+        )
+        try await repository.finishManifestScan(
+            jobID: jobID,
+            side: .local,
+            generation: earlierLocalGeneration
+        )
+
+        let localGeneration = try await repository.nextManifestGeneration(jobID: jobID, side: .local)
+        let remoteGeneration = try await repository.nextManifestGeneration(jobID: jobID, side: .remote)
+        try check(
+            localGeneration != remoteGeneration,
+            "The case-collision fixture did not stage the two sides at independent scan generations"
+        )
+
+        let upperCase = FileFingerprint(relativePath: "A.jpg", size: 10, modificationTimeNanoseconds: 10)
+        let lowerCase = FileFingerprint(relativePath: "a.jpg", size: 20, modificationTimeNanoseconds: 20)
+        let uncontested = FileFingerprint(relativePath: "Solo.jpg", size: 30, modificationTimeNanoseconds: 30)
+        try await repository.upsertLocalManifestEntries(
+            [upperCase, lowerCase, uncontested],
+            jobID: jobID,
+            generation: localGeneration,
+            caseSensitive: false
+        )
+        let sharedObject = RemoteObject(key: prefix + "/a.jpg", size: 20, eTag: "remote-a")
+        let bucketOnlyObject = RemoteObject(key: prefix + "/Bucket-only.jpg", size: 40, eTag: "remote-b")
+        try await repository.upsertRemoteManifestEntries(
+            [sharedObject, bucketOnlyObject].map { object in
+                let relativePath = Reconciler.relativePath(for: object.key, prefix: prefix) ?? object.key
+                return RemoteManifestRecord(
+                    relativePath: relativePath,
+                    canonicalPath: Reconciler.canonicalLocalPath(relativePath),
+                    object: object
+                )
+            },
+            jobID: jobID,
+            generation: remoteGeneration
+        )
+        try await repository.finishManifestScan(jobID: jobID, side: .local, generation: localGeneration)
+        try await repository.finishManifestScan(jobID: jobID, side: .remote, generation: remoteGeneration)
+        for fingerprint in [upperCase, lowerCase] {
+            var stale = fingerprint
+            stale.size = 1
+            try await repository.saveBaseline(
+                ReconciliationBaseline(
+                    relativePath: fingerprint.relativePath,
+                    localFingerprint: stale,
+                    remoteETag: sharedObject.eTag,
+                    remoteChecksum: nil,
+                    remoteSize: sharedObject.size
+                ),
+                jobID: jobID
+            )
+        }
+
+        // What an earlier cycle already put in the durable queue: `A.jpg`
+        // addressed at `a.jpg`'s object. Reconciliation has to still see the
+        // colliding paths in order to take this back out, which is why the
+        // local side records its collisions instead of deleting the rows.
+        let queuedBeforeDetection = try await repository.enqueueTransferIfNeeded(
+            TransferPlan(
+                relativePath: upperCase.relativePath,
+                remoteKey: sharedObject.key,
+                kind: .upload,
+                totalBytes: upperCase.size,
+                localFingerprint: upperCase,
+                remoteObject: sharedObject
+            ),
+            jobID: jobID
+        )
+        try check(queuedBeforeDetection, "The case-collision fixture could not queue its poisoned transfer")
+
+        let remoteCollisions = try await repository.removeCaseCollidingRemoteManifestEntries(
+            jobID: jobID,
+            generation: remoteGeneration
+        )
+        try check(
+            remoteCollisions == 0,
+            "The fixture's bucket was ambiguous, so a remote-side collision could account for the flags below"
+        )
+        let localCollisions = try await repository.recordCaseCollidingLocalManifestEntries(
+            jobID: jobID,
+            generation: localGeneration
+        )
+        try check(
+            localCollisions == 2,
+            "Two local files folding to one canonical path were not both recorded as colliding"
+        )
+
+        let uploadRows = try await repository.reconciliationRows(
+            jobID: jobID,
+            direction: .upload,
+            localGeneration: localGeneration,
+            remoteGeneration: remoteGeneration,
+            localCaseSensitive: false,
+            after: nil,
+            limit: 100
+        )
+        try check(
+            uploadRows.map(\.relativePath).sorted() == ["A.jpg", "Solo.jpg", "a.jpg"],
+            "Case-colliding local entries left the manifest, so reconciliation can no longer discard work queued against them: \(uploadRows.map(\.relativePath))"
+        )
+        let collidingUploads = uploadRows.filter { $0.relativePath == "A.jpg" || $0.relativePath == "a.jpg" }
+        try check(
+            collidingUploads.allSatisfy { $0.remote?.key == sharedObject.key },
+            "The fixture did not reproduce two local files pairing with one remote object"
+        )
+        try check(
+            collidingUploads.allSatisfy(\.hasLocalPathCollision),
+            "Two local files that fold to one canonical path were not both reported as colliding"
+        )
+        try check(
+            collidingUploads.allSatisfy { !$0.hasRemotePathCollision },
+            "A local case collision was reported through the remote side's flag, which one remote object never sets"
+        )
+        guard let soloRow = uploadRows.first(where: { $0.relativePath == "Solo.jpg" }) else {
+            throw CheckFailure.failed("The case-collision fixture lost its uncontested file")
+        }
+        try check(
+            !soloRow.hasLocalPathCollision && !soloRow.hasRemotePathCollision,
+            "A file with no case twin was reported as colliding, which would stall a healthy library"
+        )
+
+        // The coordinator's rule, applied here because driving `runCycle` needs
+        // a bookmark store, a keychain and a live object store. Initial
+        // adoption is deliberately absent: both colliding paths already carry
+        // baselines, so this is the cycle that copies, not the one that adopts.
+        let reconciler = Reconciler()
+        var uploadPlans: [TransferPlan] = []
+        var obsoletePaths: [String] = []
+        for row in uploadRows {
+            if row.hasLocalPathCollision || row.hasRemotePathCollision {
+                obsoletePaths.append(row.relativePath)
+                continue
+            }
+            let remoteKeyOverride: String?
+            if let remote = row.remote,
+               Reconciler.relativePath(for: remote.key, prefix: prefix) != row.relativePath {
+                remoteKeyOverride = remote.key
+            } else {
+                remoteKeyOverride = nil
+            }
+            if let plan = reconciler.transferPlan(
+                direction: .upload,
+                prefix: prefix,
+                relativePath: row.relativePath,
+                local: row.local,
+                remote: row.remote,
+                baseline: row.baseline,
+                remoteKeyOverride: remoteKeyOverride
+            ) {
+                uploadPlans.append(plan)
+            }
+        }
+        try check(
+            uploadPlans.map(\.remoteKey) == [prefix + "/Solo.jpg"],
+            "An ambiguous pair was planned onto one remote key: \(uploadPlans.map(\.relativePath)) → \(uploadPlans.map(\.remoteKey))"
+        )
+
+        try await repository.discardTransfers(jobID: jobID, relativePaths: obsoletePaths)
+        let queueAfterDetection = try await repository.transfers(
+            jobID: jobID,
+            relativePaths: [upperCase.relativePath, lowerCase.relativePath]
+        )
+        try check(
+            queueAfterDetection.isEmpty,
+            "A transfer queued against a case-colliding local path outlived the cycle that found the collision"
+        )
+
+        // The same ambiguity seen from the other direction. The source rows are
+        // the bucket's, and the one object under this name matches both local
+        // files, so which of them a restore would replace is unknowable.
+        let downloadRows = try await repository.reconciliationRows(
+            jobID: jobID,
+            direction: .download,
+            localGeneration: localGeneration,
+            remoteGeneration: remoteGeneration,
+            localCaseSensitive: false,
+            after: nil,
+            limit: 100
+        )
+        let ambiguousDownloads = downloadRows.filter { $0.relativePath == "a.jpg" }
+        try check(
+            !ambiguousDownloads.isEmpty,
+            "The download fixture lost the object that two local names fold onto"
+        )
+        try check(
+            ambiguousDownloads.allSatisfy(\.hasLocalPathCollision),
+            "A remote source row was not told that two local files fold onto its path"
+        )
+        try check(
+            ambiguousDownloads.allSatisfy { !$0.hasRemotePathCollision },
+            "A download's local ambiguity was reported as a remote one, which the single object in this bucket cannot be"
+        )
+        var downloadPlans: [TransferPlan] = []
+        for row in downloadRows where !row.hasLocalPathCollision && !row.hasRemotePathCollision {
+            if let plan = reconciler.transferPlan(
+                direction: .download,
+                prefix: prefix,
+                relativePath: row.relativePath,
+                local: row.local,
+                remote: row.remote,
+                baseline: row.baseline
+            ) {
+                downloadPlans.append(plan)
+            }
+        }
+        try check(
+            downloadPlans.map(\.relativePath) == ["Bucket-only.jpg"],
+            "A restore was planned onto a local name that two files already fold to: \(downloadPlans.map(\.relativePath))"
+        )
+    }
+
+    /// The upgrade every existing installation takes. The database on this Mac
+    /// has the three-column `manifest_conflicts` this fixture builds, whose
+    /// primary key cannot tell a local collision from a remote one: recording
+    /// both for one canonical path in one cycle either merged them into a
+    /// single row or failed outright. The table holds nothing but state the
+    /// next scan recomputes, so the current build drops an older one instead of
+    /// migrating it — and must leave a table that is already current alone.
+    private func legacyManifestConflictSchemaCheck() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("legacy-conflicts.sqlite")
+        let jobID = SyncJobID()
+        let generation: Int64 = 1
+        try executeSQLiteStatements(
+            at: databaseURL,
+            [
+                """
+                CREATE TABLE manifest_conflicts(
+                  job_id TEXT NOT NULL,
+                  scan_generation INTEGER NOT NULL,
+                  canonical_path TEXT NOT NULL,
+                  PRIMARY KEY(job_id, scan_generation, canonical_path)
+                )
+                """,
+                """
+                INSERT INTO manifest_conflicts(job_id, scan_generation, canonical_path)
+                VALUES ('\(jobID.description)', \(generation), 'stale.jpg')
+                """,
+                "PRAGMA user_version=3"
+            ]
+        )
+        let legacyColumns = try manifestConflictColumns(at: databaseURL)
+        try check(
+            legacyColumns.map(\.name) == ["job_id", "scan_generation", "canonical_path"],
+            "The legacy fixture did not build the table shape an installed copy actually has: \(legacyColumns.map(\.name))"
+        )
+
+        let repository: SyncRepository
+        do {
+            repository = try SyncRepository(databaseURL: databaseURL)
+        } catch {
+            throw CheckFailure.failed("An existing installation's database could not be opened: \(error)")
+        }
+        let upgradedColumns = try manifestConflictColumns(at: databaseURL)
+        try check(
+            upgradedColumns.contains(where: { $0.name == "side" }),
+            "Opening an existing installation's database left the conflict table with no side"
+        )
+        let upgradedKey = upgradedColumns
+            .filter { $0.primaryKeyPosition > 0 }
+            .sorted { $0.primaryKeyPosition < $1.primaryKeyPosition }
+            .map(\.name)
+        try check(
+            upgradedKey == ["job_id", "side", "scan_generation", "canonical_path"],
+            "The upgraded conflict table's primary key still merges the two sides: \(upgradedKey)"
+        )
+
+        // One canonical path that collides on both sides in the same cycle, at
+        // the same generation, which the old key had no room to hold. `Stale`
+        // folds onto the canonical path of the row left behind by the previous
+        // schema: a conflict carried across would block a file that has no
+        // collision at all, and would do it silently and forever.
+        let collidingPaths = ["A.jpg", "a.jpg"]
+        try await repository.upsertLocalManifestEntries(
+            (collidingPaths + ["Stale.jpg"]).enumerated().map { index, path in
+                FileFingerprint(
+                    relativePath: path,
+                    size: Int64(index + 1),
+                    modificationTimeNanoseconds: Int64(index + 1)
+                )
+            },
+            jobID: jobID,
+            generation: generation,
+            caseSensitive: false
+        )
+        try await repository.upsertRemoteManifestEntries(
+            collidingPaths.map { path in
+                RemoteManifestRecord(
+                    relativePath: path,
+                    canonicalPath: Reconciler.canonicalLocalPath(path),
+                    object: RemoteObject(key: "backup/" + path, size: 1, eTag: "etag-" + path)
+                )
+            },
+            jobID: jobID,
+            generation: generation
+        )
+        try await repository.finishManifestScan(jobID: jobID, side: .local, generation: generation)
+        try await repository.finishManifestScan(jobID: jobID, side: .remote, generation: generation)
+        let localCollisions = try await repository.recordCaseCollidingLocalManifestEntries(
+            jobID: jobID,
+            generation: generation
+        )
+        // Recorded after the local side deliberately: a cleanup that forgot to
+        // name the side would take the local rows out again here.
+        let remoteCollisions = try await repository.removeCaseCollidingRemoteManifestEntries(
+            jobID: jobID,
+            generation: generation
+        )
+        try check(
+            localCollisions == 2 && remoteCollisions == 2,
+            "An upgraded database did not record both sides' collisions: \(localCollisions) local, \(remoteCollisions) remote"
+        )
+
+        let rows = try await repository.reconciliationRows(
+            jobID: jobID,
+            direction: .upload,
+            localGeneration: generation,
+            remoteGeneration: generation,
+            localCaseSensitive: false,
+            after: nil,
+            limit: 100
+        )
+        let collidingRows = rows.filter { collidingPaths.contains($0.relativePath) }
+        try check(
+            collidingRows.count == collidingPaths.count
+                && collidingRows.allSatisfy { $0.hasLocalPathCollision && $0.hasRemotePathCollision },
+            "One canonical path could not hold a local and a remote collision at once, which is what the old primary key merged"
+        )
+        guard let staleRow = rows.first(where: { $0.relativePath == "Stale.jpg" }) else {
+            throw CheckFailure.failed("The legacy upgrade fixture lost its uncontested file")
+        }
+        try check(
+            !staleRow.hasLocalPathCollision && !staleRow.hasRemotePathCollision,
+            "A conflict row from the previous schema survived the upgrade and now blocks a file that does not collide"
+        )
+
+        let relaunched: SyncRepository
+        do {
+            relaunched = try SyncRepository(databaseURL: databaseURL)
+        } catch {
+            throw CheckFailure.failed("An already-upgraded database could not be reopened: \(error)")
+        }
+        let rowsAfterRelaunch = try await relaunched.reconciliationRows(
+            jobID: jobID,
+            direction: .upload,
+            localGeneration: generation,
+            remoteGeneration: generation,
+            localCaseSensitive: false,
+            after: nil,
+            limit: 100
+        )
+        let collidingRowsAfterRelaunch = rowsAfterRelaunch.filter { collidingPaths.contains($0.relativePath) }
+        try check(
+            collidingRowsAfterRelaunch.count == collidingPaths.count
+                && collidingRowsAfterRelaunch.allSatisfy { $0.hasLocalPathCollision && $0.hasRemotePathCollision },
+            "Launching again dropped a conflict table that was already the current shape"
+        )
+    }
+
     private func localScannerBackpressureCheck() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1317,6 +1720,138 @@ private final class ReliabilitySuite {
         try check(
             reportedPaths == visiblePlans.map(\.relativePath) && duplicatePaths.isEmpty,
             "The durable queue did not report exactly the newly visible paths"
+        )
+    }
+
+    /// One file that can never be copied no longer parks the whole job, and the
+    /// reason that cannot turn into a hot retry loop is entirely in the durable
+    /// queue's treatment of a terminal row: it is not outstanding work, it
+    /// schedules no wake-up, and the next cycle replaces it with exactly one
+    /// fresh attempt rather than piling attempts up or re-running it inside the
+    /// same cycle.
+    private func failedTransferQueueSemanticsCheck() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try SyncRepository(
+            databaseURL: directory.appendingPathComponent("failed-queue.sqlite")
+        )
+        let jobID = SyncJobID()
+        let fingerprint = FileFingerprint(
+            relativePath: "oversized.raw",
+            size: 4_096,
+            modificationTimeNanoseconds: 1
+        )
+        let plan = TransferPlan(
+            relativePath: fingerprint.relativePath,
+            remoteKey: "backup/" + fingerprint.relativePath,
+            kind: .upload,
+            totalBytes: fingerprint.size,
+            localFingerprint: fingerprint,
+            remoteObject: nil
+        )
+        let didEnqueue = try await repository.enqueueTransferIfNeeded(plan, jobID: jobID)
+        try check(didEnqueue, "The failed-queue fixture could not enqueue its file")
+        guard var attempt = try await repository.transfers(
+            jobID: jobID,
+            relativePaths: [plan.relativePath]
+        ).first else {
+            throw CheckFailure.failed("The failed-queue fixture lost its queue row")
+        }
+
+        // What the executor leaves behind for a file that will never transfer.
+        // The retry time it still carries is deliberate: a terminal row must
+        // not schedule anything even when one is written on it.
+        attempt.status = .failed
+        attempt.retryCount = 5
+        attempt.lastError = "The file is larger than the provider allows"
+        attempt.nextAttemptAt = Date().addingTimeInterval(1)
+        attempt.updatedAt = Date()
+        try await repository.saveTransfer(attempt)
+
+        let activeWithOnlyFailure = try await repository.activeTransferSummary(jobID: jobID)
+        try check(
+            activeWithOnlyFailure == TransferQueueSummary(count: 0, totalBytes: 0, completedBytes: 0),
+            "A terminally failed file was counted as outstanding work, so its job can never report itself caught up"
+        )
+        let waitingAttemptWithOnlyFailure = try await repository.nextWaitingAttempt(jobID: jobID)
+        try check(
+            waitingAttemptWithOnlyFailure == nil,
+            "A terminally failed file scheduled a wake-up, which would re-run the cycle to fail it again"
+        )
+        let runnableWithOnlyFailure = try await repository.runnableTransfers(jobID: jobID)
+        try check(
+            runnableWithOnlyFailure.isEmpty,
+            "A terminally failed file was handed straight back to the transfer loop"
+        )
+
+        // A genuinely retrying file on another path. Its retry time is the
+        // later of the two, so a timer taken from the failed row would fire
+        // first and be visible here.
+        let retryAt = Date().addingTimeInterval(3_600)
+        try await repository.saveTransfer(
+            TransferRecord(
+                jobID: jobID,
+                relativePath: "retrying.raw",
+                kind: .upload,
+                status: .waiting,
+                totalBytes: 1_000,
+                completedBytes: 250,
+                remoteKey: "backup/retrying.raw",
+                retryCount: 2,
+                nextAttemptAt: retryAt,
+                lastError: "The network is unavailable"
+            )
+        )
+        let activeBesideRetry = try await repository.activeTransferSummary(jobID: jobID)
+        try check(
+            activeBesideRetry == TransferQueueSummary(count: 1, totalBytes: 1_000, completedBytes: 250),
+            "The queue inventory beside a failed file was not exactly the file that is still retrying"
+        )
+        guard let nextAttempt = try await repository.nextWaitingAttempt(jobID: jobID) else {
+            throw CheckFailure.failed("A retrying file stopped scheduling its own wake-up")
+        }
+        try check(
+            abs(nextAttempt.timeIntervalSince(retryAt)) < 0.01,
+            "The retry timer was taken from a terminally failed row, which is the hot loop this design has to avoid"
+        )
+
+        // The next cycle re-plans the same path: one fresh attempt, replacing
+        // the terminal row rather than accumulating beside it.
+        let didRequeue = try await repository.enqueueTransferIfNeeded(plan, jobID: jobID)
+        try check(didRequeue, "The next cycle could not re-plan a file whose last attempt failed")
+        let terminalRow = try await repository.transfer(id: attempt.id)
+        try check(terminalRow == nil, "A replaced terminal row was left behind next to its replacement")
+        let rowsForPath = try await repository.transfers(
+            jobID: jobID,
+            relativePaths: [plan.relativePath]
+        )
+        guard rowsForPath.count == 1, let fresh = rowsForPath.first else {
+            throw CheckFailure.failed(
+                "Re-planning a failed file left \(rowsForPath.count) rows for one path"
+            )
+        }
+        try check(
+            fresh.id != attempt.id
+                && fresh.status == .queued
+                && fresh.retryCount == 0
+                && fresh.lastError == nil
+                && fresh.nextAttemptAt == nil,
+            "A re-planned file did not start from a clean attempt"
+        )
+        let runnableAfterRequeue = try await repository.runnableTransfers(jobID: jobID)
+        try check(
+            runnableAfterRequeue.map(\.id) == [fresh.id],
+            "A re-planned file was not the single piece of work this cycle can run"
+        )
+        let repeatedEnqueue = try await repository.enqueueTransferIfNeeded(plan, jobID: jobID)
+        try check(
+            !repeatedEnqueue,
+            "The same cycle queued one path twice, which is the spin a per-file failure must not start"
+        )
+        let activeAfterRequeue = try await repository.activeTransferSummary(jobID: jobID)
+        try check(
+            activeAfterRequeue.count == 2,
+            "A freshly re-planned file was hidden from the queue inventory"
         )
     }
 
@@ -2441,6 +2976,69 @@ private final class ReliabilitySuite {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("storagesync-tests-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    /// Builds a database the way an earlier build left one behind. The
+    /// repository's own SQLite wrapper is internal to the persistence module,
+    /// and using it here would describe the fixture in terms of the code under
+    /// test, so this talks to SQLite directly.
+    private func executeSQLiteStatements(at url: URL, _ statements: [String]) throws {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(
+            url.path,
+            &handle,
+            SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE,
+            nil
+        ) == SQLITE_OK, let handle else {
+            let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown SQLite error"
+            sqlite3_close(handle)
+            throw CheckFailure.failed("The schema fixture could not open \(url.lastPathComponent): \(message)")
+        }
+        defer { sqlite3_close(handle) }
+        for statement in statements {
+            guard sqlite3_exec(handle, statement, nil, nil, nil) == SQLITE_OK else {
+                let message = String(cString: sqlite3_errmsg(handle))
+                throw CheckFailure.failed("The schema fixture could not run \(statement): \(message)")
+            }
+        }
+    }
+
+    /// The conflict table's columns and where each one sits in the primary key,
+    /// read from the file itself rather than from the code that wrote it.
+    private func manifestConflictColumns(at url: URL) throws -> [SQLiteColumn] {
+        var handle: OpaquePointer?
+        // Opened read-write rather than read-only: the repository puts the
+        // database into WAL, and a read-only connection cannot open one.
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+              let handle else {
+            let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown SQLite error"
+            sqlite3_close(handle)
+            throw CheckFailure.failed("The conflict table's shape could not be read: \(message)")
+        }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            handle,
+            "PRAGMA table_info(manifest_conflicts)",
+            -1,
+            &statement,
+            nil
+        ) == SQLITE_OK, let statement else {
+            let message = String(cString: sqlite3_errmsg(handle))
+            throw CheckFailure.failed("The conflict table could not be inspected: \(message)")
+        }
+        defer { sqlite3_finalize(statement) }
+        var columns: [SQLiteColumn] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let name = sqlite3_column_text(statement, 1) else { continue }
+            columns.append(
+                SQLiteColumn(
+                    name: String(cString: name),
+                    primaryKeyPosition: sqlite3_column_int(statement, 5)
+                )
+            )
+        }
+        return columns
     }
 }
 
