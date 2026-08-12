@@ -11,6 +11,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var jobs: [SyncJob] = []
     @Published private(set) var connections: [ConnectionID: S3Connection] = [:]
     @Published private(set) var snapshots: [SyncJobID: SyncSnapshot] = [:]
+    /// The last complete storage balance seen for each sync, so an unplugged
+    /// drive dims the picture instead of erasing it. See `BalanceReading`.
+    @Published private(set) var lastKnownBalances: [SyncJobID: StorageBalance] = [:]
     @Published var selectedJobID: SyncJobID?
     @Published var isCreatingSync = false
     @Published var credentialsJob: SyncJob?
@@ -22,6 +25,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var needsLoginItemsApproval = false
 
     private let client = AgentClient()
+    /// Not published: it changes on every poll and only matters once a reading
+    /// has gone stale, so republishing the whole model for it would be waste.
+    private var balancesSeenAt: [SyncJobID: Date] = [:]
     private var pollingTask: Task<Void, Never>?
     private var registrationTask: Task<Void, Never>?
     /// When the agent first stopped answering, so a momentary gap is not
@@ -70,6 +76,16 @@ final class AppModel: ObservableObject {
         SyncStatus(job: job, snapshot: snapshot(for: job.id))
     }
 
+    /// The balance to draw for a sync: the live one when the last poll carried
+    /// the numbers, otherwise the last one that did.
+    func balanceReading(for job: SyncJob) -> BalanceReading? {
+        if let balance = StorageBalance(snapshot: snapshot(for: job.id), direction: job.direction) {
+            return BalanceReading(balance: balance, isCurrent: true, asOf: balancesSeenAt[job.id])
+        }
+        guard let remembered = lastKnownBalances[job.id] else { return nil }
+        return BalanceReading(balance: remembered, isCurrent: false, asOf: balancesSeenAt[job.id])
+    }
+
     func connection(for job: SyncJob) -> S3Connection? {
         connections[job.connectionID]
     }
@@ -102,6 +118,7 @@ final class AppModel: ObservableObject {
             jobs = loadedJobs.sorted { $0.createdAt < $1.createdAt }
             snapshots = Dictionary(uniqueKeysWithValues: loadedSnapshots.map { ($0.jobID, $0) })
             connections = Dictionary(uniqueKeysWithValues: loadedConnections.map { ($0.id, $0) })
+            rememberBalances()
             isAgentAvailable = true
             unreachableSince = nil
             if selectedJobID == nil || !jobs.contains(where: { $0.id == selectedJobID }) {
@@ -110,6 +127,27 @@ final class AppModel: ObservableObject {
         } catch {
             isAgentAvailable = false
             if unreachableSince == nil { unreachableSince = Date() }
+        }
+    }
+
+    /// Keeps the newest complete picture of every sync, and drops the ones
+    /// whose job has been removed so a long-running app cannot accumulate them.
+    private func rememberBalances() {
+        let now = Date()
+        for job in jobs {
+            guard let balance = StorageBalance(
+                snapshot: snapshot(for: job.id),
+                direction: job.direction
+            ) else { continue }
+            balancesSeenAt[job.id] = now
+            if lastKnownBalances[job.id] != balance {
+                lastKnownBalances[job.id] = balance
+            }
+        }
+        let liveIDs = Set(jobs.map(\.id))
+        balancesSeenAt = balancesSeenAt.filter { liveIDs.contains($0.key) }
+        if lastKnownBalances.contains(where: { !liveIDs.contains($0.key) }) {
+            lastKnownBalances = lastKnownBalances.filter { liveIDs.contains($0.key) }
         }
     }
 

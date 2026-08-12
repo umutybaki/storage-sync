@@ -411,6 +411,18 @@ public struct SyncSnapshot: Codable, Hashable, Sendable {
     public var sourceFilesFound: Int?
     public var destinationFilesFound: Int?
     public var filesAlreadyPresent: Int?
+    /// Bytes the source side held at the scan that opened this cycle.
+    public var sourceBytesFound: Int64?
+    /// Bytes at the destination that count as current: everything the scan
+    /// found there, minus whatever a queued transfer is about to replace.
+    /// Without that subtraction a changed file is counted at both ends and
+    /// inflates the total the storage balance is drawn against.
+    ///
+    /// This is deliberately *not* advanced as individual files complete.
+    /// `StorageBalance` adds `bytesCompleted` to it, so incrementing here too
+    /// would count the same bytes twice; the coordinator folds the run's
+    /// finished work in once, when the transfer loop ends.
+    public var destinationBytesInPlace: Int64?
 
     public init(
         jobID: SyncJobID,
@@ -425,7 +437,9 @@ public struct SyncSnapshot: Codable, Hashable, Sendable {
         message: String = "",
         sourceFilesFound: Int? = nil,
         destinationFilesFound: Int? = nil,
-        filesAlreadyPresent: Int? = nil
+        filesAlreadyPresent: Int? = nil,
+        sourceBytesFound: Int64? = nil,
+        destinationBytesInPlace: Int64? = nil
     ) {
         self.jobID = jobID
         self.phase = phase
@@ -440,5 +454,7 @@ public struct SyncSnapshot: Codable, Hashable, Sendable {
         self.sourceFilesFound = sourceFilesFound
         self.destinationFilesFound = destinationFilesFound
         self.filesAlreadyPresent = filesAlreadyPresent
+        self.sourceBytesFound = sourceBytesFound
+        self.destinationBytesInPlace = destinationBytesInPlace
     }
 }

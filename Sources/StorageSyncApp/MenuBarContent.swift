@@ -219,20 +219,13 @@ private struct MenuJobRow: View {
                         .foregroundStyle(.secondary)
                         .labelStyle(.statusLine)
 
-                        if snapshot.hasMeasurableProgress {
-                            ProgressView(value: snapshot.fractionCompleted)
-                                .controlSize(.small)
-                                .padding(.top, 1)
-                            Text(snapshot.progressSummary)
-                                .font(.caption2)
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                        } else if let inventory = snapshot.inventory, inventory.found > 0 {
-                            Text(countSummary(inventory))
-                                .font(.caption2)
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                        if let reading = model.balanceReading(for: job) {
+                            StorageBalanceView(
+                                reading: reading,
+                                style: .compact,
+                                isTransferring: snapshot.phase == .transferring
+                            )
+                            .padding(.top, 2)
                         }
                     }
 
@@ -257,13 +250,6 @@ private struct MenuJobRow: View {
         }
         .onHover { isHovering = $0 }
         .help(SyncRoute.text(job, connection: connection))
-    }
-
-    private func countSummary(_ inventory: SyncInventory) -> String {
-        if inventory.remaining > 0 {
-            return "\(inventory.remaining.formatted()) of \(inventory.found.formatted()) files remaining"
-        }
-        return "\(inventory.found.formatted()) files"
     }
 }
 

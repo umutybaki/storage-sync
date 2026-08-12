@@ -117,6 +117,7 @@ private final class ReliabilitySuite {
         try await s3HTTPErrorClassificationCheck()
         try reconciliationSafetyCheck()
         try initialDestinationAdoptionCheck()
+        try storageBalanceCheck()
         try await diskBackedManifestCheck()
         try await localScannerBackpressureCheck()
         try await packageContentsScanCheck()
@@ -238,6 +239,150 @@ private final class ReliabilitySuite {
         try check(
             !expectedVolume.confidentlyMatches(clonedVolume),
             "A different external volume with a cloned filesystem UUID passed the marker check"
+        )
+    }
+
+    /// The interface draws what is on this Mac, what is moving, and what is in
+    /// the bucket as three lines on one shared scale, and every one of those
+    /// lengths comes out of `StorageBalance`. Two properties make that drawing
+    /// honest rather than decorative: the destination line plus the pending
+    /// line must always be the entire width, and the width must not change
+    /// while a run fills it in. A bar that quietly rescales as it advances
+    /// would let a sync appear to make progress it has not made.
+    ///
+    /// This covers the arithmetic, which is where the subtlety is. What the
+    /// coordinator feeds it is not reachable from here: `runCycle` needs a
+    /// bookmark store, a keychain and a live object store.
+    private func storageBalanceCheck() throws {
+        func balance(
+            _ direction: SyncDirection = .upload,
+            source: Int64,
+            destination: Int64,
+            queued: Int64,
+            moved: Int64 = 0,
+            sourceFiles: Int = 0,
+            destinationFiles: Int = 0,
+            alreadyPresent: Int = 0,
+            queuedFiles: Int = 0
+        ) throws -> StorageBalance {
+            let snapshot = SyncSnapshot(
+                jobID: SyncJobID(),
+                phase: .transferring,
+                filesTotal: queuedFiles,
+                bytesCompleted: moved,
+                bytesTotal: queued,
+                sourceFilesFound: sourceFiles,
+                destinationFilesFound: destinationFiles,
+                filesAlreadyPresent: alreadyPresent,
+                sourceBytesFound: source,
+                destinationBytesInPlace: destination
+            )
+            guard let value = StorageBalance(snapshot: snapshot, direction: direction) else {
+                throw CheckFailure.failed("A snapshot carrying byte totals produced no storage balance")
+            }
+            return value
+        }
+        func near(_ value: Double, _ expected: Double) -> Bool { abs(value - expected) < 0.0001 }
+
+        // A library entirely on this Mac, most of it already uploaded: the top
+        // line covers everything, the middle covers what is left, and the two
+        // lower lines divide the width between them.
+        let wholeLibraryHere = try balance(source: 1_000, destination: 800, queued: 200)
+        try check(wholeLibraryHere.totalBytes == 1_000, "A fully local library did not size the balance to itself")
+        try check(near(wholeLibraryHere.localFraction, 1), "A fully local library did not fill the local line")
+        try check(near(wholeLibraryHere.pendingFraction, 0.2), "The pending line did not cover the un-uploaded fifth")
+        try check(near(wholeLibraryHere.cloudFraction, 0.8), "The cloud line did not cover the uploaded four fifths")
+
+        // A bucket holding more than this Mac does: 1,500 uploaded earlier, 800
+        // here of which 300 are already up there, 500 still to go.
+        let bucketHoldsMore = try balance(
+            source: 800,
+            destination: 1_500,
+            queued: 500,
+            sourceFiles: 800,
+            destinationFiles: 1_500,
+            alreadyPresent: 300,
+            queuedFiles: 500
+        )
+        try check(bucketHoldsMore.totalBytes == 2_000, "The balance did not span everything on both sides")
+        try check(near(bucketHoldsMore.localFraction, 0.4), "The local line did not cover two fifths")
+        try check(near(bucketHoldsMore.pendingFraction, 0.25), "The pending line did not cover a quarter")
+        try check(near(bucketHoldsMore.cloudFraction, 0.75), "The cloud line did not cover three quarters")
+        try check(bucketHoldsMore.sharedBytes == 300, "The overlap between the two sides was miscounted")
+        try check(bucketHoldsMore.cloudOnlyBytes == 1_200, "Bucket content absent from this Mac was miscounted")
+        try check(bucketHoldsMore.localFiles == 800, "The local file count did not follow the sync's direction")
+        try check(bucketHoldsMore.cloudFiles == 1_500, "The cloud file count did not follow the sync's direction")
+        try check(bucketHoldsMore.sharedFiles == 300, "The already-present file count was not carried through")
+        try check(bucketHoldsMore.pendingFiles == 500, "The remaining file count was not carried through")
+
+        // The whole run, byte by byte. The width has to stay put and the two
+        // lower lines have to keep dividing it exactly.
+        for moved in stride(from: Int64(0), through: 500, by: 125) {
+            let during = try balance(source: 800, destination: 1_500, queued: 500, moved: moved)
+            try check(
+                during.cloudBytes + during.pendingBytes == during.totalBytes,
+                "The cloud and pending lines stopped covering the whole width at \(moved) bytes moved"
+            )
+            try check(
+                during.totalBytes == 2_000,
+                "The balance rescaled mid-run at \(moved) bytes moved"
+            )
+            try check(
+                near(during.localFraction, 0.4),
+                "The local line moved while only the destination was gaining, at \(moved) bytes moved"
+            )
+        }
+
+        // What the coordinator writes once the transfer loop ends: the moved
+        // bytes are folded into the destination and the queue is reset. The
+        // balance has to read the same on both sides of that hand-off.
+        let duringLastByte = try balance(source: 800, destination: 1_500, queued: 500, moved: 500)
+        let afterCycle = try balance(source: 800, destination: 2_000, queued: 0, moved: 0)
+        try check(
+            afterCycle.totalBytes == duringLastByte.totalBytes
+                && afterCycle.cloudBytes == duringLastByte.cloudBytes,
+            "The balance jumped when the finished run was folded into the destination"
+        )
+        try check(!afterCycle.hasPendingWork, "A finished run still reported work in flight")
+        try check(near(afterCycle.cloudFraction, 1), "A finished upload did not fill the cloud line")
+
+        // The batch seen from the inside, which is the number a long copy is
+        // actually watched by. It is independent of how large the library is.
+        let midBatch = try balance(source: 800, destination: 1_500, queued: 500, moved: 125)
+        try check(near(midBatch.runFraction, 0.25), "This run's own progress was misreported")
+        try check(near(duringLastByte.runFraction, 1), "A fully copied run did not report itself finished")
+        try check(near(afterCycle.runFraction, 0), "An empty queue reported progress through nothing")
+
+        // A changed file exists at both ends, but only one of the two versions
+        // is current. The coordinator subtracts the copy being replaced before
+        // reporting the destination; without that the same photo would be
+        // counted twice and the total would claim twice the storage.
+        let replacingOneFile = try balance(source: 10, destination: 0, queued: 10)
+        try check(replacingOneFile.totalBytes == 10, "A file being replaced was counted at both ends")
+        try check(near(replacingOneFile.localFraction, 1), "The local line lost a file that is on this Mac")
+        try check(near(replacingOneFile.pendingFraction, 1), "A file due to be replaced was not shown as pending")
+
+        // Restores read the same picture from the other side: the local line is
+        // the one that grows, and the pending line is still the gap it grows
+        // into. 1,500 in the bucket, 800 here, 300 of those in both places.
+        let restore = try balance(.download, source: 1_500, destination: 800, queued: 1_200)
+        try check(restore.totalBytes == 2_000, "A download did not span everything on both sides")
+        try check(near(restore.localFraction, 0.4), "A download's local line was misdrawn")
+        try check(near(restore.cloudFraction, 0.75), "A download's cloud line was misdrawn")
+        try check(
+            restore.localBytes + restore.pendingBytes == restore.totalBytes,
+            "A download's growing line and its pending gap did not cover the whole width"
+        )
+        try check(restore.sharedBytes == 300, "A download's overlap between the two sides was miscounted")
+
+        // Nothing is drawn from a snapshot written before these totals existed,
+        // or from the bare one the engine writes when a drive disappears.
+        try check(
+            StorageBalance(
+                snapshot: SyncSnapshot(jobID: SyncJobID(), phase: .watching, blockers: [.localVolumeUnavailable]),
+                direction: .upload
+            ) == nil,
+            "A snapshot with no byte totals produced a balance to draw anyway"
         )
     }
 

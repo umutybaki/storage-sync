@@ -232,12 +232,6 @@ private struct SyncDetail: View {
                 StatusHeader(job: job, snapshot: snapshot, status: status, model: model)
             }
 
-            if let inventory = snapshot.inventory {
-                Section("Inventory") {
-                    InventoryStrip(inventory: inventory, direction: job.direction)
-                }
-            }
-
             Section {
                 LabeledContent("Copies") {
                     Text(job.direction == .upload ? "This Mac → S3" : "S3 → This Mac")
@@ -349,13 +343,12 @@ private struct StatusHeader: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if snapshot.hasMeasurableProgress {
-                    ProgressView(value: snapshot.fractionCompleted)
-                        .padding(.top, 4)
-                    Text(snapshot.progressSummary)
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                if let reading = model.balanceReading(for: job) {
+                    StorageBalanceView(
+                        reading: reading,
+                        isTransferring: snapshot.phase == .transferring
+                    )
+                    .padding(.top, 8)
                 }
 
                 if let current = snapshot.currentRelativePath {
@@ -378,47 +371,5 @@ private struct StatusHeader: View {
         }
         .padding(.vertical, 6)
         .accessibilityElement(children: .contain)
-    }
-}
-
-/// The three numbers the product promises, side by side, so a half-finished
-/// first pairing can be audited at a glance.
-private struct InventoryStrip: View {
-    let inventory: SyncInventory
-    let direction: SyncDirection
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            column(inventory.found, direction == .upload ? "found on this Mac" : "found in S3")
-            divider
-            column(inventory.alreadyPresent, direction == .upload ? "already in S3" : "already on this Mac")
-            divider
-            column(
-                inventory.remaining,
-                direction == .upload ? "left to upload" : "left to download",
-                emphasized: inventory.remaining > 0
-            )
-        }
-        .padding(.vertical, 4)
-    }
-
-    private var divider: some View {
-        Divider().frame(height: 30).padding(.horizontal, 4)
-    }
-
-    private func column(_ value: Int, _ label: String, emphasized: Bool = false) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(value.formatted())
-                .font(.title3)
-                .fontWeight(.semibold)
-                .monospacedDigit()
-                .foregroundStyle(emphasized ? Color.accentColor : Color.primary)
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
     }
 }

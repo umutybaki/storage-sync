@@ -152,6 +152,60 @@ Not verified visually: this session had neither Screen Recording nor Accessibili
 
 Repackage the app after any source change with `./scripts/package-app.sh`. It signs and verifies in `$TMPDIR` before moving the bundle into `.build`, so a clean run means the signature is good — see the note about verifying it again afterwards under **Workspace and toolchain**.
 
+## Storage balance pass (2026-08-12)
+
+A second UI/UX pass, on the user's request: show what is on this Mac, what is in the bucket, and what
+is moving between them, in one glance. It replaced both the plain `ProgressView` in the window's
+status header and the three-count `Inventory` section. Engine behaviour, safety, persistence and S3
+are untouched apart from two new reported numbers.
+
+- `SyncSnapshot` gained `sourceBytesFound` and `destinationBytesInPlace`. Both are `Int64?` for the
+  same in-place-upgrade reason as the count trio, and both are additive in the snapshot payload blob,
+  so there is no migration. `destinationBytesInPlace` is *net of what a queued transfer will replace*:
+  `SyncCoordinator` subtracts the destination size of every row that produces a transfer plan, because
+  a changed file otherwise exists at both ends at once and inflates the total the bars are drawn
+  against.
+- The scan already counted entries; it now sums bytes in the same loop. The manifest stores each entry
+  as an encoded payload, so there is no column for SQLite to `SUM` afterwards.
+- **`destinationBytesInPlace` is deliberately not advanced per completed file**, unlike the adjacent
+  `destinationFilesFound`/`filesAlreadyPresent` lines that sit right next to it in `runCycle`.
+  `StorageBalance` adds the live `bytesCompleted` to it, so crediting per file as well would count the
+  same bytes twice. The run's finished work is folded in once, when the transfer loop ends, as
+  `atScan + max(0, moved - remaining.completedBytes)` — subtracting what is still queued so a saved
+  partial is not counted twice. The bar reads the same byte on either side of that hand-off, which is
+  what stops it jumping when a run finishes.
+- `StorageSyncCore.StorageBalance` owns the arithmetic; it lives in Core rather than the app target
+  precisely so `StorageSyncTestRunner` can reach it. The invariant it guarantees is that the
+  destination line plus the pending line are always the entire width, and that the width does not
+  change while a run fills it in — a bar that quietly rescales as it advances would show progress
+  that has not happened. `storageBalanceCheck()` covers both of the user's worked examples, a run
+  stepped from 0 to 100%, the end-of-cycle hand-off, the superseded-file subtraction, the download
+  mirror, and a pre-upgrade snapshot producing nothing to draw. It was confirmed to fail when an
+  expected fraction was altered, and to pass again when it was restored. What it does *not* cover is
+  the coordinator feeding it: `runCycle` needs a bookmark store, a keychain and a live object store.
+- `Sources/StorageSyncApp/StorageBalanceView.swift` draws the three lines on one shared scale. They
+  are not three independent percentages: the destination fills from the left, the source is pinned to
+  the right, the middle line covers exactly the span the destination has not reached, and a hairline
+  marks the boundary through all three rows. Lengths are storage, never file counts. The counts the
+  product contract promises — found, already present, remaining — are the caption underneath. A
+  compact variant (bars only) replaced the row progress bar in the menu bar popover.
+- Colours are fixed rather than `.accentColor`, which a user can set to green and thereby make two of
+  the three lines claim to be the same thing. The middle line is amber in light appearance because
+  system yellow is washed out on a white sheet, and orange already means "waiting on something"
+  everywhere else in this app. Every row still carries its own icon and word, so nothing depends on
+  colour alone.
+- `AppModel` keeps the last complete balance per job (`lastKnownBalances`). The engine replaces a
+  snapshot with a bare blocked one when a drive is unplugged, which erases every number in it — that
+  is why the old Inventory section vanished at exactly the moment it was most worth reading. The bars
+  now dim and say how long ago the picture was taken. This is app-side only; no engine path changed.
+- `SyncInventory`, `SyncSnapshot.inventory`, `hasMeasurableProgress`, `fractionCompleted`,
+  `progressSummary`, `InventoryStrip` and `MenuJobRow.countSummary` were all removed rather than left
+  as a second, disagreeing source of truth.
+
+Not verified visually, for the same reason as the 2026-08-04 pass: no Screen Recording or Accessibility
+permission in this session. Evidence is a warning-free clean build against `MacOSX26.sdk` and the full
+reliability suite passing.
+
 ## Background agent
 
 On 2026-08-11 the user asked that quitting StorageSync stop everything, so the agent is deliberately **not** a KeepAlive job any more. `Packaging/app.photosync.agent.plist` has `KeepAlive` removed and `RunAtLoad` false; launchd starts the agent on demand through its Mach service when the manager connects. Quit sends the `shutdown` command (`AgentCommandKind.shutdown`), which calls `SyncCoordinator.stop()` and exits. `AppModel.shutdownAgentForQuit` cancels polling and the maintenance loop *first*, because either would restart the agent it is trying to stop. Do not restore `KeepAlive` without asking: it would silently undo this.

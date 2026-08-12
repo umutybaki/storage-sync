@@ -184,36 +184,19 @@ enum SyncRoute {
     }
 }
 
-/// The three numbers the product promises: found, already there, still to copy.
-struct SyncInventory: Equatable {
-    var found: Int
-    var alreadyPresent: Int
-    var remaining: Int
-}
-
-extension SyncSnapshot {
-    var inventory: SyncInventory? {
-        guard let found = sourceFilesFound, let alreadyPresent = filesAlreadyPresent else { return nil }
-        return SyncInventory(
-            found: found,
-            alreadyPresent: alreadyPresent,
-            remaining: max(0, filesTotal - filesCompleted)
-        )
-    }
-
-    var hasMeasurableProgress: Bool { bytesTotal > 0 }
-
-    var fractionCompleted: Double {
-        guard bytesTotal > 0 else { return 0 }
-        return min(1, Double(bytesCompleted) / Double(bytesTotal))
-    }
-
-    /// "2.1 GB of 9.4 GB · 23%" — one line, and it never reflows while it ticks
-    /// because every caller renders it with monospaced digits.
-    var progressSummary: String {
-        let percent = Int((fractionCompleted * 100).rounded())
-        return "\(bytesCompleted.formattedByteCount) of \(bytesTotal.formattedByteCount) · \(percent)%"
-    }
+/// A storage balance to draw, and whether it still describes right now.
+///
+/// The engine replaces a snapshot with a bare blocked one when a drive is
+/// unplugged or the bucket cannot be reached, which erases every number in it.
+/// The question "what is where" does not stop being worth answering at that
+/// moment — it is arguably the moment it matters most — so the app keeps the
+/// last complete picture and says how old it is instead of showing nothing.
+struct BalanceReading: Equatable {
+    var balance: StorageBalance
+    var isCurrent: Bool
+    /// When the balance was last read from a live snapshot. Only shown while
+    /// the reading is stale.
+    var asOf: Date?
 }
 
 extension Int64 {

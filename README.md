@@ -20,7 +20,7 @@ These are the guarantees the engine is written and tested against.
 - Network loss, provider throttling, insufficient space, and drive loss are durable waiting states, not errors.
 - Credentials live in the macOS Keychain; bookmarks, manifests, and transfer state are user-private on disk.
 
-The manager reports the inventory as three concrete numbers: source files found, files already present at the destination, and files remaining to copy. This makes a partially completed first sync auditable before terabytes of transfer begin.
+The manager shows where a sync's storage actually is, as three lines on one shared scale: what is on this Mac, what is still moving, and what is in the bucket. They are drawn against bytes rather than file counts, and they are one picture rather than three percentages — the cloud line fills from the left, the local line is pinned to the right, and the line between them covers exactly the span the cloud has not reached yet, so copying a file moves a single boundary through all three rows. Underneath sit the three concrete numbers: source files found, files already present at the destination, and files remaining to copy. This makes a partially completed first sync auditable before terabytes of transfer begin.
 
 ## Scope
 

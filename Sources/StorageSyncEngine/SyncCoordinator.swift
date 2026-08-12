@@ -40,6 +40,9 @@ private struct ManifestScanResult: Sendable {
     var generation: Int64
     var invalidRemoteKeyCount: Int
     var entryCount: Int
+    /// Summed while scanning. The manifest keeps each entry as an encoded
+    /// payload, so there is no column for SQLite to total afterwards.
+    var byteCount: Int64
 }
 
 private enum CycleDisposition: Sendable {
@@ -515,6 +518,7 @@ public actor SyncCoordinator {
             let reconciliationPageSize = 512
             var reconciliationCursor: String?
             var alreadyPresentCount = 0
+            var supersededDestinationBytes: Int64 = 0
             while true {
                 try Task.checkCancellation()
                 let rows = try await repository.reconciliationRows(
@@ -573,6 +577,13 @@ public actor SyncCoordinator {
                         remoteKeyOverride: remoteKeyOverride
                     ) {
                         plans.append(plan)
+                        // Whatever this transfer lands on is about to be
+                        // replaced, so it is not content the destination
+                        // already has. Counting it would put one file at both
+                        // ends of the storage balance and stretch the total.
+                        supersededDestinationBytes += (
+                            job.direction == .upload ? row.remote?.size : row.local?.size
+                        ) ?? 0
                     } else if row.local != nil, row.remote != nil {
                         alreadyPresentCount += 1
                         obsoleteTransferPaths.append(row.relativePath)
@@ -640,6 +651,15 @@ public actor SyncCoordinator {
                 ? remoteScan.entryCount
                 : localScan.entryCount
             snapshot.filesAlreadyPresent = alreadyPresentCount
+            let destinationBytesAtScan = max(
+                0,
+                (job.direction == .upload ? remoteScan.byteCount : localScan.byteCount)
+                    - supersededDestinationBytes
+            )
+            snapshot.sourceBytesFound = job.direction == .upload
+                ? localScan.byteCount
+                : remoteScan.byteCount
+            snapshot.destinationBytesInPlace = destinationBytesAtScan
             snapshot.message = queue.count == 0
                 ? "All caught up"
                 : "Syncing \(queue.count) item\(queue.count == 1 ? "" : "s")…"
@@ -726,6 +746,12 @@ public actor SyncCoordinator {
                             if !destinationExisted {
                                 snapshot.destinationFilesFound = (snapshot.destinationFilesFound ?? 0) + 1
                             }
+                            // The byte totals deliberately have no equivalent
+                            // line here. `StorageBalance` already adds
+                            // `bytesCompleted` to `destinationBytesInPlace`, so
+                            // crediting the destination per file as well would
+                            // count the same bytes twice. The run's finished
+                            // work is folded in once, below.
                             // A finished file may have reported less than its
                             // full size, so settle its contribution at the total.
                             _ = await progressAccumulator.update(
@@ -765,9 +791,18 @@ public actor SyncCoordinator {
                 snapshot.currentRelativePath = nil
                 snapshot.filesCompleted = 0
                 let remaining = try await repository.activeTransferSummary(jobID: job.id)
+                let movedBytes = snapshot.bytesCompleted
                 snapshot.filesTotal = remaining.count
                 snapshot.bytesCompleted = remaining.completedBytes
                 snapshot.bytesTotal = remaining.totalBytes
+                // Progress that left the queue is now at the destination, and
+                // has to be credited there before `bytesCompleted` is reset or
+                // the balance would snap back to what the scan saw. Subtracting
+                // what is still queued keeps a saved partial from counting
+                // twice. The bar therefore reads the same byte on either side
+                // of this line: `atScan + movedBytes`, before and after.
+                snapshot.destinationBytesInPlace = destinationBytesAtScan
+                    + max(0, movedBytes - remaining.completedBytes)
                 if remaining.count == 0 {
                     snapshot.lastSuccessfulSync = Date()
                     snapshot.message = invalidRemoteKeyCount == 0
@@ -858,11 +893,13 @@ public actor SyncCoordinator {
         let generation = try await repository.nextManifestGeneration(jobID: jobID, side: .local)
         var batch: [FileFingerprint] = []
         var entryCount = 0
+        var byteCount: Int64 = 0
         batch.reserveCapacity(512)
         for try await file in scanner.files(at: root) {
             try Task.checkCancellation()
             batch.append(file)
             entryCount += 1
+            byteCount += max(0, file.size)
             if batch.count == 512 {
                 try await repository.upsertLocalManifestEntries(
                     batch,
@@ -885,7 +922,8 @@ public actor SyncCoordinator {
         return ManifestScanResult(
             generation: generation,
             invalidRemoteKeyCount: 0,
-            entryCount: entryCount
+            entryCount: entryCount,
+            byteCount: byteCount
         )
     }
 
@@ -912,6 +950,7 @@ public actor SyncCoordinator {
         batch.reserveCapacity(512)
         var invalidRemoteKeyCount = 0
         var entryCount = 0
+        var byteCount: Int64 = 0
         var token: String?
         let normalizedPrefix = SyncJob.normalizedPrefix(prefix)
         let listingPrefix = normalizedPrefix.isEmpty ? "" : normalizedPrefix + "/"
@@ -929,6 +968,7 @@ public actor SyncCoordinator {
                     continue
                 }
                 entryCount += 1
+                byteCount += max(0, object.size)
                 batch.append(
                     RemoteManifestRecord(
                         relativePath: relativePath,
@@ -966,7 +1006,8 @@ public actor SyncCoordinator {
         return ManifestScanResult(
             generation: generation,
             invalidRemoteKeyCount: invalidRemoteKeyCount,
-            entryCount: entryCount
+            entryCount: entryCount,
+            byteCount: byteCount
         )
     }
 
