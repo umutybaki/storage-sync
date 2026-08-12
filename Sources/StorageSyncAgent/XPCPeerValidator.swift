@@ -2,8 +2,16 @@ import Foundation
 import MachO
 import Security
 
-/// Accepts XPC connections only from the StorageSync app that ships in the same
-/// bundle as this agent.
+/// Names the StorageSync app that ships in the same bundle as this agent, in
+/// the text form `NSXPCConnection.setCodeSigningRequirement` takes.
+///
+/// Pinning that requirement on the connection is the only way a peer is
+/// identified here. A peer's process identifier cannot do it: the peer may exit
+/// between connecting and being looked up, and the kernel may hand its number
+/// to the real app in the meantime, so the check would answer for a process
+/// that is not the one on the other end. The pinned requirement is matched
+/// against the connection's audit token, which names one process for as long as
+/// the connection exists.
 struct XPCPeerValidator {
     private let mainExecutableURL: URL
 
@@ -20,7 +28,7 @@ struct XPCPeerValidator {
             .appendingPathComponent("Contents/MacOS/StorageSync", isDirectory: false)
     }
 
-    func accepts(processIdentifier: pid_t) -> Bool {
+    func currentRequirementText() -> String? {
         // The requirement is read for each connection rather than captured once
         // at startup. An app updated in place gets a new code identity, and a
         // pinned requirement would reject the very app this agent belongs to
@@ -28,21 +36,16 @@ struct XPCPeerValidator {
         // transferring. Reading it fresh is not weaker: it still names the
         // sibling app inside this bundle, which nothing without write access to
         // the bundle can replace.
-        guard let requirement = currentRequirement() else { return false }
-        var peerCode: SecCode?
-        let attributes = [kSecGuestAttributePid: NSNumber(value: processIdentifier)] as CFDictionary
-        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &peerCode) == errSecSuccess,
-              let peerCode else { return false }
-        return SecCodeCheckValidity(peerCode, [], requirement) == errSecSuccess
-    }
-
-    private func currentRequirement() -> SecRequirement? {
         var staticCode: SecStaticCode?
         guard SecStaticCodeCreateWithPath(mainExecutableURL as CFURL, [], &staticCode) == errSecSuccess,
               let staticCode else { return nil }
         var requirement: SecRequirement?
-        guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirement) == errSecSuccess else { return nil }
-        return requirement
+        guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirement) == errSecSuccess,
+              let requirement else { return nil }
+        var text: CFString?
+        guard SecRequirementCopyString(requirement, [], &text) == errSecSuccess,
+              let text else { return nil }
+        return text as String
     }
 
     private static func executableURL() -> URL? {
