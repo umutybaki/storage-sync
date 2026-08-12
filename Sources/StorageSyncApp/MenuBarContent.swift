@@ -176,7 +176,7 @@ struct MenuBarContent: View {
     }
 
     private func open(_ job: SyncJob) {
-        model.selectedJobID = job.id
+        model.selection = .sync(job.id)
         ManagerWindow.show(using: openWindow)
     }
 }

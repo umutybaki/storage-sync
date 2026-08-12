@@ -18,6 +18,9 @@ struct StorageSyncWindow: View {
                 // Rebuild the detail pane when the selection changes so the
                 // scroll position does not carry over between syncs.
                 .id(job.id)
+            } else if let credential = model.selectedCredential {
+                CredentialDetailView(credential: credential, model: model)
+                    .id(credential.id)
             } else {
                 WelcomeView(
                     hasSyncs: !model.jobs.isEmpty,
@@ -30,6 +33,21 @@ struct StorageSyncWindow: View {
         }
         .sheet(item: $model.credentialsJob) { job in
             UpdateCredentialsView(job: job, model: model)
+        }
+        .sheet(item: $model.credentialEditor) { request in
+            CredentialEditorView(request: request, model: model)
+        }
+        .alert(
+            "Delete These Credentials?",
+            isPresented: credentialRemovalBinding,
+            presenting: model.credentialPendingRemoval
+        ) { credential in
+            Button("Delete Credentials", role: .destructive) {
+                Task { await model.confirmRemoval(of: credential) }
+            }
+            Button("Cancel", role: .cancel) { model.cancelCredentialRemoval() }
+        } message: { credential in
+            Text("StorageSync forgets “\(credential.name)” and removes its keys from your Keychain. Nothing in your bucket changes, and the keys keep working everywhere else you use them.")
         }
         // The title stays constant while the alert dismisses; the name lives in
         // the message, which is driven by the presented value.
@@ -61,6 +79,13 @@ struct StorageSyncWindow: View {
             set: { if !$0 { model.cancelRemoval() } }
         )
     }
+
+    private var credentialRemovalBinding: Binding<Bool> {
+        Binding(
+            get: { model.credentialPendingRemoval != nil },
+            set: { if !$0 { model.cancelCredentialRemoval() } }
+        )
+    }
 }
 
 // MARK: - Sidebar
@@ -69,11 +94,11 @@ private struct SyncSidebar: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        List(selection: $model.selectedJobID) {
+        List(selection: $model.selection) {
             Section("Syncs") {
                 ForEach(model.jobs) { job in
                     SidebarRow(job: job, status: model.status(for: job))
-                        .tag(job.id)
+                        .tag(ManagerSelection.sync(job.id))
                         .contextMenu {
                             Button("Sync Now") { Task { await model.syncNow(job) } }
                             if job.isPaused {
@@ -88,6 +113,29 @@ private struct SyncSidebar: View {
                         }
                 }
             }
+
+            // Hidden until there is one. The first set is saved while creating
+            // a sync, so an empty section would only ever be an empty section.
+            if !model.credentials.isEmpty {
+                Section("Credentials") {
+                    ForEach(model.credentials) { credential in
+                        CredentialSidebarRow(
+                            credential: credential,
+                            usedByCount: model.syncsUsing(credential).count
+                        )
+                        .tag(ManagerSelection.credential(credential.id))
+                        .contextMenu {
+                            Button("Edit Credentials…") { model.beginEditingCredential(credential) }
+                            Button("Create Sync with These…") { model.beginCreatingSync(using: credential) }
+                            Divider()
+                            Button("Delete Credentials…", role: .destructive) {
+                                model.requestRemoval(of: credential)
+                            }
+                            .disabled(!model.syncsUsing(credential).isEmpty)
+                        }
+                    }
+                }
+            }
         }
         .listStyle(.sidebar)
         .navigationSplitViewColumnWidth(min: 200, ideal: 224, max: 320)
@@ -100,13 +148,58 @@ private struct SyncSidebar: View {
         }
         .toolbar {
             ToolbarItem {
-                Button {
-                    model.beginCreatingSync()
+                Menu {
+                    Button("New Sync…") { model.beginCreatingSync() }
+                    Button("New Credentials…") { model.beginCreatingCredential() }
                 } label: {
-                    Label("New Sync", systemImage: "plus")
+                    Label("New", systemImage: "plus")
                 }
-                .help("Create a new sync")
+                .help("Create a sync, or save credentials to reuse")
             }
+        }
+    }
+}
+
+/// Saved keys read as one line: what they are called, and the shortened access
+/// key that tells two sets from the same provider apart.
+private struct CredentialSidebarRow: View {
+    let credential: StoredCredential
+    let usedByCount: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Label {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(credential.name)
+                        .lineLimit(1)
+                    if let summary = credential.accessKeySummary {
+                        Text(summary)
+                            .font(.caption)
+                            .monospaced()
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            } icon: {
+                Image(systemName: credential.hasSessionToken ? "key.slash" : "key")
+            }
+            Spacer(minLength: 4)
+            if usedByCount > 0 {
+                Text("\(usedByCount)")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("\(usedByCount) syncs")
+            }
+        }
+        .help(helpText)
+    }
+
+    private var helpText: String {
+        switch usedByCount {
+        case 0: "Not used by any sync yet"
+        case 1: "Used by one sync"
+        default: "Used by \(usedByCount) syncs"
         }
     }
 }
@@ -258,6 +351,23 @@ private struct SyncDetail: View {
                     "Folder in Bucket",
                     value: job.remotePrefix.isEmpty ? "Top level" : job.remotePrefix
                 )
+                LabeledContent("Credentials") {
+                    if let credential = model.credential(for: job) {
+                        Button {
+                            model.selection = .credential(credential.id)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(credential.name)
+                                Image(systemName: "chevron.forward")
+                                    .imageScale(.small)
+                            }
+                        }
+                        .buttonStyle(.link)
+                        .help("Show these credentials")
+                    } else {
+                        Text("—")
+                    }
+                }
                 if let last = snapshot.lastSuccessfulSync {
                     LabeledContent(
                         "Last Checked",
@@ -309,7 +419,7 @@ private struct SyncDetail: View {
 
         ToolbarItem(placement: .primaryAction) {
             Menu {
-                Button("Update S3 Credentials…") { model.credentialsJob = job }
+                Button("Change Credentials…") { model.credentialsJob = job }
                 Button("Show in Finder") { model.revealInFinder(job) }
                 Divider()
                 Button("Remove Sync…", role: .destructive) { model.requestRemoval(of: job) }
@@ -362,7 +472,7 @@ private struct StatusHeader: View {
                 }
 
                 if snapshot.blockers.contains(.credentialsUnavailable) {
-                    Button("Update S3 Credentials…") { model.credentialsJob = job }
+                    Button("Fix Credentials…") { model.credentialsJob = job }
                         .padding(.top, 6)
                 }
             }

@@ -57,6 +57,24 @@ private enum CheckFailure: Error, CustomStringConvertible {
     }
 }
 
+/// Keychain items outlive the process and the temporary directory, so the
+/// credential checks record what they wrote and take it back out — including
+/// on the way out of a failed check.
+private final class KeychainReferenceBox: @unchecked Sendable {
+    private var references: [String] = []
+
+    func add(_ reference: String) {
+        references.append(reference)
+    }
+
+    func purge(from keychain: KeychainStore) async {
+        for reference in references {
+            try? await keychain.remove(reference: reference)
+        }
+        references = []
+    }
+}
+
 private final class S3URLProtocolStub: URLProtocol, @unchecked Sendable {
     typealias Handler = @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
 
@@ -124,6 +142,7 @@ private final class ReliabilitySuite {
         try await partialDirectorySymlinkCheck()
         try await persistenceRecoveryCheck()
         try await persistenceJobRemovalCheck()
+        try await credentialStoreCheck()
         try await gracefulUnmountPreparationCheck()
         try await processCrashRecoveryCheck()
         try await multipartLostResponseCheck()
@@ -1354,6 +1373,250 @@ private final class ReliabilitySuite {
             limit: 10
         )
         try check(manifestRows.isEmpty, "A removed sync left manifest rows")
+    }
+
+    /// The credential store: adopting what earlier builds saved, sharing one
+    /// set of keys between syncs, and the two directions in which that sharing
+    /// can go wrong — deleting keys a sync still needs, or leaving a sync
+    /// pointed at keys that are not there.
+    ///
+    /// Keychain writes go to a service name unique to this run and are removed
+    /// afterwards, including when a check fails part-way through.
+    private func credentialStoreCheck() async throws {
+        try check(
+            StoredCredential.summary(forAccessKeyID: "AKIAIOSFODNN7EXAMPLE") == "AKIA…MPLE",
+            "A saved access key was not shortened the way it is displayed"
+        )
+        try check(
+            StoredCredential.summary(forAccessKeyID: "short") == nil,
+            "A key too short to shorten was shown anyway"
+        )
+        try check(
+            StoredCredential.uniqueName("Amazon S3", avoiding: ["Amazon S3", "Amazon S3 2"]) == "Amazon S3 3",
+            "Adopted credentials took a name that was already in use"
+        )
+        try check(
+            StoredCredential.uniqueName("Amazon S3", avoiding: ["Other"]) == "Amazon S3",
+            "An unused name was needlessly numbered"
+        )
+
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let keychain = KeychainStore(service: "app.photosync.tests." + UUID().uuidString)
+        let written = KeychainReferenceBox()
+        do {
+            try await credentialStoreDurabilityCheck(
+                directory: directory,
+                keychain: keychain,
+                written: written
+            )
+        } catch {
+            await written.purge(from: keychain)
+            throw error
+        }
+        await written.purge(from: keychain)
+    }
+
+    private func credentialStoreDurabilityCheck(
+        directory: URL,
+        keychain: KeychainStore,
+        written: KeychainReferenceBox
+    ) async throws {
+        let repository = try SyncRepository(databaseURL: directory.appendingPathComponent("credentials.sqlite"))
+        let bookmarks = try BookmarkStore(directory: directory.appendingPathComponent("bookmarks"))
+        let coordinator = SyncCoordinator(repository: repository, bookmarks: bookmarks, keychain: keychain)
+
+        // What a build from before the credential store leaves behind: keys in
+        // the Keychain under the connection's own identifier, and no record of
+        // them anywhere else. The jobs are paused so this check exercises
+        // configuration rather than scheduling.
+        let legacyConnectionID = ConnectionID()
+        let legacyReference = legacyConnectionID.description
+        written.add(legacyReference)
+        try await keychain.save(
+            S3Credentials(accessKeyID: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "original-secret"),
+            reference: legacyReference
+        )
+        let legacyConnection = S3Connection(
+            id: legacyConnectionID,
+            name: "Amazon S3",
+            endpoint: URL(string: "https://s3.eu-north-1.amazonaws.com")!,
+            region: "eu-north-1",
+            bucket: "legacy-bucket",
+            credentialReference: legacyReference
+        )
+        try await repository.saveConnection(legacyConnection)
+        let legacyJob = SyncJob(
+            name: "Photos",
+            direction: .upload,
+            localRoot: LocalRoot(displayName: "Photos", fallbackPath: "/photos", bookmarkReference: "photos"),
+            connectionID: legacyConnectionID,
+            remotePrefix: "photos",
+            isPaused: true
+        )
+        try await repository.saveJob(legacyJob)
+
+        try await coordinator.start()
+        let adopted = try await coordinator.credentials()
+        try check(adopted.count == 1, "Upgrading did not adopt the credentials an existing sync was using")
+        guard let credential = adopted.first else {
+            throw CheckFailure.failed("Upgrading adopted no credentials at all")
+        }
+        try check(
+            credential.keychainReference == legacyReference,
+            "Adoption moved the Keychain reference a running sync resolves"
+        )
+        try check(
+            credential.name == "Amazon S3 (legacy-bucket)",
+            "An adopted credential was not named after the connection it came from"
+        )
+        try check(
+            credential.accessKeySummary == "AKIA…MPLE",
+            "An adopted credential did not record its shortened access key"
+        )
+        let secretAfterAdoption = try await keychain.load(reference: legacyReference)
+        try check(
+            secretAfterAdoption?.secretAccessKey == "original-secret",
+            "Adoption rewrote the secret it was only supposed to describe"
+        )
+
+        try await coordinator.start()
+        let afterSecondLaunch = try await coordinator.credentials()
+        try check(afterSecondLaunch.count == 1, "A second launch adopted the same credentials again")
+
+        // A second sync reusing them, which is the whole point of the store.
+        let secondConnectionID = ConnectionID()
+        let secondConnection = S3Connection(
+            id: secondConnectionID,
+            name: "Amazon S3",
+            endpoint: URL(string: "https://s3.eu-north-1.amazonaws.com")!,
+            region: "eu-north-1",
+            bucket: "second-bucket",
+            credentialReference: credential.keychainReference
+        )
+        try await coordinator.save(connection: secondConnection)
+        let secondJob = SyncJob(
+            name: "Archive",
+            direction: .upload,
+            localRoot: LocalRoot(displayName: "Archive", fallbackPath: "/archive", bookmarkReference: "archive"),
+            connectionID: secondConnectionID,
+            remotePrefix: "archive",
+            isPaused: true
+        )
+        try await repository.saveJob(secondJob)
+
+        var acceptedDanglingReference = true
+        do {
+            try await coordinator.save(
+                connection: S3Connection(
+                    name: "Nowhere",
+                    endpoint: URL(string: "https://s3.eu-north-1.amazonaws.com")!,
+                    region: "eu-north-1",
+                    bucket: "nowhere",
+                    credentialReference: "credential." + UUID().uuidString
+                )
+            )
+        } catch {
+            acceptedDanglingReference = false
+        }
+        try check(!acceptedDanglingReference, "A sync was pointed at credentials that are not in the Keychain")
+
+        var deletedWhileInUse = true
+        do {
+            try await coordinator.removeCredential(id: credential.id)
+        } catch {
+            deletedWhileInUse = false
+        }
+        try check(!deletedWhileInUse, "Credentials two syncs depend on were deleted anyway")
+        let keysAfterRefusedDeletion = try await keychain.contains(reference: credential.keychainReference)
+        try check(keysAfterRefusedDeletion, "A refused deletion removed the keys regardless")
+
+        // The regression this store introduces the risk of: removing a sync
+        // used to delete the Keychain item its connection pointed at, which
+        // would now take another sync's keys with it.
+        try await coordinator.remove(jobID: legacyJob.id)
+        let keysAfterJobRemoval = try await keychain.contains(reference: credential.keychainReference)
+        let credentialsAfterJobRemoval = try await coordinator.credentials()
+        try check(
+            keysAfterJobRemoval,
+            "Removing one sync deleted saved credentials another sync is still using"
+        )
+        try check(
+            credentialsAfterJobRemoval.count == 1,
+            "Removing a sync removed the saved credentials themselves"
+        )
+
+        // And they outlive the last sync too: they are the user's, listed and
+        // deleted in one place, not owned by whichever sync happened to use
+        // them.
+        try await coordinator.remove(jobID: secondJob.id)
+        let keysAfterLastJobRemoval = try await keychain.contains(reference: credential.keychainReference)
+        try check(
+            keysAfterLastJobRemoval,
+            "Removing the last sync deleted credentials that are still listed"
+        )
+
+        try await coordinator.removeCredential(id: credential.id)
+        let remainingCredentials = try await coordinator.credentials()
+        let keysAfterDeletion = try await keychain.contains(reference: credential.keychainReference)
+        try check(remainingCredentials.isEmpty, "Deleting credentials left them in the list")
+        try check(!keysAfterDeletion, "Deleting credentials left their keys in the Keychain")
+
+        // Naming, renaming, and replacing keys.
+        let personal = try await coordinator.saveCredential(
+            id: nil,
+            name: "Personal AWS",
+            credentials: S3Credentials(accessKeyID: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "first-secret")
+        )
+        written.add(personal.keychainReference)
+        var acceptedDuplicateName = true
+        do {
+            _ = try await coordinator.saveCredential(
+                id: nil,
+                name: "  personal aws  ",
+                credentials: S3Credentials(accessKeyID: "AKIAIOSFODNN7OTHER00", secretAccessKey: "other")
+            )
+        } catch {
+            acceptedDuplicateName = false
+        }
+        try check(!acceptedDuplicateName, "Two sets of credentials were saved under the same name")
+
+        let renamed = try await coordinator.saveCredential(id: personal.id, name: "Work", credentials: nil)
+        try check(
+            renamed.keychainReference == personal.keychainReference,
+            "Renaming credentials moved the Keychain item every sync resolves"
+        )
+        let secretAfterRename = try await keychain.load(reference: personal.keychainReference)
+        try check(
+            secretAfterRename?.secretAccessKey == "first-secret",
+            "Renaming credentials changed the keys inside them"
+        )
+        // Dates round-trip through SQLite at millisecond resolution, so this
+        // asks whether the timestamp was left alone rather than for an exact
+        // match against an in-memory Date.
+        try check(
+            abs(renamed.keysUpdatedAt.timeIntervalSince(personal.keysUpdatedAt)) < 0.01,
+            "Renaming credentials claimed their keys had been replaced"
+        )
+
+        let replaced = try await coordinator.saveCredential(
+            id: personal.id,
+            name: "Work",
+            credentials: S3Credentials(
+                accessKeyID: "ASIAIOSFODNN7EXAMPLE",
+                secretAccessKey: "second-secret",
+                sessionToken: "temporary"
+            )
+        )
+        try check(replaced.accessKeySummary == "ASIA…MPLE", "Replaced keys kept the old shortened access key")
+        try check(replaced.hasSessionToken, "Temporary credentials were not recorded as temporary")
+        let secretAfterReplacement = try await keychain.load(reference: personal.keychainReference)
+        try check(
+            secretAfterReplacement?.secretAccessKey == "second-secret",
+            "Replacing keys did not reach the Keychain"
+        )
+
+        await coordinator.stop()
     }
 
     private func gracefulUnmountPreparationCheck() async throws {

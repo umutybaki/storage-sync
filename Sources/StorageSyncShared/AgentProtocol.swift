@@ -7,6 +7,10 @@ public enum AgentCommandKind: String, Codable, Sendable {
     case connections
     case saveConnection
     case testConnection
+    /// Saved provider keys, described without their secrets.
+    case credentials
+    case saveCredential
+    case removeCredential
     case saveJob
     case removeJob
     case pauseJob
@@ -29,17 +33,46 @@ public struct AgentCommand: Codable, Sendable {
 
 public struct ConnectionCredentialPayload: Codable, Sendable {
     public var connection: S3Connection
-    public var credentials: S3Credentials
+    /// Keys sent inline, which happens only while a credential is being
+    /// created and therefore does not exist to point at yet. `nil` means "use
+    /// the saved credential this connection already references", so the common
+    /// case — a second sync reusing keys that are already stored — never
+    /// carries a secret over XPC at all.
+    public var credentials: S3Credentials?
     public var remotePrefix: String?
 
     public init(
         connection: S3Connection,
-        credentials: S3Credentials,
+        credentials: S3Credentials? = nil,
         remotePrefix: String? = nil
     ) {
         self.connection = connection
         self.credentials = credentials
         self.remotePrefix = remotePrefix
+    }
+}
+
+/// Creates a credential, renames one, or replaces the keys inside one.
+///
+/// `id` absent means create. `credentials` absent means leave the saved keys
+/// alone, which is how a rename avoids needing the secret in hand.
+public struct SaveCredentialPayload: Codable, Sendable {
+    public var id: CredentialID?
+    public var name: String
+    public var credentials: S3Credentials?
+
+    public init(id: CredentialID? = nil, name: String, credentials: S3Credentials? = nil) {
+        self.id = id
+        self.name = name
+        self.credentials = credentials
+    }
+}
+
+public struct CredentialCommandPayload: Codable, Sendable {
+    public var credentialID: CredentialID
+
+    public init(credentialID: CredentialID) {
+        self.credentialID = credentialID
     }
 }
 

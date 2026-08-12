@@ -137,6 +137,7 @@ public actor SyncCoordinator {
     }
 
     public func start() async throws {
+        await adoptCredentialsFromConnections()
         for job in try await repository.jobs() {
             if job.isPaused {
                 try await repository.setSnapshot(
@@ -168,13 +169,220 @@ public actor SyncCoordinator {
         try await repository.connections()
     }
 
-    public func save(connection: S3Connection, credentials: S3Credentials) async throws {
-        try await keychain.save(credentials, reference: connection.credentialReference)
+    /// Proves keys and bucket work together before anything durable is written.
+    ///
+    /// The keys are either the ones being typed in — which is the only moment
+    /// a secret travels anywhere — or, when none are passed, the saved ones the
+    /// connection already names. Listing the prefix is the smallest request
+    /// that exercises signing, addressing, and access in one go.
+    public func test(
+        connection: S3Connection,
+        credentials: S3Credentials?,
+        remotePrefix: String?
+    ) async throws {
+        let store = try await objectStoreFactory.make(
+            connection: connection,
+            credentials: credentials,
+            timeout: 30
+        )
+        let normalizedPrefix = SyncJob.normalizedPrefix(remotePrefix ?? "")
+        _ = try await store.list(
+            prefix: normalizedPrefix.isEmpty ? "" : normalizedPrefix + "/",
+            continuationToken: nil
+        )
+    }
+
+    /// Connections carry no secret of their own: they name a saved credential
+    /// and the engine resolves it at the moment it needs one. Saving a
+    /// connection therefore never writes to the Keychain — `saveCredential` is
+    /// the only thing that does — but it does insist the credential it points
+    /// at is really there, so a sync cannot be pointed at keys that are gone.
+    public func save(connection: S3Connection) async throws {
+        guard try await keychain.contains(reference: connection.credentialReference) else {
+            throw CoordinatorError.missingCredential
+        }
         try await repository.saveConnection(connection)
         for job in try await repository.jobs() where job.connectionID == connection.id && !job.isPaused {
             attentionJobIDs.remove(job.id)
             requestRun(jobID: job.id, allowAttention: true)
         }
+    }
+
+    public func credentials() async throws -> [StoredCredential] {
+        try await repository.credentials()
+    }
+
+    /// Creates a credential, renames one, or replaces the keys inside one.
+    ///
+    /// This is the only place in StorageSync that writes a secret. Passing no
+    /// keys leaves the saved ones untouched, which is how a rename works
+    /// without the secret ever being read, let alone sent anywhere.
+    @discardableResult
+    public func saveCredential(
+        id: CredentialID?,
+        name: String,
+        credentials: S3Credentials?
+    ) async throws -> StoredCredential {
+        let requestedName = StoredCredential.normalizedName(name)
+        guard !requestedName.isEmpty else { throw CoordinatorError.credentialNameMissing }
+        let existing = try await repository.credentials()
+        guard !existing.contains(where: {
+            $0.id != id && $0.name.lowercased() == requestedName.lowercased()
+        }) else {
+            throw CoordinatorError.credentialNameTaken(requestedName)
+        }
+
+        var record: StoredCredential
+        if let id {
+            guard var stored = try await repository.credential(id: id) else {
+                throw CoordinatorError.missingCredential
+            }
+            stored.name = requestedName
+            record = stored
+        } else {
+            guard credentials != nil else { throw CoordinatorError.credentialKeysMissing }
+            record = StoredCredential(name: requestedName)
+        }
+
+        if let credentials {
+            try await keychain.save(
+                credentials,
+                reference: record.keychainReference,
+                label: Self.keychainLabel(for: requestedName)
+            )
+            record.accessKeySummary = StoredCredential.summary(forAccessKeyID: credentials.accessKeyID)
+            record.hasSessionToken = credentials.sessionToken != nil
+            record.keysUpdatedAt = Date()
+        } else {
+            // Cosmetic, and deliberately not fatal: a rename that could not
+            // reach the Keychain still renames the credential in StorageSync.
+            try? await keychain.relabel(
+                reference: record.keychainReference,
+                label: Self.keychainLabel(for: requestedName)
+            )
+        }
+
+        do {
+            try await repository.saveCredential(record)
+        } catch {
+            // A secret nobody can see is worse than none, so a credential that
+            // failed to become a record takes its Keychain item back out.
+            if id == nil { try? await keychain.remove(reference: record.keychainReference) }
+            throw error
+        }
+
+        await wakeJobsUsing(credentialReference: record.keychainReference)
+        return record
+    }
+
+    /// Refuses while a sync still depends on it. Deleting keys out from under a
+    /// running sync would look like an unexplained authentication failure some
+    /// time later, so the answer names the syncs instead.
+    public func removeCredential(id: CredentialID) async throws {
+        guard let credential = try await repository.credential(id: id) else { return }
+        let dependents = try await jobsUsing(credentialReference: credential.keychainReference)
+        guard dependents.isEmpty else {
+            throw CoordinatorError.credentialInUse(dependents.map(\.name))
+        }
+        // The secret goes first. If the record survived and the item did not,
+        // the credential is visibly broken and can be deleted again; the other
+        // order would leave a secret with nothing left pointing at it.
+        try await keychain.remove(reference: credential.keychainReference)
+        try await repository.removeCredential(id: id)
+    }
+
+    /// Removing a sync used to delete the Keychain item its connection pointed
+    /// at. That is right only while the keys belong to that one sync. A saved
+    /// credential is the user's, not the sync's: it can be shared with other
+    /// syncs and is meant to outlive them, so it is deleted only from the
+    /// Credentials list. What is still cleaned up here is a secret nothing
+    /// refers to any more.
+    ///
+    /// Every uncertain answer counts as "still in use". Leaving an orphaned
+    /// item behind is a mess; deleting one that is still referenced is data
+    /// loss the user cannot undo.
+    private func removeCredentialMaterialIfOrphaned(reference: String) async {
+        let ownedByCredential = (try? await repository.credentials())?.contains {
+            $0.keychainReference == reference
+        } ?? true
+        let usedByConnection = (try? await repository.connections())?.contains {
+            $0.credentialReference == reference
+        } ?? true
+        guard !ownedByCredential, !usedByConnection else { return }
+        try? await keychain.remove(reference: reference)
+    }
+
+    private func jobsUsing(credentialReference: String) async throws -> [SyncJob] {
+        let connectionIDs = Set(
+            try await repository.connections()
+                .filter { $0.credentialReference == credentialReference }
+                .map(\.id)
+        )
+        guard !connectionIDs.isEmpty else { return [] }
+        return try await repository.jobs().filter { connectionIDs.contains($0.connectionID) }
+    }
+
+    /// New keys are worth acting on immediately: the syncs that were parked on
+    /// an authentication failure are exactly the ones the user just fixed.
+    private func wakeJobsUsing(credentialReference: String) async {
+        guard let dependents = try? await jobsUsing(credentialReference: credentialReference) else { return }
+        for job in dependents where !job.isPaused {
+            attentionJobIDs.remove(job.id)
+            requestRun(jobID: job.id, allowAttention: true)
+        }
+    }
+
+    private static func keychainLabel(for name: String) -> String {
+        "StorageSync — \(name)"
+    }
+
+    /// Brings keys saved before the credential store existed into it.
+    ///
+    /// The Keychain reference is adopted exactly as it was written, so every
+    /// existing sync keeps resolving the same item and no secret is moved,
+    /// rewritten, or copied. Reading it at all is only to fill in the masked
+    /// access key for display, and failing that read is not a reason to skip
+    /// the adoption.
+    private func adoptCredentialsFromConnections() async {
+        guard let connections = try? await repository.connections(),
+              var known = try? await repository.credentials() else { return }
+        let jobs = (try? await repository.jobs()) ?? []
+        var references = Set(known.map(\.keychainReference))
+
+        for connection in connections where !references.contains(connection.credentialReference) {
+            // A connection whose keys are already gone is not a credential
+            // worth listing. Its sync reports that it needs new ones, and
+            // supplying them creates the credential properly.
+            guard (try? await keychain.contains(reference: connection.credentialReference)) == true else { continue }
+
+            let users = jobs.filter { $0.connectionID == connection.id }
+            var record = StoredCredential(
+                name: StoredCredential.uniqueName(
+                    Self.adoptedName(for: connection),
+                    avoiding: known.map(\.name)
+                ),
+                keychainReference: connection.credentialReference,
+                createdAt: users.map(\.createdAt).min() ?? Date(),
+                keysUpdatedAt: users.map(\.createdAt).min() ?? Date()
+            )
+            if let secret = try? await keychain.load(reference: connection.credentialReference) {
+                record.accessKeySummary = StoredCredential.summary(forAccessKeyID: secret.accessKeyID)
+                record.hasSessionToken = secret.sessionToken != nil
+            }
+            do {
+                try await repository.saveCredential(record)
+            } catch {
+                continue
+            }
+            known.append(record)
+            references.insert(record.keychainReference)
+        }
+    }
+
+    /// Enough to tell two adopted credentials apart at a glance. The user can
+    /// rename it to whatever they actually call the account.
+    private static func adoptedName(for connection: S3Connection) -> String {
+        connection.bucket.isEmpty ? connection.name : "\(connection.name) (\(connection.bucket))"
     }
 
     public func save(job: SyncJob) async throws {
@@ -268,8 +476,8 @@ public actor SyncCoordinator {
             $0.connectionID == job.connectionID
         } ?? true
         if !connectionStillUsed, let connection {
-            try? await keychain.remove(reference: connection.credentialReference)
             try? await repository.removeConnection(id: connection.id)
+            await removeCredentialMaterialIfOrphaned(reference: connection.credentialReference)
         }
 
         if let store {
@@ -1045,10 +1253,31 @@ public actor SyncCoordinator {
 
 public enum CoordinatorError: Error, LocalizedError {
     case missingConnection
+    case missingCredential
+    case credentialNameMissing
+    case credentialNameTaken(String)
+    case credentialKeysMissing
+    case credentialInUse([String])
 
     public var errorDescription: String? {
         switch self {
-        case .missingConnection: "The S3 connection for this sync no longer exists."
+        case .missingConnection:
+            "The S3 connection for this sync no longer exists."
+        case .missingCredential:
+            "Those saved credentials are no longer in your Keychain."
+        case .credentialNameMissing:
+            "Give these credentials a name."
+        case .credentialNameTaken(let name):
+            "Credentials named “\(name)” already exist. Choose another name."
+        case .credentialKeysMissing:
+            "Enter the access key and secret key."
+        case .credentialInUse(let jobNames):
+            switch jobNames.count {
+            case 1:
+                "“\(jobNames[0])” is using these credentials. Point that sync at other credentials, or remove it first."
+            default:
+                "\(jobNames.count) syncs are using these credentials: \(jobNames.formatted(.list(type: .and))). Point them at other credentials, or remove them first."
+            }
         }
     }
 }

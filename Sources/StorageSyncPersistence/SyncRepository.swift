@@ -68,6 +68,32 @@ public actor SyncRepository {
         try load(table: "connections", id: id.description, as: S3Connection.self)
     }
 
+    /// Saved provider keys, described without their secrets. The secret itself
+    /// is in the Keychain under the credential's reference; nothing in this
+    /// table grants access to anything.
+    public func saveCredential(_ credential: StoredCredential) throws {
+        try upsert(
+            table: "credentials",
+            id: credential.id.description,
+            payload: encoder.encode(credential)
+        )
+    }
+
+    public func credentials() throws -> [StoredCredential] {
+        try loadAll(table: "credentials", as: StoredCredential.self)
+    }
+
+    public func credential(id: CredentialID) throws -> StoredCredential? {
+        try load(table: "credentials", id: id.description, as: StoredCredential.self)
+    }
+
+    public func removeCredential(id: CredentialID) throws {
+        try database.execute(
+            "DELETE FROM credentials WHERE id = ?",
+            bindings: [.text(id.description)]
+        )
+    }
+
     public func saveJob(_ job: SyncJob) throws {
         try upsert(table: "jobs", id: job.id.description, payload: encoder.encode(job))
     }
@@ -784,6 +810,14 @@ public actor SyncRepository {
         )
         try database.execute(
             """
+            CREATE TABLE IF NOT EXISTS credentials(
+              id TEXT PRIMARY KEY,
+              payload BLOB NOT NULL
+            )
+            """
+        )
+        try database.execute(
+            """
             CREATE TABLE IF NOT EXISTS jobs(
               id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
@@ -929,8 +963,13 @@ public actor SyncRepository {
         }
     }
 
+    /// Tables that hold one JSON document per row and are addressed by name in
+    /// interpolated SQL. Kept in one place so a caller cannot reach a table
+    /// that is not shaped this way, and so adding one is a single edit.
+    private static let documentTables: Set<String> = ["connections", "credentials", "jobs", "snapshots"]
+
     private func upsert(table: String, id: String, payload: Data) throws {
-        precondition(["connections", "jobs", "snapshots"].contains(table))
+        precondition(Self.documentTables.contains(table))
         try database.execute(
             "INSERT INTO \(table)(id, payload) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
             bindings: [.text(id), .blob(payload)]
@@ -990,7 +1029,7 @@ public actor SyncRepository {
     }
 
     private func load<T: Decodable & Sendable>(table: String, id: String, as type: T.Type) throws -> T? {
-        precondition(["connections", "jobs", "snapshots"].contains(table))
+        precondition(Self.documentTables.contains(table))
         var value: T?
         try database.query(
             "SELECT payload FROM \(table) WHERE id = ?",
@@ -1003,7 +1042,7 @@ public actor SyncRepository {
     }
 
     private func loadAll<T: Decodable & Sendable>(table: String, as type: T.Type) throws -> [T] {
-        precondition(["connections", "jobs", "snapshots"].contains(table))
+        precondition(Self.documentTables.contains(table))
         var values: [T] = []
         try database.query("SELECT payload FROM \(table) ORDER BY id ASC") { statement in
             guard let payload = database.blob(statement, column: 0) else { return }

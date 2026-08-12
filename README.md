@@ -19,12 +19,40 @@ These are the guarantees the engine is written and tested against.
 - Multipart uploads and ranged downloads are checkpointed in a synchronous SQLite WAL.
 - Network loss, provider throttling, insufficient space, and drive loss are durable waiting states, not errors.
 - Credentials live in the macOS Keychain; bookmarks, manifests, and transfer state are user-private on disk.
+- Only one operation in the app writes a secret, and only the background agent ever reads one back.
 
 The manager shows where a sync's storage actually is, as three lines on one shared scale: what is on this Mac, what is still moving, and what is in the bucket. They are drawn against bytes rather than file counts, and they are one picture rather than three percentages — the cloud line fills from the left, the local line is pinned to the right, and the line between them covers exactly the span the cloud has not reached yet, so copying a file moves a single boundary through all three rows. Underneath sit the three concrete numbers: source files found, files already present at the destination, and files remaining to copy. This makes a partially completed first sync auditable before terabytes of transfer begin.
 
+## Credentials
+
+Keys are saved once, given a name, and reused. The sidebar's **Credentials**
+section lists every saved set with its shortened access key, when the keys were
+last replaced, and which syncs depend on it; the Create Sync sheet offers them in
+a menu, so a second bucket in the same account asks for nothing that was already
+typed.
+
+Sharing one set between syncs is the point, and it decides the rest of the
+behaviour. Replacing an expired key once fixes every sync using it — and because
+that is a change several syncs feel at once, the new keys are tried against a
+bucket one of them already uses before anything is saved. Deleting is refused
+while a sync still depends on the keys, and names the syncs rather than breaking
+them. Removing a sync leaves saved credentials alone: they are yours, not the
+sync's, and are deleted from the Credentials list only.
+
+The keys themselves are in the Keychain and nowhere else. StorageSync's database
+holds a name, a date, and the access key ID with its middle removed — the way the
+AWS console shows it — so two sets for the same provider can be told apart in a
+menu without the database holding anything that grants access. Saving credentials
+is the only operation that writes a secret; pointing a sync at credentials that
+are already saved sends no secret anywhere at all, and only the background agent
+ever reads one back.
+
+Credentials saved by earlier versions are adopted into the list on first launch,
+keeping their existing Keychain item exactly as it is.
+
 ## Scope
 
-Deliberately narrow. Create a sync, see its state, pause or resume it, update credentials. Upload and download directions are both supported; bidirectional sync is not, and neither is deletion propagation in any form.
+Deliberately narrow. Create a sync, see its state, pause or resume it, manage the credentials it uses. Upload and download directions are both supported; bidirectional sync is not, and neither is deletion propagation in any form.
 
 Any S3-compatible endpoint should work — AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi, Ceph — using SigV4 with either virtual-host or path-style addressing. Development and real-world verification were done against AWS S3.
 

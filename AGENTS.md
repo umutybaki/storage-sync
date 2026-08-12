@@ -206,6 +206,59 @@ Not verified visually, for the same reason as the 2026-08-04 pass: no Screen Rec
 permission in this session. Evidence is a warning-free clean build against `MacOSX26.sdk` and the full
 reliability suite passing.
 
+## Credential store pass (2026-08-12)
+
+Saved credentials became their own record so several syncs can share one set of
+keys. Engine, persistence beyond one new table, S3, and transfer safety are
+untouched. Version 0.3.0.
+
+- `StorageSyncCore.StoredCredential` holds an ID, the user's name for it, a
+  Keychain reference, dates, and the access key ID with its middle removed. No
+  secret is in it, which is why it can live in SQLite (`credentials` table),
+  cross XPC, and be drawn on screen. `keysUpdatedAt` deliberately does not move
+  on a rename.
+- **`SyncCoordinator.saveCredential` is the only thing in the tree that writes a
+  secret.** `save(connection:)` no longer takes credentials at all: it checks
+  the referenced item exists with `KeychainStore.contains`, which asks for no
+  data and so does not trip the ACL prompt, and then writes configuration only.
+  Reusing saved keys for a new sync sends no secret over XPC.
+- **Removing a sync must not delete the Keychain item its connection points at**
+  when a saved credential owns it. That was correct while an item belonged to
+  one sync and is data loss now that it can be shared.
+  `removeCredentialMaterialIfOrphaned` treats every uncertain answer as "still
+  in use". A reliability check covers it and was confirmed to fail when the
+  guard was removed.
+- Legacy credentials are adopted in `start()`. **The Keychain reference is
+  adopted exactly as written** — nothing is moved or rewritten, so a running
+  sync keeps resolving the same item. Confirmed to fail when the adoption was
+  made to mint a new reference. The item is read once only for the masked key,
+  and `try?` on that read is deliberate.
+- Adoption reads the Keychain at agent start rather than at first transfer, so
+  the "new helper identity" prompt described under **Background agent** now
+  appears earlier. Still answered with **Always Allow**.
+- Keychain items are written `AfterFirstUnlockThisDeviceOnly`, explicitly
+  non-synchronizable, and labelled with the credential's name. The accessibility
+  class is a declaration rather than enforcement here: generic passwords land in
+  the file-based login keychain, which does not enforce it. Do not "fix" that by
+  setting `kSecUseDataProtectionKeychain` — it needs a team identifier this
+  ad-hoc build does not have, and it would orphan every credential already
+  saved.
+- `credentialStoreCheck()` covers masking, unique naming, adoption and its
+  idempotence, sharing between syncs, refusing a dangling reference, refusing
+  deletion while in use, credentials outliving every sync that used them,
+  duplicate names, and rename leaving keys and reference alone. It writes to a
+  Keychain service unique to the run and purges it, including on failure.
+- Interface: a Credentials section in the sidebar with a detail pane, a
+  create/edit sheet, a picker in Create Sync, and **Change Credentials…** in
+  place of **Update S3 Credentials…**. `AppModel.selectedJobID` became
+  `selection: ManagerSelection`.
+- The credentials list is fetched separately from the jobs/snapshots/connections
+  request and tolerates failure. An older agent still running after an in-place
+  upgrade does not know the command, and taking the whole refresh down would
+  claim the user's syncs had vanished.
+
+Not verified visually, for the same reason as the earlier interface passes.
+
 ## Background agent
 
 On 2026-08-11 the user asked that quitting StorageSync stop everything, so the agent is deliberately **not** a KeepAlive job any more. `Packaging/app.photosync.agent.plist` has `KeepAlive` removed and `RunAtLoad` false; launchd starts the agent on demand through its Mach service when the manager connects. Quit sends the `shutdown` command (`AgentCommandKind.shutdown`), which calls `SyncCoordinator.stop()` and exits. `AppModel.shutdownAgentForQuit` cancels polling and the maintenance loop *first*, because either would restart the agent it is trying to stop. Do not restore `KeepAlive` without asking: it would silently undo this.

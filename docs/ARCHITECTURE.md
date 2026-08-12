@@ -31,6 +31,36 @@ Each job is one-way: local to S3 or S3 to local. Reconciliation never creates a 
 
 On the first pairing of a relative path, if both source and destination already contain that path, the coordinator records their observed fingerprints as the initial baseline and removes any obsolete queued copy. This lets StorageSync take over a half-completed archive without uploading or downloading the existing portion again. Once that baseline exists, later source changes are planned normally.
 
+## Credentials
+
+A saved credential is a first-class record: an identifier, a user-chosen name, a
+Keychain reference, dates, and the access key ID with its middle removed for
+display. The secret is in the Keychain under that reference and nowhere else, so
+the record is safe to keep in SQLite, send over XPC, and draw on screen.
+
+Connections hold no secret of their own. They name a credential's Keychain
+reference and the engine resolves it at the moment it needs a request signed,
+which is what lets several syncs share one set of keys and what makes replacing
+an expired key a single edit.
+
+Exactly one operation writes a secret. Saving a connection does not: it verifies
+that the referenced item exists — without reading it — and then writes only
+configuration. Pointing a sync at credentials that are already saved therefore
+sends nothing sensitive anywhere; keys travel only in the moment they are first
+typed in or replaced, and the interface process never reads one back.
+
+Sharing decides the deletion rules. A saved credential outlives the syncs that
+use it and is deleted from the Credentials list only, which refuses while a sync
+still depends on it. Removing a sync cleans up a Keychain item only when no saved
+credential owns it and no connection still refers to it; every uncertain answer
+counts as still in use, because an orphaned item is a mess and a deleted one is
+data loss.
+
+Credentials written before this store existed are adopted on agent start. The
+reference is adopted exactly as it was, so nothing moves and no running sync
+notices; the item is read once, only to fill in the masked access key, and a
+failed read is not a reason to skip the adoption.
+
 ## Large-scale reconciliation
 
 Local files and paginated S3 listings stream into SQLite in batches of 512. SQLite joins the current local generation, remote generation, and completed-transfer baselines. The coordinator reads joined rows in bounded pages and enqueues each page in one durable transaction. It never constructs a complete in-memory manifest or transfer queue.

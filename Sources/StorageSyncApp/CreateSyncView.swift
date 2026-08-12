@@ -6,10 +6,23 @@ import UniformTypeIdentifiers
 struct CreateSyncView: View {
     @ObservedObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
-    @State private var draft = SyncDraft()
+    @State private var draft: SyncDraft
     @State private var isSaving = false
     @State private var isDropTargeted = false
     @State private var errorMessage: String?
+
+    /// Opens on saved credentials whenever there are any — the ones the sheet
+    /// was opened from, or failing that the first in the list. Reusing a saved
+    /// set is the common case once a sync exists, and typing keys again for the
+    /// same account is the mistake worth designing out.
+    init(model: AppModel) {
+        _model = ObservedObject(wrappedValue: model)
+        var initial = SyncDraft()
+        if let requested = model.newSyncCredential ?? model.credentials.first?.id {
+            initial.credentialChoice = .saved(requested)
+        }
+        _draft = State(initialValue: initial)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -65,16 +78,44 @@ struct CreateSyncView: View {
                 }
 
                 Section {
-                    TextField("Access key", text: $draft.accessKey)
-                    SecureField("Secret key", text: $draft.secretKey)
-                    SecureField("Session token", text: $draft.sessionToken, prompt: Text("Optional"))
+                    if !model.credentials.isEmpty {
+                        Picker("Use", selection: $draft.credentialChoice) {
+                            ForEach(model.credentials) { credential in
+                                Text(credentialLabel(credential))
+                                    .tag(CredentialChoice.saved(credential.id))
+                            }
+                            Divider()
+                            Text("New Credentials…").tag(CredentialChoice.new)
+                        }
+                    }
+                    if draft.isCreatingCredential {
+                        if !model.credentials.isEmpty {
+                            TextField(
+                                "Name",
+                                text: $draft.credentialName,
+                                prompt: Text(draft.provider.rawValue)
+                            )
+                        }
+                        CredentialKeyFields(
+                            accessKey: $draft.accessKey,
+                            secretKey: $draft.secretKey,
+                            sessionToken: $draft.sessionToken
+                        )
+                    }
                 } header: {
                     Text("Credentials")
                 } footer: {
-                    Label(
-                        "Keys are tested once and then stored only in your macOS Keychain.",
-                        systemImage: "lock"
-                    )
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label(
+                            draft.isCreatingCredential
+                                ? "Keys are tested once and then stored only in your macOS Keychain."
+                                : "Saved in your macOS Keychain. StorageSync checks them against this bucket before starting.",
+                            systemImage: "lock"
+                        )
+                        if draft.isCreatingCredential, !model.credentials.isEmpty {
+                            Text("Saved credentials can be reused by any number of syncs, so keys only need typing once per account.")
+                        }
+                    }
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
@@ -117,10 +158,20 @@ struct CreateSyncView: View {
             Button("Start Sync", action: start)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(!draft.isComplete || isSaving)
+                .disabled(missingRequirement != nil || isSaving)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    private var missingRequirement: String? {
+        draft.missingRequirement(existingCredentialNames: model.credentials.map(\.name))
+    }
+
+    /// Enough to tell two sets of keys for the same provider apart in a menu.
+    private func credentialLabel(_ credential: StoredCredential) -> String {
+        guard let summary = credential.accessKeySummary else { return credential.name }
+        return "\(credential.name) — \(summary)"
     }
 
     /// Either what is still missing, or exactly what is about to happen.
@@ -130,7 +181,7 @@ struct CreateSyncView: View {
             Text("Checking the bucket…")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-        } else if let missing = draft.missingRequirement {
+        } else if let missing = missingRequirement {
             Text(missing)
                 .font(.callout)
                 .foregroundStyle(.secondary)

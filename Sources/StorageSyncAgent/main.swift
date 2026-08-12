@@ -3,7 +3,6 @@ import os
 import StorageSyncCore
 import StorageSyncEngine
 import StorageSyncPersistence
-import StorageSyncS3
 import StorageSyncShared
 import StorageSyncSystem
 
@@ -43,24 +42,32 @@ final class AgentService: NSObject, StorageSyncAgentXPCProtocol, @unchecked Send
         case .connections:
             return try JSONEncoder().encode(try await coordinator.connections())
         case .saveConnection:
-            let payload = try JSONDecoder().decode(ConnectionCredentialPayload.self, from: requiredPayload(command))
-            try await coordinator.save(connection: payload.connection, credentials: payload.credentials)
+            let connection = try JSONDecoder().decode(S3Connection.self, from: requiredPayload(command))
+            try await coordinator.save(connection: connection)
             return nil
         case .testConnection:
             let payload = try JSONDecoder().decode(ConnectionCredentialPayload.self, from: requiredPayload(command))
-            let store = S3ObjectStore(
-                configuration: S3ClientConfiguration(
-                    endpoint: payload.connection.endpoint,
-                    region: payload.connection.region,
-                    bucket: payload.connection.bucket,
-                    addressingStyle: payload.connection.addressingStyle,
-                    credentials: payload.credentials,
-                    timeout: 30
-                )
+            try await coordinator.test(
+                connection: payload.connection,
+                credentials: payload.credentials,
+                remotePrefix: payload.remotePrefix
             )
-            let normalizedPrefix = SyncJob.normalizedPrefix(payload.remotePrefix ?? "")
-            let listingPrefix = normalizedPrefix.isEmpty ? "" : normalizedPrefix + "/"
-            _ = try await store.list(prefix: listingPrefix, continuationToken: nil)
+            return nil
+        case .credentials:
+            return try JSONEncoder().encode(try await coordinator.credentials())
+        case .saveCredential:
+            let payload = try JSONDecoder().decode(SaveCredentialPayload.self, from: requiredPayload(command))
+            let saved = try await coordinator.saveCredential(
+                id: payload.id,
+                name: payload.name,
+                credentials: payload.credentials
+            )
+            // The reply is the saved record, never the keys: the manager needs
+            // the reference to point a connection at, and nothing more.
+            return try JSONEncoder().encode(saved)
+        case .removeCredential:
+            let payload = try JSONDecoder().decode(CredentialCommandPayload.self, from: requiredPayload(command))
+            try await coordinator.removeCredential(id: payload.credentialID)
             return nil
         case .saveJob:
             let job = try JSONDecoder().decode(SyncJob.self, from: requiredPayload(command))

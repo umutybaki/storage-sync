@@ -10,8 +10,21 @@ public struct ObjectStoreFactory: Sendable {
         self.keychain = keychain
     }
 
-    public func make(connection: S3Connection) async throws -> any ObjectStore {
-        guard let credentials = try await keychain.load(reference: connection.credentialReference) else {
+    /// - Parameter credentials: Keys to use instead of the connection's saved
+    ///   ones. Only the check that runs before a credential is saved passes
+    ///   these; every other caller leaves it `nil` so the secret is read from
+    ///   the Keychain at the moment it is needed and nowhere kept.
+    public func make(
+        connection: S3Connection,
+        credentials: S3Credentials? = nil,
+        timeout: TimeInterval? = nil
+    ) async throws -> any ObjectStore {
+        let resolved: S3Credentials
+        if let credentials {
+            resolved = credentials
+        } else if let stored = try await keychain.load(reference: connection.credentialReference) {
+            resolved = stored
+        } else {
             throw ObjectStoreError.authentication("Credentials are missing from Keychain.")
         }
         return S3ObjectStore(
@@ -20,7 +33,8 @@ public struct ObjectStoreFactory: Sendable {
                 region: connection.region,
                 bucket: connection.bucket,
                 addressingStyle: connection.addressingStyle,
-                credentials: credentials
+                credentials: resolved,
+                timeout: timeout ?? 120
             )
         )
     }

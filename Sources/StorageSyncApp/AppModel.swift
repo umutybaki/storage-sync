@@ -11,12 +11,19 @@ final class AppModel: ObservableObject {
     @Published private(set) var jobs: [SyncJob] = []
     @Published private(set) var connections: [ConnectionID: S3Connection] = [:]
     @Published private(set) var snapshots: [SyncJobID: SyncSnapshot] = [:]
+    /// Saved provider keys, described without their secrets. Ordered by name so
+    /// the sidebar and every menu built from it agree.
+    @Published private(set) var credentials: [StoredCredential] = []
     /// The last complete storage balance seen for each sync, so an unplugged
     /// drive dims the picture instead of erasing it. See `BalanceReading`.
     @Published private(set) var lastKnownBalances: [SyncJobID: StorageBalance] = [:]
-    @Published var selectedJobID: SyncJobID?
+    @Published var selection: ManagerSelection?
     @Published var isCreatingSync = false
     @Published var credentialsJob: SyncJob?
+    @Published var credentialEditor: CredentialEditorRequest?
+    @Published var credentialPendingRemoval: StoredCredential?
+    /// Which saved credentials the next Create Sync sheet should open on.
+    @Published var newSyncCredential: CredentialID?
     @Published var jobPendingRemoval: SyncJob?
     @Published var errorMessage: String?
     @Published private(set) var isAgentAvailable = false
@@ -65,7 +72,26 @@ final class AppModel: ObservableObject {
     var menuBarSymbol: String { overallStatus.menuBarSymbol }
 
     var selectedJob: SyncJob? {
-        jobs.first { $0.id == selectedJobID }
+        guard case .sync(let id) = selection else { return nil }
+        return jobs.first { $0.id == id }
+    }
+
+    var selectedCredential: StoredCredential? {
+        guard case .credential(let id) = selection else { return nil }
+        return credentials.first { $0.id == id }
+    }
+
+    /// The syncs that would stop working if these keys stopped working. Joined
+    /// on the Keychain reference rather than on a stored credential ID, because
+    /// the reference is what the engine actually resolves — a second field
+    /// could disagree with it and make this list a comfortable lie.
+    func syncsUsing(_ credential: StoredCredential) -> [SyncJob] {
+        jobs.filter { connections[$0.connectionID]?.credentialReference == credential.keychainReference }
+    }
+
+    func credential(for job: SyncJob) -> StoredCredential? {
+        guard let reference = connections[job.connectionID]?.credentialReference else { return nil }
+        return credentials.first { $0.keychainReference == reference }
     }
 
     func snapshot(for jobID: SyncJobID) -> SyncSnapshot {
@@ -90,7 +116,11 @@ final class AppModel: ObservableObject {
         connections[job.connectionID]
     }
 
-    func beginCreatingSync() {
+    /// - Parameter credential: Which saved credentials the sheet should start
+    ///   on. Passed when the sheet was opened from a credential, so "use these
+    ///   for another sync" is one click rather than a re-selection.
+    func beginCreatingSync(using credential: StoredCredential? = nil) {
+        newSyncCredential = credential?.id
         isCreatingSync = true
     }
 
@@ -118,15 +148,38 @@ final class AppModel: ObservableObject {
             jobs = loadedJobs.sorted { $0.createdAt < $1.createdAt }
             snapshots = Dictionary(uniqueKeysWithValues: loadedSnapshots.map { ($0.jobID, $0) })
             connections = Dictionary(uniqueKeysWithValues: loadedConnections.map { ($0.id, $0) })
+            // Deliberately not part of the request above. Replacing an app
+            // bundle leaves the previous agent running until launchd restarts
+            // it, and that older agent does not know this command. Losing the
+            // credentials list for those few seconds is a dimmed menu; losing
+            // the whole refresh would be an app that says all your syncs are
+            // gone.
+            if let loadedCredentials = try? await client.perform(.credentials, response: [StoredCredential].self) {
+                credentials = loadedCredentials.sorted {
+                    $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                }
+            }
             rememberBalances()
             isAgentAvailable = true
             unreachableSince = nil
-            if selectedJobID == nil || !jobs.contains(where: { $0.id == selectedJobID }) {
-                selectedJobID = jobs.first?.id
-            }
+            reconcileSelection()
         } catch {
             isAgentAvailable = false
             if unreachableSince == nil { unreachableSince = Date() }
+        }
+    }
+
+    /// Keeps the sidebar pointing at something that still exists, without ever
+    /// taking a live selection away from the user: a chosen credential is not
+    /// replaced by the first sync just because syncs sort above it.
+    private func reconcileSelection() {
+        switch selection {
+        case .sync(let id) where jobs.contains(where: { $0.id == id }):
+            return
+        case .credential(let id) where credentials.contains(where: { $0.id == id }):
+            return
+        default:
+            selection = jobs.first.map { .sync($0.id) } ?? credentials.first.map { .credential($0.id) }
         }
     }
 
@@ -162,9 +215,30 @@ final class AppModel: ObservableObject {
               endpoint.scheme == "https" || (endpoint.scheme == "http" && endpoint.isLoopbackHost) else {
             throw SyncDraftError.invalidEndpoint
         }
+
+        // Keys the user is typing in now, or nothing at all when they picked
+        // credentials that are already saved. In that case the secret stays in
+        // the Keychain throughout: the agent resolves it from the reference.
+        let newKeys: S3Credentials?
+        var credentialReference: String
+        switch draft.credentialChoice {
+        case .new:
+            newKeys = S3Credentials(
+                accessKeyID: draft.accessKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                secretAccessKey: draft.secretKey,
+                sessionToken: draft.sessionToken.nilIfBlank
+            )
+            credentialReference = ""
+        case .saved(let id):
+            guard let credential = credentials.first(where: { $0.id == id }) else {
+                throw SyncDraftError.missingCredential
+            }
+            newKeys = nil
+            credentialReference = credential.keychainReference
+        }
+
         let connectionID = ConnectionID()
-        let credentialReference = connectionID.description
-        let connection = S3Connection(
+        var connection = S3Connection(
             id: connectionID,
             name: draft.provider == .amazon ? "Amazon S3" : endpoint.host ?? "S3 Storage",
             endpoint: endpoint,
@@ -173,25 +247,37 @@ final class AppModel: ObservableObject {
             addressingStyle: draft.provider == .amazon && !draft.bucket.contains(".") ? .virtualHost : .path,
             credentialReference: credentialReference
         )
-        let credentials = S3Credentials(
-            accessKeyID: draft.accessKey.trimmingCharacters(in: .whitespacesAndNewlines),
-            secretAccessKey: draft.secretKey,
-            sessionToken: draft.sessionToken.nilIfBlank
+        // Nothing durable exists yet, so a wrong key or bucket costs only this
+        // request. New keys are checked as typed; saved ones are checked
+        // against this bucket, which is not the same question as whether they
+        // work for the sync they came from.
+        try await client.perform(
+            .testConnection,
+            payload: JSONEncoder().encode(
+                ConnectionCredentialPayload(
+                    connection: connection,
+                    credentials: newKeys,
+                    remotePrefix: SyncJob.normalizedPrefix(draft.prefix)
+                )
+            )
         )
-        let connectionPayload = ConnectionCredentialPayload(
-            connection: connection,
-            credentials: credentials,
-            remotePrefix: SyncJob.normalizedPrefix(draft.prefix)
-        )
-        let encodedConnection = try JSONEncoder().encode(connectionPayload)
-        try await client.perform(.testConnection, payload: encodedConnection)
 
         let locations = try RuntimeLocations.standard()
         try locations.prepare()
         let bookmarkStore = try BookmarkStore(directory: locations.bookmarks)
         let bookmarkReference = try await bookmarkStore.create(for: folderURL)
         let volume = try VolumeInspector().identity(for: folderURL, createMarkerIfNeeded: true)
-        try await client.perform(.saveConnection, payload: encodedConnection)
+
+        if let newKeys {
+            let saved = try await performSaveCredential(
+                id: nil,
+                name: draft.effectiveCredentialName,
+                keys: newKeys
+            )
+            connection.credentialReference = saved.keychainReference
+        }
+
+        try await client.perform(.saveConnection, payload: JSONEncoder().encode(connection))
         let job = SyncJob(
             name: draft.name.nilIfBlank ?? folderURL.lastPathComponent,
             direction: draft.direction,
@@ -205,7 +291,7 @@ final class AppModel: ObservableObject {
             remotePrefix: draft.prefix
         )
         try await client.perform(.saveJob, payload: JSONEncoder().encode(job))
-        selectedJobID = job.id
+        selection = .sync(job.id)
         isCreatingSync = false
         await refresh()
     }
@@ -278,31 +364,140 @@ final class AppModel: ObservableObject {
         SMAppService.openSystemSettingsLoginItems()
     }
 
+    // MARK: - Credentials
+
+    func beginCreatingCredential() {
+        credentialEditor = .create
+    }
+
+    func beginEditingCredential(_ credential: StoredCredential) {
+        credentialEditor = .edit(credential)
+    }
+
+    /// Saves a credential from the Credentials list: a new set of keys, a
+    /// rename, or a replacement of the keys inside an existing one.
+    ///
+    /// Replacement keys are tried against a bucket one of the dependent syncs
+    /// already uses, so the same wrong-key mistake cannot be committed to
+    /// several syncs at once. A brand-new credential has no bucket to try yet
+    /// and is saved as given; the sync it is later attached to checks it then.
+    func saveCredential(id: CredentialID?, name: String, keys: S3Credentials?) async throws {
+        if let keys, let id,
+           let credential = credentials.first(where: { $0.id == id }),
+           let (connection, prefix) = verificationTarget(for: credential) {
+            try await client.perform(
+                .testConnection,
+                payload: JSONEncoder().encode(
+                    ConnectionCredentialPayload(
+                        connection: connection,
+                        credentials: keys,
+                        remotePrefix: prefix
+                    )
+                )
+            )
+        }
+        let saved = try await performSaveCredential(id: id, name: name, keys: keys)
+        credentialEditor = nil
+        selection = .credential(saved.id)
+        await refresh()
+    }
+
+    func requestRemoval(of credential: StoredCredential) {
+        credentialPendingRemoval = credential
+    }
+
+    func cancelCredentialRemoval() {
+        credentialPendingRemoval = nil
+    }
+
+    func confirmRemoval(of credential: StoredCredential) async {
+        credentialPendingRemoval = nil
+        do {
+            try await client.perform(
+                .removeCredential,
+                payload: JSONEncoder().encode(CredentialCommandPayload(credentialID: credential.id))
+            )
+            await refresh()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Points one sync at a set of credentials: an existing saved set, or a new
+    /// one created here. Either way the keys are proved against this sync's own
+    /// bucket before the sync is switched over, so a recovery attempt cannot
+    /// quietly replace one broken credential with another.
     func updateCredentials(
         for job: SyncJob,
-        accessKey: String,
-        secretKey: String,
-        sessionToken: String
+        choice: CredentialChoice,
+        name: String,
+        keys: S3Credentials?
     ) async throws {
-        guard let connection = connections[job.connectionID] else {
+        guard var connection = connections[job.connectionID] else {
             throw CredentialUpdateError.missingConnection
         }
-        let credentials = S3Credentials(
-            accessKeyID: accessKey.trimmingCharacters(in: .whitespacesAndNewlines),
-            secretAccessKey: secretKey,
-            sessionToken: sessionToken.nilIfBlank
-        )
-        let payload = try JSONEncoder().encode(
-            ConnectionCredentialPayload(
-                connection: connection,
-                credentials: credentials,
-                remotePrefix: job.remotePrefix
-            )
-        )
-        try await client.perform(.testConnection, payload: payload)
-        try await client.perform(.saveConnection, payload: payload)
+
+        let reference: String
+        switch choice {
+        case .new:
+            guard let keys else { throw CredentialUpdateError.missingKeys }
+            try await test(connection: connection, credentials: keys, prefix: job.remotePrefix)
+            reference = try await performSaveCredential(id: nil, name: name, keys: keys).keychainReference
+        case .saved(let id):
+            guard let credential = credentials.first(where: { $0.id == id }) else {
+                throw CredentialUpdateError.missingCredential
+            }
+            var candidate = connection
+            candidate.credentialReference = credential.keychainReference
+            // With keys in hand the test uses those; without, it makes the
+            // agent resolve the saved ones from the Keychain — which is also
+            // the only way to find out whether they still work here.
+            try await test(connection: candidate, credentials: keys, prefix: job.remotePrefix)
+            if let keys {
+                _ = try await performSaveCredential(id: id, name: credential.name, keys: keys)
+            }
+            reference = credential.keychainReference
+        }
+
+        connection.credentialReference = reference
+        try await client.perform(.saveConnection, payload: JSONEncoder().encode(connection))
         credentialsJob = nil
         await refresh()
+    }
+
+    private func test(connection: S3Connection, credentials: S3Credentials?, prefix: String) async throws {
+        try await client.perform(
+            .testConnection,
+            payload: JSONEncoder().encode(
+                ConnectionCredentialPayload(
+                    connection: connection,
+                    credentials: credentials,
+                    remotePrefix: prefix
+                )
+            )
+        )
+    }
+
+    private func performSaveCredential(
+        id: CredentialID?,
+        name: String,
+        keys: S3Credentials?
+    ) async throws -> StoredCredential {
+        try await client.perform(
+            .saveCredential,
+            payload: JSONEncoder().encode(SaveCredentialPayload(id: id, name: name, credentials: keys)),
+            response: StoredCredential.self
+        )
+    }
+
+    /// A bucket these credentials are already trusted with, for checking a
+    /// replacement against something real.
+    private func verificationTarget(for credential: StoredCredential) -> (S3Connection, String)? {
+        for job in syncsUsing(credential) {
+            guard let connection = connections[job.connectionID] else { continue }
+            return (connection, job.remotePrefix)
+        }
+        return nil
     }
 
     private func sendJobCommand(_ kind: AgentCommandKind, jobID: SyncJobID) async {
@@ -451,6 +646,39 @@ enum ActiveAppModel {
     static weak var current: AppModel?
 }
 
+/// What the manager window's sidebar is showing. Syncs and credentials are
+/// different kinds of thing in one list, so the selection has to say which.
+enum ManagerSelection: Hashable {
+    case sync(SyncJobID)
+    case credential(CredentialID)
+}
+
+/// Which credentials a sync should use: ones already saved, or ones being
+/// typed in right now.
+enum CredentialChoice: Hashable {
+    case saved(CredentialID)
+    case new
+}
+
+enum CredentialEditorRequest: Identifiable, Hashable {
+    case create
+    case edit(StoredCredential)
+
+    var id: String {
+        switch self {
+        case .create: "new"
+        case .edit(let credential): credential.id.description
+        }
+    }
+
+    var credential: StoredCredential? {
+        switch self {
+        case .create: nil
+        case .edit(let credential): credential
+        }
+    }
+}
+
 enum StorageProvider: String, CaseIterable, Identifiable {
     case amazon = "Amazon S3"
     case compatible = "Other S3-compatible"
@@ -466,17 +694,23 @@ struct SyncDraft {
     var region = "us-east-1"
     var bucket = ""
     var prefix = "photos"
+    var credentialChoice: CredentialChoice = .new
+    var credentialName = ""
     var accessKey = ""
     var secretKey = ""
     var sessionToken = ""
     var direction: SyncDirection = .upload
     var folderURL: URL?
 
-    var isComplete: Bool { missingRequirement == nil }
+    var isCreatingCredential: Bool { credentialChoice == .new }
+
+    func isComplete(existingCredentialNames: [String]) -> Bool {
+        missingRequirement(existingCredentialNames: existingCredentialNames) == nil
+    }
 
     /// Says what is still missing instead of leaving a dimmed button with no
     /// explanation. Ordered the same way the form is read, top to bottom.
-    var missingRequirement: String? {
+    func missingRequirement(existingCredentialNames: [String]) -> String? {
         if folderURL == nil { return "Choose a folder on this Mac." }
         if provider == .compatible && URL(string: endpoint) == nil {
             return "Enter the storage endpoint address."
@@ -487,8 +721,15 @@ struct SyncDraft {
         if bucket.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return "Enter the bucket name."
         }
+        guard isCreatingCredential else { return nil }
         if accessKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || secretKey.isEmpty {
             return "Enter the access key and secret key."
+        }
+        // The agent refuses a duplicate name rather than quietly numbering it,
+        // so the sheet has to say so before the keys are sent anywhere.
+        let name = effectiveCredentialName.lowercased()
+        if existingCredentialNames.contains(where: { $0.lowercased() == name }) {
+            return "Credentials named “\(effectiveCredentialName)” already exist. Choose another name."
         }
         return nil
     }
@@ -499,25 +740,40 @@ struct SyncDraft {
         if !typed.isEmpty { return typed }
         return folderURL?.lastPathComponent ?? ""
     }
+
+    /// The name new credentials will be saved under. Falls back to the provider
+    /// so the common single-account case needs no answer at all.
+    var effectiveCredentialName: String {
+        let typed = StoredCredential.normalizedName(credentialName)
+        return typed.isEmpty ? provider.rawValue : typed
+    }
 }
 
 enum SyncDraftError: Error, LocalizedError {
     case missingFolder
     case invalidEndpoint
+    case missingCredential
 
     var errorDescription: String? {
         switch self {
         case .missingFolder: "Choose a local folder."
         case .invalidEndpoint: "Use a valid HTTPS S3 endpoint. Plain HTTP is allowed only for a local test server."
+        case .missingCredential: "Those saved credentials are no longer available. Choose another set."
         }
     }
 }
 
 enum CredentialUpdateError: Error, LocalizedError {
     case missingConnection
+    case missingCredential
+    case missingKeys
 
     var errorDescription: String? {
-        "The S3 connection for this sync is no longer available."
+        switch self {
+        case .missingConnection: "The S3 connection for this sync is no longer available."
+        case .missingCredential: "Those saved credentials are no longer available. Choose another set."
+        case .missingKeys: "Enter the access key and secret key."
+        }
     }
 }
 
@@ -528,9 +784,11 @@ private extension URL {
     }
 }
 
-private extension String {
+extension String {
     var nilIfBlank: String? {
         let value = trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
     }
+
+    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
 }
