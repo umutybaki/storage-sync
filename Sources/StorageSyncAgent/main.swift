@@ -97,12 +97,26 @@ final class AgentService: NSObject, StorageSyncAgentXPCProtocol, @unchecked Send
             return nil
         case .shutdown:
             AgentLog.shared.log("Shutting down at the manager's request.")
-            // Cancels in-flight transfers. Their multipart and range progress is
-            // already checkpointed in SQLite, so the next run resumes rather
-            // than restarting them.
+            // A backstop, not the expected path: `stop()` returns in
+            // milliseconds once the cancelled work has committed its
+            // checkpoints, but a transfer wedged in a socket read must not be
+            // able to keep the agent alive after the user has quit. Five
+            // seconds is longer than a SQLite commit and a file synchronize can
+            // credibly take, and short enough that a relaunch does not find the
+            // previous agent still holding the Mach service. Anything still
+            // running at that point is recovered from SQLite on the next start.
+            Task.detached {
+                try? await Task.sleep(for: .seconds(5))
+                AgentLog.shared.error("In-flight work did not stop within five seconds; exiting anyway.")
+                exit(0)
+            }
+            // Cancels in-flight transfers and waits for them to unwind, so a
+            // part that is written and acknowledged but not yet checkpointed
+            // becomes durable instead of being transferred again next run.
             await coordinator.stop()
-            // Exit after the reply has been delivered; leaving immediately would
-            // make the quit look like a failure to the manager.
+            // Only then arm the exit, so the reply is delivered first; leaving
+            // immediately would make the quit look like a failure to the
+            // manager.
             Task {
                 try? await Task.sleep(for: .milliseconds(250))
                 exit(0)
@@ -215,10 +229,15 @@ final class AgentDelegate: NSObject, NSXPCListenerDelegate {
     }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
-        guard peerValidator?.accepts(processIdentifier: newConnection.processIdentifier) == true else {
+        guard let requirement = peerValidator?.currentRequirementText() else {
             AgentLog.shared.error("Refused a connection from process \(newConnection.processIdentifier).")
             return false
         }
+        // Pinned before the connection is resumed, because from `resume()` on
+        // the peer can call anything in the protocol — including the commands
+        // that write S3 credentials. XPC then checks every message against this
+        // requirement and invalidates the connection when one does not match.
+        newConnection.setCodeSigningRequirement(requirement)
         newConnection.exportedInterface = NSXPCInterface(with: StorageSyncAgentXPCProtocol.self)
         newConnection.exportedObject = service
         newConnection.remoteObjectInterface = NSXPCInterface(with: StorageSyncAgentClientXPCProtocol.self)

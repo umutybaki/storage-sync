@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import StorageSyncCore
 import StorageSyncShared
 
@@ -63,9 +64,17 @@ final class AgentClient: @unchecked Sendable {
     private func performRaw(_ kind: AgentCommandKind, payload: Data?) async throws -> Data? {
         let command = AgentCommand(kind: kind, payload: payload)
         let commandData = try JSONEncoder().encode(command)
+        guard let connection = currentConnection() else {
+            // There is no connection to lose, so nothing will report this the
+            // usual way. Say it in both registers the caller already handles:
+            // the throw answers this command, the callback moves the UI to the
+            // same "agent not running" state a dropped connection produces, and
+            // the app's recovery loop takes it from there.
+            connectionWasLost()
+            throw AgentClientError.unavailable
+        }
         return try await withCheckedThrowingContinuation { continuation in
             let box = ContinuationBox(continuation)
-            let connection = currentConnection()
             guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
                 box.resume(throwing: error)
             }) as? StorageSyncAgentXPCProtocol else {
@@ -79,19 +88,45 @@ final class AgentClient: @unchecked Sendable {
         }
     }
 
-    private func currentConnection() -> NSXPCConnection {
+    /// Nil when the agent's requirement cannot be produced, which is refused
+    /// rather than connected unpinned: a Mach service name is claimed, not
+    /// owned, and the commands sent over this connection carry the user's S3
+    /// keys to whatever answered it.
+    private func currentConnection() -> NSXPCConnection? {
         lock.lock()
         defer { lock.unlock() }
         if let connection { return connection }
+        guard let requirement = Self.agentRequirementText() else { return nil }
         let newConnection = NSXPCConnection(machServiceName: AgentConstants.machServiceName, options: [])
         newConnection.remoteObjectInterface = NSXPCInterface(with: StorageSyncAgentXPCProtocol.self)
         newConnection.exportedInterface = NSXPCInterface(with: StorageSyncAgentClientXPCProtocol.self)
         newConnection.exportedObject = eventReceiver
         newConnection.interruptionHandler = { [weak self] in self?.connectionWasLost() }
         newConnection.invalidationHandler = { [weak self] in self?.connectionWasLost() }
+        newConnection.setCodeSigningRequirement(requirement)
         newConnection.resume()
         connection = newConnection
         return newConnection
+    }
+
+    /// The mirror of what the agent pins on its side, read from the helper this
+    /// app ships rather than captured once, for the same reason: the app is
+    /// ad-hoc signed, so its designated requirement is a cdhash and every
+    /// rebuild produces a different one. A requirement held from an earlier
+    /// launch would name the helper this bundle replaced.
+    private static func agentRequirementText() -> String? {
+        let agentURL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Helpers/StorageSyncAgent", isDirectory: false)
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(agentURL as CFURL, [], &staticCode) == errSecSuccess,
+              let staticCode else { return nil }
+        var requirement: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirement) == errSecSuccess,
+              let requirement else { return nil }
+        var text: CFString?
+        guard SecRequirementCopyString(requirement, [], &text) == errSecSuccess,
+              let text else { return nil }
+        return text as String
     }
 
     private func discardConnection() {
