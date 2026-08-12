@@ -380,6 +380,11 @@ public struct TransferActivityItem: Codable, Hashable, Sendable, Identifiable {
     public var status: TransferStatus
     public var totalBytes: Int64
     public var completedBytes: Int64
+    /// Bytes handed to the network stack for the current request, including
+    /// durable completed parts. This is live presentation state: S3 confirms
+    /// the bytes only when the request succeeds, so resumability continues to
+    /// use `completedBytes` and saved part rows exclusively.
+    public var bytesSent: Int64?
     public var retryCount: Int
     public var nextAttemptAt: Date?
     public var lastError: String?
@@ -395,11 +400,24 @@ public struct TransferActivityItem: Codable, Hashable, Sendable, Identifiable {
         status = transfer.status
         totalBytes = transfer.totalBytes
         completedBytes = transfer.completedBytes
+        bytesSent = transfer.completedBytes
         retryCount = transfer.retryCount
         nextAttemptAt = transfer.nextAttemptAt
         lastError = transfer.lastError
         createdAt = transfer.createdAt
         updatedAt = transfer.updatedAt
+    }
+}
+
+public struct TransferProgressUpdate: Hashable, Sendable {
+    public var jobID: SyncJobID
+    public var transferID: TransferID
+    public var bytesSent: Int64
+
+    public init(jobID: SyncJobID, transferID: TransferID, bytesSent: Int64) {
+        self.jobID = jobID
+        self.transferID = transferID
+        self.bytesSent = bytesSent
     }
 }
 

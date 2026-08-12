@@ -92,36 +92,19 @@ struct StorageSyncWindow: View {
 
 private struct SyncSidebar: View {
     @ObservedObject var model: AppModel
-    @State private var expandedJobIDs: Set<SyncJobID> = []
 
     var body: some View {
         List(selection: $model.selection) {
             Section("Syncs") {
                 ForEach(model.jobs) { job in
-                    SyncSidebarDisclosure(
+                    SyncSidebarRow(
                         job: job,
                         status: model.status(for: job),
                         snapshot: model.snapshot(for: job.id),
                         connection: model.connection(for: job),
-                        credential: model.credential(for: job),
-                        isExpanded: expandedJobIDs.contains(job.id),
-                        isSelected: model.selection == .sync(job.id),
-                        toggleExpanded: {
-                            withAnimation(.snappy(duration: 0.2)) {
-                                if expandedJobIDs.contains(job.id) {
-                                    expandedJobIDs.remove(job.id)
-                                } else {
-                                    expandedJobIDs.insert(job.id)
-                                }
-                            }
-                        },
-                        select: { model.selection = .sync(job.id) }
+                        credential: model.credential(for: job)
                     )
-                        .listRowBackground(
-                            model.selection == .sync(job.id)
-                                ? Color.accentColor.opacity(0.14)
-                                : Color.clear
-                        )
+                        .tag(ManagerSelection.sync(job.id))
                         .contextMenu {
                             Button(model.isCheckingForChanges(job.id) ? "Checking for Changes…" : "Sync Now") {
                                 Task { await model.syncNow(job) }
@@ -164,7 +147,7 @@ private struct SyncSidebar: View {
             }
         }
         .listStyle(.sidebar)
-        .navigationSplitViewColumnWidth(min: 230, ideal: 276, max: 360)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             AgentStatusBar(
                 isAvailable: model.isAgentAvailable,
@@ -230,100 +213,110 @@ private struct CredentialSidebarRow: View {
     }
 }
 
-private struct SyncSidebarDisclosure: View {
+private struct SyncSidebarRow: View {
     let job: SyncJob
     let status: SyncStatus
     let snapshot: SyncSnapshot
     let connection: S3Connection?
     let credential: StoredCredential?
-    let isExpanded: Bool
-    let isSelected: Bool
-    let toggleExpanded: () -> Void
-    let select: () -> Void
+    @State private var showsInfo = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 4) {
-                Button(action: toggleExpanded) {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .frame(width: 18, height: 22)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(isExpanded ? "Hide sync details" : "Show sync details")
-                .accessibilityLabel(isExpanded ? "Collapse \(job.name) details" : "Expand \(job.name) details")
+        HStack(spacing: 8) {
+            Image(systemName: status.symbol)
+                .foregroundStyle(status.tint)
+                .frame(width: 18)
+                .accessibilityLabel(status.title)
 
-                Button(action: select) {
-                    HStack(spacing: 6) {
-                        Label(job.name, systemImage: SyncRoute.symbol(job))
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        Image(systemName: status.symbol)
-                            .imageScale(.small)
-                            .foregroundStyle(status.tint)
-                            .accessibilityLabel(status.title)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint("Shows this sync’s status and transfers")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.name)
+                    .lineLimit(1)
+                Text(SyncRoute.text(job, connection: connection))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
-            if isExpanded {
-                VStack(alignment: .leading, spacing: 6) {
-                    SidebarDetailLine(
-                        symbol: job.direction == .upload ? "arrow.up" : "arrow.down",
-                        title: job.direction == .upload ? "This Mac → S3" : "S3 → This Mac"
-                    )
-                    SidebarDetailLine(symbol: "folder", title: job.localRoot.displayName)
-                    SidebarDetailLine(
-                        symbol: "shippingbox",
-                        title: bucketDescription
-                    )
-                    if let credential {
-                        SidebarDetailLine(symbol: "key", title: credential.name)
-                    }
-                    SidebarDetailLine(
-                        symbol: "clock",
-                        title: snapshot.lastSuccessfulSync.map {
-                            "Last checked \($0.formatted(date: .abbreviated, time: .shortened))"
-                        } ?? "Not checked yet"
-                    )
-                    Label("Destination files are never removed", systemImage: "checkmark.shield")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.leading, 28)
-                .padding(.top, 6)
-                .padding(.bottom, 5)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+            Spacer(minLength: 2)
+
+            Button {
+                showsInfo.toggle()
+            } label: {
+                Image(systemName: "info.circle")
+                    .imageScale(.medium)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .help("Show sync details")
+            .accessibilityLabel("Show \(job.name) details")
+            .popover(isPresented: $showsInfo, arrowEdge: .leading) {
+                SyncInfoPopover(
+                    job: job,
+                    snapshot: snapshot,
+                    connection: connection,
+                    credential: credential
+                )
             }
         }
+        .contentShape(Rectangle())
+        .padding(.vertical, 2)
         .help(status.title)
-    }
-
-    private var bucketDescription: String {
-        guard let connection else { return "Bucket unavailable" }
-        return job.remotePrefix.isEmpty
-            ? connection.bucket
-            : "\(connection.bucket)/\(job.remotePrefix)"
     }
 }
 
-private struct SidebarDetailLine: View {
-    let symbol: String
-    let title: String
+private struct SyncInfoPopover: View {
+    let job: SyncJob
+    let snapshot: SyncSnapshot
+    let connection: S3Connection?
+    let credential: StoredCredential?
 
     var body: some View {
-        Label(title, systemImage: symbol)
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(job.name)
+                    .font(.headline)
+                Text(SyncRoute.text(job, connection: connection))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 9) {
+                infoRow("Folder", value: job.localRoot.fallbackPath)
+                infoRow("Bucket", value: connection?.bucket ?? "Unavailable")
+                infoRow("Prefix", value: job.remotePrefix.isEmpty ? "Top level" : job.remotePrefix)
+                infoRow("Region", value: connection?.region ?? "Unavailable")
+                infoRow("Credentials", value: credential?.name ?? "Unavailable")
+                infoRow("Last checked", value: lastChecked)
+            }
+
+            Divider()
+
+            Label(
+                "Destination files are never removed.",
+                systemImage: "checkmark.shield"
+            )
             .font(.caption)
             .foregroundStyle(.secondary)
-            .lineLimit(2)
-            .truncationMode(.middle)
-            .help(title)
+        }
+        .padding(18)
+        .frame(width: 360)
+    }
+
+    private var lastChecked: String {
+        snapshot.lastSuccessfulSync?.formatted(date: .abbreviated, time: .shortened)
+            ?? "Not checked yet"
+    }
+
+    private func infoRow(_ label: String, value: String) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+        }
     }
 }
 

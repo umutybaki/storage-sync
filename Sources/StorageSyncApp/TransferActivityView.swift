@@ -21,7 +21,8 @@ struct TransferActivityView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .fixedSize()
+                .labelsHidden()
+                .frame(minWidth: 410, idealWidth: 500, maxWidth: 620)
             }
 
             activityContent
@@ -65,7 +66,7 @@ struct TransferActivityView: View {
                 TableColumn("Progress") { item in
                     TransferProgressCell(item: item)
                 }
-                .width(min: 115, ideal: 145)
+                .width(min: 145, ideal: 185)
 
                 TableColumn("Size") { item in
                     Text(ByteCountFormatter.string(fromByteCount: item.totalBytes, countStyle: .file))
@@ -209,7 +210,7 @@ private struct TransferProgressCell: View {
 
     var body: some View {
         switch item.status {
-        case .running where item.completedBytes == 0 && item.totalBytes > 0:
+        case .running where visibleBytes == 0 && item.totalBytes > 0:
             HStack(spacing: 7) {
                 ProgressView()
                     .controlSize(.small)
@@ -237,17 +238,34 @@ private struct TransferProgressCell: View {
     private var progress: some View {
         VStack(alignment: .leading, spacing: 3) {
             ProgressView(
-                value: Double(min(item.totalBytes, max(0, item.completedBytes))),
+                value: Double(visibleBytes),
                 total: Double(max(1, item.totalBytes))
             )
             Text(
-                "\(ByteCountFormatter.string(fromByteCount: item.completedBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: item.totalBytes, countStyle: .file))"
+                "\(ByteCountFormatter.string(fromByteCount: visibleBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: item.totalBytes, countStyle: .file))\(progressSuffix)"
             )
             .font(.caption2)
             .monospacedDigit()
             .foregroundStyle(.secondary)
             .lineLimit(1)
         }
+        .accessibilityLabel(
+            "\(visibleBytes.formatted()) of \(item.totalBytes.formatted()) bytes \(accessibilityProgressVerb)"
+        )
+    }
+
+    private var visibleBytes: Int64 {
+        let live = item.kind == .upload ? item.bytesSent ?? 0 : 0
+        return min(item.totalBytes, max(0, max(item.completedBytes, live)))
+    }
+
+    private var progressSuffix: String {
+        item.status == .running && item.kind == .upload ? " sent" : ""
+    }
+
+    private var accessibilityProgressVerb: String {
+        if item.status == .running && item.kind == .upload { return "sent" }
+        return "completed"
     }
 }
 

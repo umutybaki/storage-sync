@@ -65,11 +65,21 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
     }
 
     public func put(key: String, data: Data, metadata: [String: String]) async throws -> RemoteObject {
+        try await put(key: key, data: data, metadata: metadata, progress: { _ in })
+    }
+
+    public func put(
+        key: String,
+        data: Data,
+        metadata: [String: String],
+        progress: @escaping UploadProgressHandler
+    ) async throws -> RemoteObject {
         let response = try await send(
             method: "PUT",
             key: key,
             headers: metadataHeaders(metadata),
-            body: data
+            body: data,
+            uploadProgress: progress
         )
         return remoteObject(key: key, response: response.response, authoritativeSize: Int64(data.count))
     }
@@ -90,6 +100,22 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         partNumber: Int,
         data: Data
     ) async throws -> UploadedPart {
+        try await uploadPart(
+            key: key,
+            uploadID: uploadID,
+            partNumber: partNumber,
+            data: data,
+            progress: { _ in }
+        )
+    }
+
+    public func uploadPart(
+        key: String,
+        uploadID: String,
+        partNumber: Int,
+        data: Data,
+        progress: @escaping UploadProgressHandler
+    ) async throws -> UploadedPart {
         let response = try await send(
             method: "PUT",
             key: key,
@@ -97,7 +123,8 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
                 URLQueryItem(name: "partNumber", value: String(partNumber)),
                 URLQueryItem(name: "uploadId", value: uploadID)
             ],
-            body: data
+            body: data,
+            uploadProgress: progress
         )
         guard let eTag = response.response.value(forHTTPHeaderField: "ETag"), !eTag.isEmpty else {
             throw ObjectStoreError.invalidResponse("The S3 service accepted part \(partNumber) without returning an ETag.")
@@ -178,7 +205,8 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         key: String?,
         query: [URLQueryItem] = [],
         headers: [String: String] = [:],
-        body: Data = Data()
+        body: Data = Data(),
+        uploadProgress: UploadProgressHandler? = nil
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         let url = try requestURL(key: key, query: query)
         var request = URLRequest(url: url, timeoutInterval: configuration.timeout)
@@ -194,11 +222,18 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         )
 
         do {
-            let (data, urlResponse) = try await session.data(for: request)
+            let progressDelegate = uploadProgress.map(UploadRequestProgressDelegate.init(handler:))
+            let (data, urlResponse) = try await session.data(for: request, delegate: progressDelegate)
             guard let response = urlResponse as? HTTPURLResponse else {
                 throw ObjectStoreError.invalidResponse("The S3 endpoint returned a non-HTTP response.")
             }
             try validate(response: response, data: data)
+            if let uploadProgress, !body.isEmpty {
+                // Delegate callbacks describe bytes sent, but the successful
+                // HTTP response is the point at which the full request is no
+                // longer merely in flight. Force the exact terminal value.
+                await uploadProgress(Int64(body.count))
+            }
             return (data, response)
         } catch let error as ObjectStoreError {
             throw error
@@ -346,5 +381,23 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
         return formatter.date(from: value)
+    }
+}
+
+private final class UploadRequestProgressDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let handler: UploadProgressHandler
+
+    init(handler: @escaping UploadProgressHandler) {
+        self.handler = handler
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didSendBodyData bytesSent: Int64,
+        totalBytesSent: Int64,
+        totalBytesExpectedToSend: Int64
+    ) {
+        Task { await handler(totalBytesSent) }
     }
 }

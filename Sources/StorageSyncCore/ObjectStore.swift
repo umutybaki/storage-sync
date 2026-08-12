@@ -24,16 +24,65 @@ public struct UploadedPart: Codable, Hashable, Sendable {
     }
 }
 
+/// Cumulative body bytes sent for one HTTP request. A successful response is
+/// still required before those bytes count as durably uploaded.
+public typealias UploadProgressHandler = @Sendable (Int64) async -> Void
+
 public protocol ObjectStore: Sendable {
     func list(prefix: String, continuationToken: String?) async throws -> ObjectPage
     func head(key: String) async throws -> RemoteObject?
     func put(key: String, data: Data, metadata: [String: String]) async throws -> RemoteObject
+    func put(
+        key: String,
+        data: Data,
+        metadata: [String: String],
+        progress: @escaping UploadProgressHandler
+    ) async throws -> RemoteObject
     func createMultipartUpload(key: String, metadata: [String: String]) async throws -> String
     func uploadPart(key: String, uploadID: String, partNumber: Int, data: Data) async throws -> UploadedPart
+    func uploadPart(
+        key: String,
+        uploadID: String,
+        partNumber: Int,
+        data: Data,
+        progress: @escaping UploadProgressHandler
+    ) async throws -> UploadedPart
     func listParts(key: String, uploadID: String) async throws -> [UploadedPart]
     func completeMultipartUpload(key: String, uploadID: String, parts: [UploadedPart]) async throws -> RemoteObject
     func abortMultipartUpload(key: String, uploadID: String) async throws
     func getRange(key: String, range: Range<Int64>?) async throws -> Data
+}
+
+public extension ObjectStore {
+    /// Existing providers and test doubles remain correct without implementing
+    /// transport-level progress: they report the complete request at success.
+    func put(
+        key: String,
+        data: Data,
+        metadata: [String: String],
+        progress: @escaping UploadProgressHandler
+    ) async throws -> RemoteObject {
+        let object = try await put(key: key, data: data, metadata: metadata)
+        await progress(Int64(data.count))
+        return object
+    }
+
+    func uploadPart(
+        key: String,
+        uploadID: String,
+        partNumber: Int,
+        data: Data,
+        progress: @escaping UploadProgressHandler
+    ) async throws -> UploadedPart {
+        let part = try await uploadPart(
+            key: key,
+            uploadID: uploadID,
+            partNumber: partNumber,
+            data: data
+        )
+        await progress(Int64(data.count))
+        return part
+    }
 }
 
 public enum ObjectStoreError: Error, LocalizedError, Sendable, Equatable {

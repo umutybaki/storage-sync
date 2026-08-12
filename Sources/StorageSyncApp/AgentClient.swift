@@ -25,6 +25,12 @@ final class AgentClient: @unchecked Sendable {
         eventReceiver.setHandler(handler)
     }
 
+    func onTransferProgressChange(
+        _ handler: (@Sendable (TransferProgressUpdate) -> Void)?
+    ) {
+        eventReceiver.setProgressHandler(handler)
+    }
+
     func onStateChange(_ handler: (@Sendable () -> Void)?) {
         eventReceiver.setStateHandler(handler)
     }
@@ -103,12 +109,19 @@ final class AgentClient: @unchecked Sendable {
 private final class AgentEventReceiver: NSObject, StorageSyncAgentClientXPCProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private var handler: (@Sendable (SyncJobID, Int64) -> Void)?
+    private var progressHandler: (@Sendable (TransferProgressUpdate) -> Void)?
     private var stateHandler: (@Sendable () -> Void)?
     private var connectionLostHandler: (@Sendable () -> Void)?
 
     func setHandler(_ handler: (@Sendable (SyncJobID, Int64) -> Void)?) {
         lock.lock()
         self.handler = handler
+        lock.unlock()
+    }
+
+    func setProgressHandler(_ handler: (@Sendable (TransferProgressUpdate) -> Void)?) {
+        lock.lock()
+        progressHandler = handler
         lock.unlock()
     }
 
@@ -130,6 +143,21 @@ private final class AgentEventReceiver: NSObject, StorageSyncAgentClientXPCProto
         let handler = handler
         lock.unlock()
         handler?(SyncJobID(rawValue: rawValue), revision)
+    }
+
+    func transferProgressDidChange(jobID: String, transferID: String, bytesSent: Int64) {
+        guard let jobUUID = UUID(uuidString: jobID),
+              let transferUUID = UUID(uuidString: transferID) else { return }
+        lock.lock()
+        let handler = progressHandler
+        lock.unlock()
+        handler?(
+            TransferProgressUpdate(
+                jobID: SyncJobID(rawValue: jobUUID),
+                transferID: TransferID(rawValue: transferUUID),
+                bytesSent: bytesSent
+            )
+        )
     }
 
     func stateDidChange() {

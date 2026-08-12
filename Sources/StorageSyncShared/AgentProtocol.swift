@@ -95,6 +95,7 @@ public struct JobCommandPayload: Codable, Sendable {
 /// competing source of truth.
 @objc public protocol StorageSyncAgentClientXPCProtocol {
     func transferActivityDidChange(jobID: String, revision: Int64)
+    func transferProgressDidChange(jobID: String, transferID: String, bytesSent: Int64)
     func stateDidChange()
 }
 

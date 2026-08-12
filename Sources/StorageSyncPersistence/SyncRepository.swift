@@ -38,6 +38,7 @@ public actor SyncRepository {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private var activityContinuations: [UUID: AsyncStream<TransferActivityUpdate>.Continuation] = [:]
+    private var progressContinuations: [UUID: AsyncStream<TransferProgressUpdate>.Continuation] = [:]
     private var stateContinuations: [UUID: AsyncStream<Void>.Continuation] = [:]
 
     public init(databaseURL: URL) throws {
@@ -77,6 +78,39 @@ public actor SyncRepository {
         for continuation in activityContinuations.values {
             continuation.yield(update)
         }
+    }
+
+    /// Live transport progress is intentionally not written into resumable
+    /// state. Bytes become durable only when S3 acknowledges the request/part;
+    /// until then this stream lets the visible row say exactly what has been
+    /// sent without teaching crash recovery to trust unacknowledged bytes.
+    public func transferProgressUpdates() -> AsyncStream<TransferProgressUpdate> {
+        let token = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(128)) { continuation in
+            progressContinuations[token] = continuation
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { await self?.removeProgressContinuation(token) }
+            }
+        }
+    }
+
+    public func reportTransferProgress(
+        jobID: SyncJobID,
+        transferID: TransferID,
+        bytesSent: Int64
+    ) {
+        let update = TransferProgressUpdate(
+            jobID: jobID,
+            transferID: transferID,
+            bytesSent: max(0, bytesSent)
+        )
+        for continuation in progressContinuations.values {
+            continuation.yield(update)
+        }
+    }
+
+    private func removeProgressContinuation(_ token: UUID) {
+        progressContinuations.removeValue(forKey: token)
     }
 
     public func stateUpdates() -> AsyncStream<Void> {

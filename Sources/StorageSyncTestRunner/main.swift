@@ -75,6 +75,16 @@ private final class KeychainReferenceBox: @unchecked Sendable {
     }
 }
 
+private actor ByteProgressRecorder {
+    private var values: [Int64] = []
+
+    func record(_ value: Int64) {
+        values.append(value)
+    }
+
+    func snapshot() -> [Int64] { values }
+}
+
 private final class S3URLProtocolStub: URLProtocol, @unchecked Sendable {
     typealias Handler = @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
 
@@ -146,6 +156,7 @@ private final class ReliabilitySuite {
         try await credentialStoreCheck()
         try await gracefulUnmountPreparationCheck()
         try await processCrashRecoveryCheck()
+        try await uploadProgressVisibilityCheck()
         try await multipartLostResponseCheck()
         try await multipartCompletionLostResponseCheck()
         try await expiredMultipartUploadCheck()
@@ -523,12 +534,21 @@ private final class ReliabilitySuite {
         let bytes = try await store.getRange(key: "folder/a b#%.jpg", range: 5..<9)
         try check(bytes == Data("data".utf8), "The ranged S3 response body was not returned")
 
+        let putProgress = ByteProgressRecorder()
         let uploaded = try await store.put(
             key: "folder/new.jpg",
             data: Data("payload".utf8),
-            metadata: ["storagesync-source-size": "7"]
+            metadata: ["storagesync-source-size": "7"],
+            progress: { bytesSent in
+                await putProgress.record(bytesSent)
+            }
         )
         try check(uploaded.size == 7, "A zero-length S3 PUT response was mistaken for the uploaded object size")
+        let putProgressValues = await putProgress.snapshot()
+        try check(
+            putProgressValues.last == 7,
+            "The S3 transport did not report the exact successful PUT body size"
+        )
 
         do {
             _ = try await store.completeMultipartUpload(
@@ -1866,6 +1886,62 @@ private final class ReliabilitySuite {
         let repository = try SyncRepository(databaseURL: databaseURL)
         let recovered = try await repository.transfer(id: TransferID(rawValue: transferID))
         try check(recovered?.status == .waiting, "An abruptly terminated process did not recover its running transfer")
+    }
+
+    private func uploadProgressVisibilityCheck() async throws {
+        let fixture = try Fixture.make(direction: .upload)
+        defer { fixture.cleanup() }
+        let payload = Data(repeating: 0x5a, count: 80)
+        let relativePath = "visible-progress.bin"
+        let source = fixture.root.appendingPathComponent(relativePath)
+        try payload.write(to: source)
+        let fingerprint = try LocalScanner().fingerprint(
+            url: source,
+            relativePath: relativePath
+        )
+        let transfer = TransferRecord(
+            jobID: fixture.job.id,
+            relativePath: relativePath,
+            kind: .upload,
+            totalBytes: Int64(payload.count),
+            sourceFingerprint: fingerprint,
+            remoteKey: "backup/\(relativePath)"
+        )
+        try await fixture.repository.saveTransfer(transfer)
+
+        let updates = await fixture.repository.transferProgressUpdates()
+        let observedTask = Task { () -> [Int64] in
+            var values: [Int64] = []
+            for await update in updates
+            where update.jobID == transfer.jobID && update.transferID == transfer.id {
+                values.append(update.bytesSent)
+                if update.bytesSent == transfer.totalBytes { return values }
+            }
+            return values
+        }
+
+        let result = await fixture.executor(maxConcurrentParts: 3).execute(
+            transfer,
+            job: fixture.job,
+            root: fixture.root
+        )
+        guard case .completed = result else {
+            observedTask.cancel()
+            throw CheckFailure.failed("The visible-progress upload failed: \(result)")
+        }
+        let observed = await observedTask.value
+        try check(
+            observed.last == transfer.totalBytes,
+            "Per-file upload progress never reported the exact terminal byte count"
+        )
+        try check(
+            zip(observed, observed.dropFirst()).allSatisfy { $0.0 <= $0.1 },
+            "Concurrent multipart progress moved backwards"
+        )
+        try check(
+            observed.allSatisfy { 0...transfer.totalBytes ~= $0 },
+            "Per-file upload progress exceeded the file's exact byte bounds"
+        )
     }
 
     private func multipartLostResponseCheck() async throws {

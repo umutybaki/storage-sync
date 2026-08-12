@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4.0
+
+**Deterministic transfer activity.** Every sync now has a durable, Finder-like
+transfer browser that makes newly discovered, waiting, active, completed, and
+problem files visible for the current check.
+
+- **Sync Now** remains available while transfers are running. A click is
+  acknowledged immediately, then starts one bounded rescan at the next safe
+  transfer-batch boundary. Starting or resuming a sync also scans once; there
+  are no interval-based scans.
+- Automatic interval and filesystem-event scans are disabled. Discovery happens
+  only when the app/agent starts, a sync resumes, or the user clicks **Sync
+  Now**, so every check has an observable cause.
+- The selected sync is event-driven rather than polled. Its activity page is
+  reloaded only after the agent commits a newer revision, so merely selecting a
+  sync or opening its details cannot trigger a check.
+- The transfer browser records the current batch in SQLite and pages 150 rows
+  at a time. Queued, active, retrying, completed, failed, and superseded rows
+  survive app and agent restarts without loading a large manifest into memory.
+- Uploading rows now show the exact request bytes sent for each file. Multipart
+  parts are combined into one monotonic file total; durable resume checkpoints
+  remain separate, so a sent byte is never misrepresented as acknowledged by
+  S3.
+- The sync summary keeps aggregate progress and blockers while file-level
+  status lives in the table. Filters expose all, active, waiting, completed,
+  and issue rows, with Finder reveal and relative-path copy actions.
+- Sidebar rows again use native selection highlighting, show only the sync name
+  and source → destination route, and move configuration details into an info
+  popover. The manager minimum size now keeps every transfer control legible.
+- Source-change warnings are shown only when reliable metadata proves that the
+  content changed during transfer; routine syncing retains the **Syncing…**
+  headline.
+
 ## 0.3.0
 
 **Saved credentials.** One set of provider keys can now be saved once, given a

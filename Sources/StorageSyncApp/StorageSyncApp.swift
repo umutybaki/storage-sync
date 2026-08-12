@@ -17,11 +17,15 @@ struct StorageSyncApplication: App {
 
         Window("StorageSync", id: ManagerWindow.id) {
             StorageSyncWindow(model: model)
-                .frame(minWidth: 760, minHeight: 470)
+                // The transfer table needs room for all five columns and the
+                // complete filter control. Below this width SwiftUI clips
+                // trailing filters/columns instead of producing a useful
+                // compact arrangement.
+                .frame(minWidth: 960, minHeight: 540)
                 .onAppear { ManagerWindow.didOpen() }
                 .onDisappear { ManagerWindow.didClose() }
         }
-        .defaultSize(width: 940, height: 610)
+        .defaultSize(width: 1080, height: 680)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {

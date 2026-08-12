@@ -54,6 +54,60 @@ private struct DownloadedPartCheckpoint: Sendable {
     var checksum: String
 }
 
+/// Aggregates concurrent multipart request counters into one exact per-file
+/// number. It is deliberately live-only: request bytes are not recovery
+/// checkpoints until S3 returns success for that part.
+private actor LiveUploadProgressReporter {
+    private let repository: SyncRepository
+    private let jobID: SyncJobID
+    private let transferID: TransferID
+    private let totalBytes: Int64
+    private let clock = ContinuousClock()
+    private var acknowledgedBytes: Int64
+    private var requestBytes: [Int: Int64] = [:]
+    private var lastReportedBytes: Int64
+    private var lastReportedAt: ContinuousClock.Instant?
+
+    init(repository: SyncRepository, transfer: TransferRecord, acknowledgedBytes: Int64) {
+        self.repository = repository
+        jobID = transfer.jobID
+        transferID = transfer.id
+        totalBytes = max(0, transfer.totalBytes)
+        self.acknowledgedBytes = max(0, acknowledgedBytes)
+        lastReportedBytes = max(0, acknowledgedBytes)
+    }
+
+    func report(requestID: Int, bytesSent: Int64, requestByteCount: Int64) async {
+        let bounded = min(max(0, requestByteCount), max(0, bytesSent))
+        requestBytes[requestID] = max(requestBytes[requestID] ?? 0, bounded)
+        await emit(force: false)
+    }
+
+    func acknowledge(requestID: Int, byteCount: Int64) async {
+        requestBytes.removeValue(forKey: requestID)
+        acknowledgedBytes = min(totalBytes, acknowledgedBytes + max(0, byteCount))
+        await emit(force: true)
+    }
+
+    private func emit(force: Bool) async {
+        let inFlight = requestBytes.values.reduce(Int64(0), +)
+        let visibleBytes = min(totalBytes, max(lastReportedBytes, acknowledgedBytes + inFlight))
+        let now = clock.now
+        let intervalElapsed = lastReportedAt.map {
+            $0.duration(to: now) >= .milliseconds(100)
+        } ?? true
+        guard visibleBytes > lastReportedBytes,
+              force || visibleBytes == totalBytes || intervalElapsed else { return }
+        lastReportedBytes = visibleBytes
+        lastReportedAt = now
+        await repository.reportTransferProgress(
+            jobID: jobID,
+            transferID: transferID,
+            bytesSent: visibleBytes
+        )
+    }
+}
+
 public typealias TransferProgressHandler = @Sendable (Int64) async -> Void
 
 public struct TransferExecutor: Sendable {
@@ -236,10 +290,22 @@ public struct TransferExecutor: Sendable {
                 throw TransferExecutionError.sourceChanged
             }
             let checksum = sha256(data)
+            let liveProgress = LiveUploadProgressReporter(
+                repository: repository,
+                transfer: transfer,
+                acknowledgedBytes: transfer.completedBytes
+            )
             remote = try await objectStore.put(
                 key: transfer.remoteKey,
                 data: data,
-                metadata: metadata.merging(["storagesync-sha256": checksum]) { _, new in new }
+                metadata: metadata.merging(["storagesync-sha256": checksum]) { _, new in new },
+                progress: { bytesSent in
+                    await liveProgress.report(
+                        requestID: 0,
+                        bytesSent: bytesSent,
+                        requestByteCount: before.size
+                    )
+                }
             )
             transfer.completedBytes = before.size
             await progress(transfer.completedBytes)
@@ -321,6 +387,11 @@ public struct TransferExecutor: Sendable {
         await progress(transfer.completedBytes)
 
         let missingParts = plannedParts.filter { completed[$0.number] == nil }
+        let liveProgress = LiveUploadProgressReporter(
+            repository: repository,
+            transfer: transfer,
+            acknowledgedBytes: transfer.completedBytes
+        )
         let maximumParallelParts = boundedPartConcurrency(for: plannedParts)
         let multipartRemoteKey = transfer.remoteKey
         let currentUploadID = uploadID
@@ -343,7 +414,14 @@ public struct TransferExecutor: Sendable {
                         key: multipartRemoteKey,
                         uploadID: currentUploadID,
                         partNumber: part.number,
-                        data: data
+                        data: data,
+                        progress: { bytesSent in
+                            await liveProgress.report(
+                                requestID: part.number,
+                                bytesSent: bytesSent,
+                                requestByteCount: part.length
+                            )
+                        }
                     )
                     try Task.checkCancellation()
                     return UploadedPartCheckpoint(part: part, uploaded: uploaded, checksum: checksum)
@@ -352,6 +430,10 @@ public struct TransferExecutor: Sendable {
 
             while let result = try await group.next() {
                 completed[result.part.number] = result.uploaded
+                await liveProgress.acknowledge(
+                    requestID: result.part.number,
+                    byteCount: result.part.length
+                )
                 var checkpoint = result.part
                 checkpoint.eTag = result.uploaded.eTag
                 checkpoint.checksum = result.checksum
@@ -378,7 +460,14 @@ public struct TransferExecutor: Sendable {
                             key: multipartRemoteKey,
                             uploadID: currentUploadID,
                             partNumber: part.number,
-                            data: data
+                            data: data,
+                            progress: { bytesSent in
+                                await liveProgress.report(
+                                    requestID: part.number,
+                                    bytesSent: bytesSent,
+                                    requestByteCount: part.length
+                                )
+                            }
                         )
                         try Task.checkCancellation()
                         return UploadedPartCheckpoint(part: part, uploaded: uploaded, checksum: checksum)

@@ -157,6 +157,25 @@ private final class ActivityBroadcaster: @unchecked Sendable {
         }
     }
 
+    func broadcastProgress(_ update: TransferProgressUpdate) {
+        lock.lock()
+        let current = connections
+        lock.unlock()
+        for (identifier, connection) in current {
+            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ [weak self] _ in
+                self?.remove(identifier)
+            }) as? StorageSyncAgentClientXPCProtocol else {
+                remove(identifier)
+                continue
+            }
+            proxy.transferProgressDidChange(
+                jobID: update.jobID.description,
+                transferID: update.transferID.description,
+                bytesSent: update.bytesSent
+            )
+        }
+    }
+
     func broadcastStateChange() {
         lock.lock()
         let current = connections
@@ -219,6 +238,10 @@ final class AgentDelegate: NSObject, NSXPCListenerDelegate {
         activityBroadcaster.broadcast(update)
     }
 
+    func broadcastProgress(_ update: TransferProgressUpdate) {
+        activityBroadcaster.broadcastProgress(update)
+    }
+
     func broadcastStateChange() {
         activityBroadcaster.broadcastStateChange()
     }
@@ -239,6 +262,13 @@ Task {
     let updates = await repository.transferActivityUpdates()
     for await update in updates {
         delegate.broadcast(update)
+    }
+}
+
+Task {
+    let updates = await repository.transferProgressUpdates()
+    for await update in updates {
+        delegate.broadcastProgress(update)
     }
 }
 

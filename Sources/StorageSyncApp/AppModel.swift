@@ -6,6 +6,11 @@ import StorageSyncShared
 import StorageSyncSystem
 import ServiceManagement
 
+private struct PendingTransferProgress {
+    var bytesSent: Int64
+    var retryCount: Int?
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var jobs: [SyncJob] = []
@@ -27,6 +32,7 @@ final class AppModel: ObservableObject {
             transferActivityNextCursor = nil
             transferActivityError = nil
             requiredActivityRevision = 0
+            pendingTransferProgress = [:]
             guard case .sync(let jobID) = selection else { return }
             selectionActivityTask = Task { [weak self] in
                 await self?.loadTransferActivity(jobID: jobID, reset: true)
@@ -76,6 +82,7 @@ final class AppModel: ObservableObject {
     private var stateRefreshTask: Task<Void, Never>?
     private var stateEventGeneration: UInt64 = 0
     private var requiredActivityRevision: Int64 = 0
+    private var pendingTransferProgress: [TransferID: PendingTransferProgress] = [:]
     /// When the agent first stopped answering, so a momentary gap is not
     /// mistaken for a broken registration.
     private var unreachableSince: Date?
@@ -85,6 +92,11 @@ final class AppModel: ObservableObject {
         client.onTransferActivityChange { [weak self] jobID, revision in
             Task { @MainActor [weak self] in
                 await self?.transferActivityDidChange(jobID: jobID, revision: revision)
+            }
+        }
+        client.onTransferProgressChange { [weak self] update in
+            Task { @MainActor [weak self] in
+                self?.transferProgressDidChange(update)
             }
         }
         client.onStateChange { [weak self] in
@@ -111,6 +123,7 @@ final class AppModel: ObservableObject {
         selectionActivityTask?.cancel()
         stateRefreshTask?.cancel()
         client.onTransferActivityChange(nil)
+        client.onTransferProgressChange(nil)
         client.onStateChange(nil)
         client.onConnectionLost(nil)
     }
@@ -252,9 +265,10 @@ final class AppModel: ObservableObject {
             transferActivityRevision = page.revision
             transferActivityCounts = page.counts
             transferActivityNextCursor = page.nextCursor
-            transferActivityItems = reset
+            let loadedItems = reset
                 ? page.items
                 : Self.mergingActivityRows(transferActivityItems, page.items)
+            transferActivityItems = applyingPendingProgress(to: loadedItems)
             transferActivityError = nil
         } catch is CancellationError {
             return
@@ -280,6 +294,67 @@ final class AppModel: ObservableObject {
         selectionActivityTask?.cancel()
         selectionActivityTask = Task { [weak self] in
             await self?.loadTransferActivity(jobID: jobID, reset: true)
+        }
+    }
+
+    private func transferProgressDidChange(_ update: TransferProgressUpdate) {
+        guard case .sync(let selectedID) = selection,
+              selectedID == update.jobID else { return }
+        let sent = max(0, update.bytesSent)
+        guard let index = transferActivityItems.firstIndex(where: { $0.id == update.transferID }) else {
+            let previous = pendingTransferProgress[update.transferID]
+            pendingTransferProgress[update.transferID] = PendingTransferProgress(
+                bytesSent: max(sent, previous?.bytesSent ?? 0),
+                retryCount: previous?.retryCount
+            )
+            return
+        }
+        guard transferActivityItems[index].status == .running,
+              transferActivityItems[index].kind == .upload else {
+            pendingTransferProgress.removeValue(forKey: update.transferID)
+            return
+        }
+
+        let retryCount = transferActivityItems[index].retryCount
+        let previous = pendingTransferProgress[update.transferID]
+        let belongsToCurrentAttempt = previous?.retryCount == nil
+            || previous?.retryCount == retryCount
+        let visibleSent = belongsToCurrentAttempt
+            ? max(sent, previous?.bytesSent ?? 0)
+            : sent
+        pendingTransferProgress[update.transferID] = PendingTransferProgress(
+            bytesSent: visibleSent,
+            retryCount: retryCount
+        )
+        var item = transferActivityItems[index]
+        item.bytesSent = min(item.totalBytes, max(item.completedBytes, visibleSent))
+        transferActivityItems[index] = item
+    }
+
+    private func applyingPendingProgress(
+        to items: [TransferActivityItem]
+    ) -> [TransferActivityItem] {
+        items.map { item in
+            guard item.status == .running,
+                  item.kind == .upload,
+                  var pending = pendingTransferProgress[item.id] else {
+                if item.status != .running {
+                    pendingTransferProgress.removeValue(forKey: item.id)
+                }
+                return item
+            }
+            guard pending.retryCount == nil || pending.retryCount == item.retryCount else {
+                // A new retry is a new network attempt. Its byte counter must
+                // never inherit bytes merely sent by the previous request.
+                pendingTransferProgress.removeValue(forKey: item.id)
+                return item
+            }
+            pending.retryCount = item.retryCount
+            pending.bytesSent = max(item.completedBytes, pending.bytesSent)
+            pendingTransferProgress[item.id] = pending
+            var updated = item
+            updated.bytesSent = min(item.totalBytes, pending.bytesSent)
+            return updated
         }
     }
 
