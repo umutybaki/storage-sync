@@ -325,6 +325,12 @@ public struct TransferRecord: Codable, Hashable, Sendable, Identifiable {
     public var retryCount: Int
     public var nextAttemptAt: Date?
     public var lastError: String?
+    /// Why the engine stopped this transfer, decided where the failure was
+    /// caught rather than re-derived downstream: `lastError` holds a system
+    /// message that macOS localizes, so any consumer matching words in it
+    /// reports the wrong cause on a non-English system. Optional so queue rows
+    /// written before this field still decode.
+    public var waitingBlocker: SyncBlocker?
     public let createdAt: Date
     public var updatedAt: Date
 
@@ -344,6 +350,7 @@ public struct TransferRecord: Codable, Hashable, Sendable, Identifiable {
         retryCount: Int = 0,
         nextAttemptAt: Date? = nil,
         lastError: String? = nil,
+        waitingBlocker: SyncBlocker? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -362,6 +369,7 @@ public struct TransferRecord: Codable, Hashable, Sendable, Identifiable {
         self.retryCount = retryCount
         self.nextAttemptAt = nextAttemptAt
         self.lastError = lastError
+        self.waitingBlocker = waitingBlocker
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -388,6 +396,10 @@ public struct TransferActivityItem: Codable, Hashable, Sendable, Identifiable {
     public var retryCount: Int
     public var nextAttemptAt: Date?
     public var lastError: String?
+    /// Carried from the queue row so a row can name what it is waiting for
+    /// without reading `lastError`, whose wording changes with the system
+    /// language. Optional so activity rows written before this field decode.
+    public var waitingBlocker: SyncBlocker?
     public let createdAt: Date
     public var updatedAt: Date
 
@@ -404,6 +416,7 @@ public struct TransferActivityItem: Codable, Hashable, Sendable, Identifiable {
         retryCount = transfer.retryCount
         nextAttemptAt = transfer.nextAttemptAt
         lastError = transfer.lastError
+        waitingBlocker = transfer.waitingBlocker
         createdAt = transfer.createdAt
         updatedAt = transfer.updatedAt
     }

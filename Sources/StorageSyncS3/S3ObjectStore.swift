@@ -4,6 +4,7 @@ import StorageSyncCore
 public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
     private let configuration: S3ClientConfiguration
     private let session: URLSession
+    private let ownsSession: Bool
     private let signer: SigV4Signer
 
     public init(configuration: S3ClientConfiguration, session: URLSession? = nil) {
@@ -11,6 +12,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         signer = SigV4Signer()
         if let session {
             self.session = session
+            ownsSession = false
         } else {
             let sessionConfiguration = URLSessionConfiguration.ephemeral
             sessionConfiguration.timeoutIntervalForRequest = configuration.timeout
@@ -22,7 +24,19 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             sessionConfiguration.httpMaximumConnectionsPerHost = 8
             sessionConfiguration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             self.session = URLSession(configuration: sessionConfiguration)
+            ownsSession = true
         }
+    }
+
+    deinit {
+        // A URLSession keeps its operation queue, threads and connection pool
+        // alive until it is invalidated, and a store — so a session — is built
+        // per sync cycle, per removal and per connection test, which over a
+        // multi-day run would accumulate them without bound. Only a session
+        // this store created may be torn down; an injected one belongs to its
+        // caller. Tasks are finished rather than cancelled because a part
+        // upload can be hours in and must not be aborted by teardown.
+        if ownsSession { session.finishTasksAndInvalidate() }
     }
 
     public func list(prefix: String, continuationToken: String?) async throws -> ObjectPage {

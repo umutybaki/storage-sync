@@ -146,6 +146,7 @@ public struct TransferExecutor: Sendable {
             try validateVolume(job: job, root: root)
             transfer.status = .running
             transfer.lastError = nil
+            transfer.waitingBlocker = nil
             transfer.updatedAt = Date()
             try await repository.saveTransfer(transfer)
 
@@ -200,14 +201,14 @@ public struct TransferExecutor: Sendable {
         } catch let error as TransferExecutionError {
             switch error {
             case .insufficientSpace:
-                await wait(&transfer, error: error)
+                await wait(&transfer, blocker: .insufficientSpace, error: error)
                 return .waiting(.insufficientSpace, error.localizedDescription)
             default:
                 await mark(&transfer, status: .failed, message: error.localizedDescription)
                 return .attention(nil, error.localizedDescription)
             }
         } catch let error as VolumeInspectorError {
-            await wait(&transfer, error: error)
+            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
             return .waiting(.localVolumeUnavailable, error.localizedDescription)
         } catch let error as ObjectStoreError {
             switch error {
@@ -223,23 +224,23 @@ public struct TransferExecutor: Sendable {
                 return .superseded(nil)
             case .checksumMismatch:
                 await discardCheckpoints(for: transfer, root: root)
-                await wait(&transfer, error: error)
+                await wait(&transfer, blocker: .networkUnavailable, error: error)
                 return .waiting(.networkUnavailable, "Downloaded data failed integrity verification and will be fetched again.")
             default:
-                await wait(&transfer, error: error)
+                await wait(&transfer, blocker: .networkUnavailable, error: error)
                 return .waiting(.networkUnavailable, error.localizedDescription)
             }
         } catch let error as CocoaError where error.code == .fileWriteOutOfSpace {
-            await wait(&transfer, error: error)
+            await wait(&transfer, blocker: .insufficientSpace, error: error)
             return .waiting(.insufficientSpace, error.localizedDescription)
         } catch let error as CocoaError {
-            await wait(&transfer, error: error)
+            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
             return .waiting(.localVolumeUnavailable, error.localizedDescription)
         } catch let error as POSIXError where error.code == .ENOSPC {
-            await wait(&transfer, error: error)
+            await wait(&transfer, blocker: .insufficientSpace, error: error)
             return .waiting(.insufficientSpace, error.localizedDescription)
         } catch let error as POSIXError {
-            await wait(&transfer, error: error)
+            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
             return .waiting(.localVolumeUnavailable, error.localizedDescription)
         } catch {
             await mark(&transfer, status: .failed, message: error.localizedDescription)
@@ -815,10 +816,14 @@ public struct TransferExecutor: Sendable {
         return min(configured, memoryBound)
     }
 
-    private func wait(_ transfer: inout TransferRecord, error: Error) async {
+    /// The blocker is recorded next to the message because it is the same
+    /// classification this call's caller returns to the coordinator, and it is
+    /// the only form of it that survives to the row a person reads.
+    private func wait(_ transfer: inout TransferRecord, blocker: SyncBlocker, error: Error) async {
         transfer.retryCount += 1
         transfer.status = .waiting
         transfer.lastError = error.localizedDescription
+        transfer.waitingBlocker = blocker
         transfer.updatedAt = Date()
         let unit = Double.random(in: 0...1)
         if let delay = retryPolicy.delay(forAttempt: transfer.retryCount - 1, randomUnit: unit) {
@@ -842,6 +847,7 @@ public struct TransferExecutor: Sendable {
     private func deferAfterCancellation(_ transfer: inout TransferRecord) async {
         transfer.status = .waiting
         transfer.lastError = nil
+        transfer.waitingBlocker = nil
         transfer.nextAttemptAt = nil
         transfer.updatedAt = Date()
         try? await repository.saveTransfer(transfer)

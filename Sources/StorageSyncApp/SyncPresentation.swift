@@ -84,7 +84,12 @@ extension SyncStatus {
                 self = SyncStatus(
                     tone: .attention,
                     title: engineMessage.isEmpty ? "Needs attention" : engineMessage,
-                    detail: "Syncing stopped before anything at the destination was changed."
+                    // Attention now covers a run that copied most of its files
+                    // and left one behind, not only a run that stopped before
+                    // it started, so this cannot claim the destination was
+                    // untouched. What is true either way is that nothing was
+                    // removed there: the app has no delete operation at all.
+                    detail: "Nothing was deleted at the destination."
                 )
             case .scanning:
                 self = SyncStatus(

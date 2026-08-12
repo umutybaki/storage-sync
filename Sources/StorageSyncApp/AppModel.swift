@@ -839,6 +839,7 @@ final class AppModel: ObservableObject {
 
     private static let agentPlistName = "app.photosync.agent.plist"
     private static let agentStampKey = "RegisteredAgentFingerprint"
+    private static let launchAtLoginRegisteredKey = "DidRegisterLaunchAtLogin"
 
     /// launchd stores the agent's program path and a code requirement taken from
     /// the bundle that registered it. Moving the app, replacing it with a new
@@ -926,12 +927,23 @@ final class AppModel: ObservableObject {
         try agent.register()
     }
 
+    /// An app the user has switched off in Login Items reports the same status
+    /// as one that has never been registered, so the status alone cannot tell a
+    /// deliberate opt-out from a first run. Registering whenever the status
+    /// allows it — on every launch, and on every agent heal — would silently
+    /// turn the user's choice back on and it could never stick. The app
+    /// therefore gets exactly one turn, recorded here, and never asks again.
     private func registerLaunchAtLogin() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.launchAtLoginRegisteredKey) else { return }
         let mainApp = SMAppService.mainApp
-        guard mainApp.status == .notRegistered || mainApp.status == .notFound else { return }
-        // Opening at login is a convenience, not a requirement: the agent is a
-        // separate login item and keeps syncing without the menu bar app.
-        try? mainApp.register()
+        if mainApp.status == .notRegistered || mainApp.status == .notFound {
+            // Opening at login is a convenience, not a requirement: the agent
+            // is a separate login item and keeps syncing without the menu bar
+            // app. So a failed attempt is not worth retrying either.
+            try? mainApp.register()
+        }
+        defaults.set(true, forKey: Self.launchAtLoginRegisteredKey)
     }
 
     private func unregisterAndWait(_ service: SMAppService) async throws {

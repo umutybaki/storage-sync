@@ -32,8 +32,3 @@ public struct TransferID: StorageSyncIdentifier {
     public let rawValue: UUID
     public init(rawValue: UUID) { self.rawValue = rawValue }
 }
-
-public struct RunID: StorageSyncIdentifier {
-    public let rawValue: UUID
-    public init(rawValue: UUID) { self.rawValue = rawValue }
-}

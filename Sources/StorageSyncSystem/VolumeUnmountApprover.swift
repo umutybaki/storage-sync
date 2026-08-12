@@ -37,6 +37,17 @@ public final class VolumeUnmountApprover: @unchecked Sendable {
     }
 
     deinit {
+        // Torn down before the queue so nothing is in flight once this unretained
+        // context dangles. toOpaque() is only this object's address, so it rebuilds the
+        // pointer registered in init, which is the identity Disk Arbitration matches on.
+        // DAUnregisterApprovalCallback is unavailable in Swift; DAUnregisterCallback
+        // covers approval callbacks too.
+        let callback: DADiskUnmountApprovalCallback = storageSyncDiskUnmountApproval
+        DAUnregisterCallback(
+            session,
+            unsafeBitCast(callback, to: UnsafeMutableRawPointer.self),
+            Unmanaged.passUnretained(self).toOpaque()
+        )
         DASessionSetDispatchQueue(session, nil)
     }
 }

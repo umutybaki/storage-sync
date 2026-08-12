@@ -23,7 +23,7 @@ LaunchAgent / SyncCoordinator
     │   ├── reconciliation baselines
     │   ├── transfer queue
     │   └── per-part checkpoints
-    ├── local scanner + FSEvents + mount notifications
+    ├── local scanner + mount notifications
     └── SigV4 S3 client + network path notifications
 ```
 
@@ -83,7 +83,7 @@ Successful transfer completion atomically stores its reconciliation baseline and
 
 Per-transfer retries use indefinite capped exponential backoff with full jitter, so a queue of failures spreads out instead of retrying in lockstep. The scan loop that wraps them backs off on the same curve but without jitter, since only one scan per job is ever in flight. The coordinator schedules the exact earliest durable retry, while network and volume events clear stale backoff and wake affected jobs immediately. Authentication, access denial, incompatible responses, and unsafe local paths require attention rather than looping.
 
-Upload jobs use FSEvents for immediate local changes plus a 30-minute safety scan. Download jobs poll S3 every five minutes. A source or destination that changes during a transfer triggers an immediate new reconciliation.
+Discovery is deliberately explicit for both directions: a job scans when the app or agent starts, when a sync resumes, and when the user clicks **Sync Now**. There are no interval scans and no filesystem-event scans, so every check has a cause the user can point at. A source or destination that changes during a transfer triggers an immediate new reconciliation.
 
 ## Distribution boundary
 
