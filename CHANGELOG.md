@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.1
+
+**Reliability and safety fixes from a full pre-release review.** No feature
+changes. Fifteen defects, several of which could stop a sync indefinitely or
+overwrite a file in the bucket.
+
+- A single file can no longer stop a whole sync. A file dated far outside the
+  normal range used to crash the background agent, which then restarted,
+  reached the same file and crashed again. An unreadable file, or one deleted
+  while a check was running, used to end the whole check and report it as a
+  disconnected drive. A file that can never be copied — too large for S3, for
+  instance — used to stop every other file with it, and **Sync Now** only ran
+  into the same file again. Each of these now affects that one file.
+- Two files whose names differ only in capitalization can no longer be sent to
+  the same place in the bucket. Previously each could overwrite the other on
+  alternating checks. Such a pair is now reported and skipped until renamed.
+- Quitting no longer discards a piece of a large file that had already been
+  accepted by S3 but not yet recorded. StorageSync now waits for in-flight work
+  to be written down before exiting.
+- Only StorageSync itself can talk to its background agent. The previous check
+  could be defeated by a short-lived process, and the app did not verify the
+  agent's identity at all.
+- Turning StorageSync off in **Login Items** now stays off. It used to switch
+  itself back on at the next launch.
+- Waiting files describe why they are waiting in every language, not only in
+  English. On a non-English system a file blocked on an unplugged drive
+  previously read as merely queued.
+- Long-running syncs no longer accumulate network connections, and file icons
+  in the transfer list are no longer re-resolved on every progress update.
+
 ## 0.4.0
 
 **Deterministic transfer activity.** Every sync now has a durable, Finder-like
