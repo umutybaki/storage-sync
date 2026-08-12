@@ -27,6 +27,12 @@ public struct ObjectStoreFactory: Sendable {
         } else {
             throw ObjectStoreError.authentication("Credentials are missing from Keychain.")
         }
+        // A store per call, rather than one shared instance, because the
+        // timeout differs per caller and is baked into the URLSession
+        // configuration it cannot be changed on afterwards — a shared session
+        // would apply one job's timeout to every other. The store invalidates
+        // the session it owns when it is released, so callers only have to let
+        // it go out of scope.
         return S3ObjectStore(
             configuration: S3ClientConfiguration(
                 endpoint: connection.endpoint,

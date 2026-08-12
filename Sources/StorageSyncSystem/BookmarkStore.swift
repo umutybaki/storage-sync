@@ -62,10 +62,15 @@ public actor BookmarkStore {
             bookmarkDataIsStale: &stale
         )
         let didStart = url.startAccessingSecurityScopedResource()
+        // Built before the refresh below so its deinit owns the release even if
+        // re-persisting throws.
+        let access = ScopedURLAccess(url: url, didStartAccess: didStart)
         if stale {
-            _ = try create(for: url, reference: reference)
+            // A bookmark that resolved is usable whether or not it can be rewritten,
+            // so a failed refresh only costs another stale resolution next time.
+            _ = try? create(for: url, reference: reference)
         }
-        return ScopedURLAccess(url: url, didStartAccess: didStart)
+        return access
     }
 
     public func remove(reference: String) throws {

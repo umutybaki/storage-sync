@@ -157,9 +157,17 @@ struct TransferActivityView: View {
 private struct TransferNameCell: View {
     let item: TransferActivityItem
 
+    /// Live progress republishes the whole item array many times a second, so
+    /// every visible row is rebuilt that often, and resolving a type identifier
+    /// and asking the workspace for its icon costs far more than drawing the
+    /// row does. The result only depends on the extension, so each distinct one
+    /// is looked up once. `View.body` is main-actor isolated, which is what
+    /// makes an unsynchronized dictionary safe here.
+    @MainActor private static var iconsByExtension: [String: NSImage] = [:]
+
     var body: some View {
         HStack(spacing: 8) {
-            Image(nsImage: NSWorkspace.shared.icon(for: contentType))
+            Image(nsImage: Self.icon(forExtension: fileExtension))
                 .resizable()
                 .scaledToFit()
                 .frame(width: 20, height: 20)
@@ -189,8 +197,19 @@ private struct TransferNameCell: View {
         let value = path.pathExtension
         return value.isEmpty ? "public.data" : value
     }
-    private var contentType: UTType {
-        UTType(filenameExtension: fileExtension) ?? .data
+
+    /// Extensions the workspace does not recognize are cached with the generic
+    /// icon they fall back to, so a folder full of unknown files does not repeat
+    /// the failed lookup on every emit.
+    @MainActor
+    private static func icon(forExtension fileExtension: String) -> NSImage {
+        // Filename extensions are matched case-insensitively, so folding the
+        // key keeps one entry per type rather than one per spelling.
+        let key = fileExtension.lowercased()
+        if let cached = iconsByExtension[key] { return cached }
+        let icon = NSWorkspace.shared.icon(for: UTType(filenameExtension: key) ?? .data)
+        iconsByExtension[key] = icon
+        return icon
     }
 }
 
@@ -291,12 +310,18 @@ extension TransferActivityItem {
         case .running:
             return kind == .upload ? "Uploading" : "Downloading"
         case .waiting:
-            if let error = lastError?.lowercased() {
-                if error.contains("network") || error.contains("internet") || error.contains("timed out") {
-                    return "Waiting for internet"
-                }
-                if error.contains("volume") || error.contains("drive") || error.contains("folder") {
-                    return "Waiting for drive"
+            // The engine's own classification, never words found in
+            // `lastError`: that text is a localized system message, so reading
+            // it names the wrong cause on a non-English system and mistakes an
+            // S3 message mentioning a folder for a disconnected drive. Rows
+            // written before the blocker was carried through have none, and
+            // fall back to the generic wording.
+            if let waitingBlocker {
+                switch waitingBlocker {
+                case .networkUnavailable: return "Waiting for internet"
+                case .localVolumeUnavailable: return "Waiting for drive"
+                case .insufficientSpace: return "Not enough space"
+                case .credentialsUnavailable: return "Sign in again"
                 }
             }
             return retryCount > 0 ? "Retrying" : (kind == .upload ? "Waiting to upload" : "Waiting to download")

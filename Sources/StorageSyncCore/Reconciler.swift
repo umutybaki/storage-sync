@@ -77,6 +77,18 @@ public struct ReconciliationResult: Sendable, Equatable {
 public struct Reconciler: Sendable {
     public init() {}
 
+    /// Reconciles whole manifests held in memory.
+    ///
+    /// Not the production path, and deliberately kept anyway. The engine
+    /// reconciles through `SyncRepository.reconciliationRows` and
+    /// `transferPlan`, which page against SQLite because the product contract
+    /// covers libraries too large to hold at once; this version needs every
+    /// file in an array and would defeat that. It stays because it is the
+    /// executable specification of the pairing rules — prefix handling,
+    /// reserved paths, unsafe keys, case folding — that the paged path has to
+    /// reproduce, and the suite tests it directly. It is not moved into the
+    /// test target because doing so would require publishing three private
+    /// helpers, widening the module's surface to shrink it.
     public func reconcile(
         direction: SyncDirection,
         prefix: String,
