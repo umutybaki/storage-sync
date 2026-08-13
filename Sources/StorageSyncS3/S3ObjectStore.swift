@@ -153,7 +153,13 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
 
     public func listParts(key: String, uploadID: String) async throws -> [UploadedPart] {
         var marker: String?
-        var allParts: [UploadedPart] = []
+        // Keyed by part number rather than accumulated flat: a provider whose
+        // paging overlaps lists the same part on two consecutive pages, and the
+        // marker guard below only catches a repeated *marker*. Callers index
+        // these by number, so a duplicate must be resolved here, deterministically
+        // and while page order is still known. The later page wins as the fresher
+        // view of that part.
+        var partsByNumber: [Int: UploadedPart] = [:]
         while true {
             var query = [
                 URLQueryItem(name: "uploadId", value: uploadID),
@@ -162,7 +168,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             if let marker { query.append(URLQueryItem(name: "part-number-marker", value: marker)) }
             let response = try await send(method: "GET", key: key, query: query)
             let page = try S3XML.parseParts(response.data)
-            allParts.append(contentsOf: page.parts)
+            for part in page.parts { partsByNumber[part.number] = part }
             guard page.isTruncated else { break }
             guard let next = page.nextPartNumberMarker ?? page.parts.last?.number,
                   String(next) != marker else {
@@ -172,7 +178,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             }
             marker = String(next)
         }
-        return allParts.sorted { $0.number < $1.number }
+        return partsByNumber.values.sorted { $0.number < $1.number }
     }
 
     public func completeMultipartUpload(
@@ -206,12 +212,39 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
     }
 
     public func getRange(key: String, range: Range<Int64>?) async throws -> Data {
-        var headers: [String: String] = [:]
-        if let range {
-            guard !range.isEmpty else { return Data() }
-            headers["Range"] = "bytes=\(range.lowerBound)-\(range.upperBound - 1)"
+        guard let range else {
+            return try await send(method: "GET", key: key).data
         }
-        return try await send(method: "GET", key: key, headers: headers).data
+        guard !range.isEmpty else { return Data() }
+        let response = try await send(
+            method: "GET",
+            key: key,
+            headers: ["Range": "bytes=\(range.lowerBound)-\(range.upperBound - 1)"]
+        )
+        // A provider that does not implement Range answers 200 with the whole
+        // object, and `validate` accepts any 2xx. Left alone that surfaces as a
+        // short read on every part of every multi-part download — one confusing
+        // byte-count failure per file — instead of naming the one thing actually
+        // wrong. Ranged reads are how a large file is fetched and resumed at all.
+        guard satisfiesRequestedRange(response.response, range: range) else {
+            throw ObjectStoreError.incompatible(
+                "The S3 provider ignored a byte-range request and returned the whole object. "
+                    + "StorageSync needs ranged reads to download and resume large files."
+            )
+        }
+        return response.data
+    }
+
+    /// RFC 9110 requires 206 for a served range. A provider that answers 200 but
+    /// still describes exactly the requested window in `Content-Range` did
+    /// honour the request, so it is accepted; one that ignored the header
+    /// describes nothing.
+    private func satisfiesRequestedRange(_ response: HTTPURLResponse, range: Range<Int64>) -> Bool {
+        if response.statusCode == 206 { return true }
+        guard let contentRange = response.value(forHTTPHeaderField: "Content-Range") else { return false }
+        return contentRange
+            .trimmingCharacters(in: .whitespaces)
+            .hasPrefix("bytes \(range.lowerBound)-\(range.upperBound - 1)/")
     }
 
     private func send(

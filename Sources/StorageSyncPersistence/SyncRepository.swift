@@ -856,39 +856,9 @@ public actor SyncRepository {
         )
     }
 
-    /// Removes every object in a case-folded collision group, returning the
-    /// number skipped. Skipping the whole group avoids choosing an arbitrary
-    /// winner on case-insensitive destination volumes.
-    public func removeCaseCollidingRemoteManifestEntries(
-        jobID: SyncJobID,
-        generation: Int64
-    ) throws -> Int {
-        let bindings: [SQLiteValue] = [.text(jobID.description), .integer(generation)]
-        var count = 0
-        try database.transaction {
-            count = try recordCaseCollisionsInsideTransaction(
-                jobID: jobID,
-                side: .remote,
-                generation: generation
-            )
-            guard count > 0 else { return }
-            try database.execute(
-                """
-                DELETE FROM manifest
-                WHERE job_id = ? AND side = 'remote' AND scan_generation = ?
-                  AND canonical_path IN (
-                    SELECT canonical_path FROM manifest_conflicts
-                    WHERE job_id = ? AND side = 'remote' AND scan_generation = ?
-                  )
-                """,
-                bindings: bindings + bindings
-            )
-        }
-        return count
-    }
-
-    /// The local half of the same rule, returning the number of local entries
-    /// that cannot be reconciled this scan.
+    /// Records the canonical path of every group that more than one entry on
+    /// this side folds to, and returns how many entries those groups hold —
+    /// the entries that cannot be reconciled this scan.
     ///
     /// `isCaseSensitive` comes from a volume probe that is allowed to answer
     /// "unknown", and an unknown answer is read as case-insensitive. On a
@@ -896,31 +866,34 @@ public actor SyncRepository {
     /// manifest rows folding to one canonical path, and both join to the one
     /// remote object under that name: each upload rewrites the object the
     /// other one just wrote, so the destination ends up holding neither file
-    /// intact. Skipping the whole group is the only answer that cannot destroy
-    /// data, exactly as on the remote side.
+    /// intact. A bucket holding `Photo.JPG` and `photo.jpg` is the same
+    /// ambiguity seen from the other end. Skipping the whole group is the only
+    /// answer that cannot destroy data.
     ///
-    /// Unlike the remote side the colliding rows stay in the manifest.
-    /// Reconciliation still has to see those paths — that is how a transfer
-    /// already queued against one of them gets discarded before it can run,
-    /// and how their baselines avoid being pruned as if the files had been
-    /// deleted.
-    public func recordCaseCollidingLocalManifestEntries(
+    /// The colliding rows stay in the manifest on both sides. Reconciliation
+    /// still has to see those paths — that is how a transfer already queued
+    /// against one of them gets discarded before it can run, and how their
+    /// baselines avoid being pruned as if the files had been deleted. The
+    /// remote side used to delete its group instead, which took the baselines
+    /// of a colliding pair with it on every download cycle: the next pairing
+    /// then found no baseline, adopted whatever was already on this Mac, and
+    /// silently never downloaded a change made while the collision existed.
+    public func recordCaseCollidingManifestEntries(
         jobID: SyncJobID,
+        side: ManifestSide,
         generation: Int64
     ) throws -> Int {
         var count = 0
         try database.transaction {
             count = try recordCaseCollisionsInsideTransaction(
                 jobID: jobID,
-                side: .local,
+                side: side,
                 generation: generation
             )
         }
         return count
     }
 
-    /// Records the canonical path of every group that more than one entry on
-    /// this side folds to, and returns how many entries those groups hold.
     private func recordCaseCollisionsInsideTransaction(
         jobID: SyncJobID,
         side: ManifestSide,

@@ -73,18 +73,29 @@ final class AgentClient: @unchecked Sendable {
             connectionWasLost()
             throw AgentClientError.unavailable
         }
-        return try await withCheckedThrowingContinuation { continuation in
-            let box = ContinuationBox(continuation)
-            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
-                box.resume(throwing: error)
-            }) as? StorageSyncAgentXPCProtocol else {
-                box.resume(throwing: AgentClientError.unavailable)
-                return
+        // XPC has no cancel. Once a command is delivered the agent runs it to
+        // completion whatever this side does, so cancelling abandons the *reply*
+        // and nothing else — which is exactly what a caller working to a
+        // deadline needs. Without this the continuation waits until the agent
+        // answers or the connection drops, and every timeout built on top of it
+        // is decorative.
+        let box = ContinuationBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data?, Error>) in
+                guard box.attach(continuation) else { return }
+                guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
+                    box.resume(throwing: error)
+                }) as? StorageSyncAgentXPCProtocol else {
+                    box.resume(throwing: AgentClientError.unavailable)
+                    return
+                }
+                proxy.perform(commandData: commandData) { data, error in
+                    if let error { box.resume(throwing: error) }
+                    else { box.resume(returning: data) }
+                }
             }
-            proxy.perform(commandData: commandData) { data, error in
-                if let error { box.resume(throwing: error) }
-                else { box.resume(returning: data) }
-            }
+        } onCancel: {
+            box.resume(throwing: CancellationError())
         }
     }
 
@@ -210,27 +221,49 @@ private final class AgentEventReceiver: NSObject, StorageSyncAgentClientXPCProto
     }
 }
 
+/// Delivers whichever comes first — the reply, a connection error, or the
+/// caller's cancellation — and drops the rest, including a reply that arrives
+/// after nobody is waiting for it any more.
 private final class ContinuationBox: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Data?, Error>?
+    private var result: Result<Data?, Error>?
 
-    init(_ continuation: CheckedContinuation<Data?, Error>) {
+    /// Handed the continuation once the request body starts. Cancellation can
+    /// be reported before that — `withTaskCancellationHandler` calls its handler
+    /// straight away when the task is already cancelled — so a result recorded
+    /// first is delivered here instead of being lost. False then says the box is
+    /// already settled and the command is not worth sending.
+    func attach(_ continuation: CheckedContinuation<Data?, Error>) -> Bool {
+        lock.lock()
+        if let result {
+            lock.unlock()
+            continuation.resume(with: result)
+            return false
+        }
         self.continuation = continuation
+        lock.unlock()
+        return true
     }
 
     func resume(returning data: Data?) {
-        take()?.resume(returning: data)
+        settle(.success(data))
     }
 
     func resume(throwing error: Error) {
-        take()?.resume(throwing: error)
+        settle(.failure(error))
     }
 
-    private func take() -> CheckedContinuation<Data?, Error>? {
+    private func settle(_ result: Result<Data?, Error>) {
         lock.lock()
-        defer { lock.unlock() }
-        let value = continuation
-        continuation = nil
-        return value
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
     }
 }

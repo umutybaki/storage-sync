@@ -60,44 +60,94 @@ private struct CycleOutcome: Sendable {
     var disposition: CycleDisposition
 }
 
-private actor TransferPermitPool {
+/// Bounds how many files move at once across every sync, not just one.
+///
+/// That sharing is why the wait below has to be cancellable: a transfer parked
+/// here can be behind work belonging to a job the user is not touching at all.
+public actor TransferPermitPool {
     private struct Waiter {
+        var id: UInt64
         var weight: Int
-        var continuation: CheckedContinuation<Void, Never>
+        var continuation: CheckedContinuation<Bool, Never>
     }
 
     private let capacity: Int
     private var available: Int
     private var waiters: [Waiter] = []
+    private var nextWaiterID: UInt64 = 0
 
-    init(limit: Int) {
+    public init(limit: Int) {
         capacity = max(1, limit)
         available = max(1, limit)
     }
 
-    func perform<T: Sendable>(weight requestedWeight: Int = 1, _ operation: @Sendable () async -> T) async -> T {
+    public func perform<T: Sendable>(
+        weight requestedWeight: Int = 1,
+        _ operation: @Sendable () async -> T
+    ) async -> T {
         let weight = min(capacity, max(1, requestedWeight))
-        await acquire(weight: weight)
+        let admitted = await acquire(weight: weight)
         let result = await operation()
-        release(weight: weight)
+        // Only a permit that was actually taken is handed back. A cancelled
+        // waiter holds nothing, and releasing on its behalf would credit the
+        // pool with capacity it never had.
+        if admitted { release(weight: weight) }
         return result
     }
 
-    private func acquire(weight: Int) async {
+    /// Waits for `weight` permits and answers whether it got them.
+    ///
+    /// A cancelled waiter stops waiting and returns `false`. Its operation
+    /// still runs, unadmitted: `TransferExecutor.execute` checks cancellation
+    /// before it opens a file or a connection, so an already-cancelled
+    /// transfer costs nothing this pool exists to bound. Holding it here costs
+    /// a great deal — `prepareForVolumeUnmount` cancels the affected job's
+    /// work and awaits it, and Disk Arbitration allows that twenty seconds
+    /// before it refuses the eject. A wait that ignored cancellation could
+    /// spend all twenty of them behind another job's 128 MiB part.
+    ///
+    /// Cancellation arriving before the continuation exists has no waiter to
+    /// find, so the body answers it directly; in the other order the handler
+    /// finds it queued. Every resume path removes the waiter from the queue
+    /// first, so no continuation can be resumed twice.
+    private func acquire(weight: Int) async -> Bool {
         if waiters.isEmpty, available >= weight {
             available -= weight
-            return
+            return true
         }
-        await withCheckedContinuation { continuation in
-            waiters.append(Waiter(weight: weight, continuation: continuation))
+        let id = nextWaiterID
+        nextWaiterID += 1
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                waiters.append(Waiter(id: id, weight: weight, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: id) }
         }
+    }
+
+    private func cancelWaiter(id: UInt64) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume(returning: false)
+        // Nothing was freed, but the queue is served strictly in order, so
+        // dropping one waiter can let those behind it fit what is already
+        // available.
+        admitEligibleWaiters()
     }
 
     private func release(weight: Int) {
         available = min(capacity, available + weight)
+        admitEligibleWaiters()
+    }
+
+    private func admitEligibleWaiters() {
         while let first = waiters.first, first.weight <= available {
             available -= first.weight
-            waiters.removeFirst().continuation.resume()
+            waiters.removeFirst().continuation.resume(returning: true)
         }
     }
 }
@@ -418,9 +468,16 @@ public actor SyncCoordinator {
         job.isPaused = true
         try await repository.saveJob(job)
         pendingWakeJobIDs.remove(jobID)
-        let task = jobTasks.removeValue(forKey: jobID)
+        // The task stays in `jobTasks` for as long as it takes to unwind.
+        // `remove` and `prepareForVolumeUnmount` set a flag that keeps
+        // `schedule` from starting anything while they wait; pausing sets
+        // none, so a Resume arriving during this await is precisely what
+        // `schedule` has to find and wait for. Whoever installed a
+        // replacement owns the entry, so it is cleared only while still ours.
+        let task = jobTasks[jobID]
         task?.cancel()
         await task?.value
+        if jobTasks[jobID] == task { jobTasks.removeValue(forKey: jobID) }
         try await repository.setSnapshot(
             SyncSnapshot(jobID: jobID, phase: .paused, message: "Paused")
         )
@@ -610,8 +667,24 @@ public actor SyncCoordinator {
     private func schedule(jobID: SyncJobID, immediate: Bool) {
         guard !removingJobIDs.contains(jobID),
               !unmountingJobIDs.contains(jobID) else { return }
-        jobTasks[jobID]?.cancel()
+        // Cancellation is cooperative, so the outgoing cycle can still be
+        // inside an upload or a listing long after it was cancelled. Two
+        // cycles for one job take independent manifest generations and then
+        // delete each other's rows in `finishManifestScan`, prune the
+        // baselines the shredded manifest no longer covers, and are handed the
+        // same queued transfers — two multipart uploads on one key, or two
+        // handles writing one `.partial`. So a replacement waits for its
+        // predecessor, exactly as `pause`, `remove` and `prepareForVolumeUnmount`
+        // already wait for theirs.
+        //
+        // The waiting happens inside the new task rather than here. `schedule`
+        // is reached straight from the XPC command paths, which must not park
+        // behind a part that is still checkpointing, and a job task never
+        // calls back into `schedule`, so nothing can wait on itself.
+        let previous = jobTasks.removeValue(forKey: jobID)
+        previous?.cancel()
         jobTasks[jobID] = Task { [weak self] in
+            await previous?.value
             if !immediate {
                 try? await Task.sleep(for: .seconds(2))
             }
@@ -1291,8 +1364,9 @@ public actor SyncCoordinator {
         // more than capitalization.
         var caseCollisionCount = 0
         if !caseSensitive {
-            caseCollisionCount = try await repository.recordCaseCollidingLocalManifestEntries(
+            caseCollisionCount = try await repository.recordCaseCollidingManifestEntries(
                 jobID: jobID,
+                side: .local,
                 generation: generation
             )
         }
@@ -1345,8 +1419,15 @@ public actor SyncCoordinator {
                     invalidRemoteKeyCount += 1
                     continue
                 }
+                // The S3 listing boundary rejects a negative size, but a transfer's
+                // total byte count is built from the manifest, so do not persist one
+                // from any other store either.
+                guard object.size >= 0 else {
+                    invalidRemoteKeyCount += 1
+                    continue
+                }
                 entryCount += 1
-                byteCount += max(0, object.size)
+                byteCount += object.size
                 batch.append(
                     RemoteManifestRecord(
                         relativePath: relativePath,
@@ -1375,10 +1456,15 @@ public actor SyncCoordinator {
             )
         }
         try await repository.finishManifestScan(jobID: jobID, side: .remote, generation: generation)
+        // The colliding objects are recorded, not dropped, for the same reason
+        // the local side keeps its own: a download prunes its baselines
+        // against this manifest, and a group missing from it reads as objects
+        // that were deleted. Reconciliation skips the group on the flag.
         var caseCollisionCount = 0
         if !caseSensitive {
-            caseCollisionCount = try await repository.removeCaseCollidingRemoteManifestEntries(
+            caseCollisionCount = try await repository.recordCaseCollidingManifestEntries(
                 jobID: jobID,
+                side: .remote,
                 generation: generation
             )
         }

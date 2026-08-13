@@ -149,6 +149,17 @@ private final class S3XMLParserDelegate: NSObject, XMLParserDelegate {
 enum S3XML {
     static func parseObjects(_ data: Data) throws -> ListObjectsXMLResult {
         let delegate = try parse(data)
+        // A negative <Size> is not a length, and it must not reach the manifest:
+        // it becomes a transfer's total byte count, which the download path then
+        // converts to unsigned offsets. Rejecting the page is deliberate —
+        // skipping the entry would hand reconciliation a listing that silently
+        // omits a real object, and clamping it to zero would let an empty file
+        // be recorded as a complete download.
+        if let invalid = delegate.objects.first(where: { $0.size < 0 }) {
+            throw ObjectStoreError.invalidResponse(
+                "The S3 service reported a negative size for object \(invalid.key)."
+            )
+        }
         return ListObjectsXMLResult(
             objects: delegate.objects,
             isTruncated: delegate.isTruncated,

@@ -32,11 +32,12 @@ final class AppModel: ObservableObject {
             transferActivityNextCursor = nil
             transferActivityError = nil
             requiredActivityRevision = 0
+            pendingActivityRevision = nil
+            activityPageWasStale = false
+            staleActivityRetries = 0
             pendingTransferProgress = [:]
             guard case .sync(let jobID) = selection else { return }
-            selectionActivityTask = Task { [weak self] in
-                await self?.loadTransferActivity(jobID: jobID, reset: true)
-            }
+            startActivityLoad(jobID: jobID, reset: true)
         }
     }
     @Published var isCreatingSync = false
@@ -65,10 +66,7 @@ final class AppModel: ObservableObject {
         didSet {
             guard transferActivityFilter != oldValue,
                   case .sync(let jobID) = selection else { return }
-            selectionActivityTask?.cancel()
-            selectionActivityTask = Task { [weak self] in
-                await self?.loadTransferActivity(jobID: jobID, reset: true)
-            }
+            startActivityLoad(jobID: jobID, reset: true)
         }
     }
 
@@ -82,6 +80,17 @@ final class AppModel: ObservableObject {
     private var stateRefreshTask: Task<Void, Never>?
     private var stateEventGeneration: UInt64 = 0
     private var requiredActivityRevision: Int64 = 0
+    /// The newest revision announced while a page request was already in
+    /// flight. XPC requests cannot be recalled, so the answer to a burst of
+    /// announcements is to remember the last one, not to send a request per
+    /// announcement.
+    private var pendingActivityRevision: Int64?
+    /// Set when the page that just arrived was older than what the agent has
+    /// already committed. The reload is started once, by
+    /// `activityLoadDidFinish`, rather than from inside the load itself.
+    private var activityPageWasStale = false
+    private var staleActivityRetries = 0
+    private var activityLoadGeneration: UInt64 = 0
     private var pendingTransferProgress: [TransferID: PendingTransferProgress] = [:]
     /// When the agent first stopped answering, so a momentary gap is not
     /// mistaken for a broken registration.
@@ -245,20 +254,14 @@ final class AppModel: ObservableObject {
                   case .sync(let selectedID) = selection,
                   selectedID == jobID else { return }
 
-            // A page from an older batch/revision can arrive after a push. It
-            // is never rendered, even briefly; ask for the committed revision
-            // the callback named instead.
-            if page.revision < requiredActivityRevision {
-                selectionActivityTask = Task { [weak self] in
-                    await self?.loadTransferActivity(jobID: jobID, reset: true)
-                }
-                return
-            }
-
-            if !reset, page.revision != transferActivityRevision {
-                selectionActivityTask = Task { [weak self] in
-                    await self?.loadTransferActivity(jobID: jobID, reset: true)
-                }
+            // A page from an older batch/revision can arrive after a push, and a
+            // continuation page can belong to a revision the list has already
+            // moved past. Neither is ever rendered, even briefly; the reload is
+            // left to `activityLoadDidFinish`, which is the only thing that
+            // starts one and is what keeps this from becoming a tight loop.
+            if page.revision < requiredActivityRevision
+                || (!reset && page.revision != transferActivityRevision) {
+                activityPageWasStale = true
                 return
             }
 
@@ -282,19 +285,69 @@ final class AppModel: ObservableObject {
         guard case .sync(let jobID) = selection,
               transferActivityNextCursor != nil,
               !isLoadingTransferActivity else { return }
-        selectionActivityTask = Task { [weak self] in
-            await self?.loadTransferActivity(jobID: jobID, reset: false)
-        }
+        startActivityLoad(jobID: jobID, reset: false)
     }
 
     private func transferActivityDidChange(jobID: SyncJobID, revision: Int64) async {
         guard case .sync(let selectedID) = selection, selectedID == jobID else { return }
         requiredActivityRevision = max(requiredActivityRevision, revision)
         guard revision > transferActivityRevision else { return }
-        selectionActivityTask?.cancel()
-        selectionActivityTask = Task { [weak self] in
-            await self?.loadTransferActivity(jobID: jobID, reset: true)
+        // During a transfer the agent announces a revision per part checkpoint
+        // and per finished file, so a request per announcement would put dozens
+        // of paged queries a second on its single SQLite connection — and
+        // cancelling the previous one does not recall the request already sent.
+        // Keep one in flight and remember the newest revision instead; the load
+        // that is running picks it up when it finishes.
+        guard selectionActivityTask == nil else {
+            pendingActivityRevision = max(pendingActivityRevision ?? 0, revision)
+            return
         }
+        startActivityLoad(jobID: jobID, reset: true)
+    }
+
+    /// The only place an activity page request is started, so at most one is
+    /// ever in flight: `selectionActivityTask` is non-nil for exactly as long as
+    /// one is running. The generation makes a superseded load's completion a
+    /// no-op rather than a race over that handle.
+    private func startActivityLoad(jobID: SyncJobID, reset: Bool, retryDelay: Duration? = nil) {
+        selectionActivityTask?.cancel()
+        activityLoadGeneration &+= 1
+        let generation = activityLoadGeneration
+        selectionActivityTask = Task { [weak self] in
+            if let retryDelay { try? await Task.sleep(for: retryDelay) }
+            if !Task.isCancelled {
+                await self?.loadTransferActivity(jobID: jobID, reset: reset)
+            }
+            await self?.activityLoadDidFinish(generation: generation, jobID: jobID)
+        }
+    }
+
+    /// Releases the one-request latch and starts the single follow-up load that
+    /// everything announced meanwhile asks for. A page that came back older than
+    /// the agent's committed revision is asked for again, but with a growing
+    /// delay, so a burst of checkpoints cannot turn into a request loop.
+    private func activityLoadDidFinish(generation: UInt64, jobID: SyncJobID) async {
+        guard generation == activityLoadGeneration else { return }
+        selectionActivityTask = nil
+        let wasStale = activityPageWasStale
+        activityPageWasStale = false
+        staleActivityRetries = wasStale ? staleActivityRetries + 1 : 0
+        let pending = pendingActivityRevision
+        pendingActivityRevision = nil
+        guard case .sync(let selectedID) = selection, selectedID == jobID else { return }
+        guard wasStale || (pending ?? 0) > transferActivityRevision else { return }
+        startActivityLoad(
+            jobID: jobID,
+            reset: true,
+            retryDelay: wasStale ? Self.activityRetryDelay(attempt: staleActivityRetries) : nil
+        )
+    }
+
+    /// 100 ms doubling to a one-second ceiling: short enough that a single stale
+    /// page still reads as an immediate update, bounded so a sustained
+    /// disagreement costs the agent one query a second instead of a spin.
+    private static func activityRetryDelay(attempt: Int) -> Duration {
+        .milliseconds(min(1_000, 100 * (1 << min(max(attempt, 1) - 1, 4))))
     }
 
     private func transferProgressDidChange(_ update: TransferProgressUpdate) {
@@ -680,6 +733,12 @@ final class AppModel: ObservableObject {
             group.addTask { try? await client.perform(.shutdown) }
             group.addTask { try? await Task.sleep(for: limit) }
             await group.next()
+            // Giving up on the reply is not giving up on the shutdown: the
+            // command is already at the agent, which finishes `stop()` and exits
+            // on its own clock. This only stops `.terminateLater` from holding a
+            // menu-bar-less app open for as long as that takes — and it works
+            // solely because `AgentClient` resumes a cancelled request rather
+            // than waiting out the round trip.
             group.cancelAll()
         }
         client.invalidate()

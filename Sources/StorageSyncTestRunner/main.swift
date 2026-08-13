@@ -93,6 +93,29 @@ private actor ByteProgressRecorder {
     func snapshot() -> [Int64] { values }
 }
 
+/// Holds the shared transfer-permit pool open for as long as a check needs it,
+/// and records which of the waiters queued behind it got to run. The hold
+/// parks on the actor's own reentrancy rather than a sleep of a fixed length,
+/// so the check never races the clock.
+private actor PermitPoolGate {
+    private var isHeld = false
+    private var isReleased = false
+    private var didRun: Set<String> = []
+
+    func holdUntilReleased() async {
+        isHeld = true
+        while !isReleased {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        isHeld = false
+    }
+
+    func isHolding() -> Bool { isHeld }
+    func release() { isReleased = true }
+    func markRan(_ name: String) { didRun.insert(name) }
+    func ran(_ name: String) -> Bool { didRun.contains(name) }
+}
+
 private final class S3URLProtocolStub: URLProtocol, @unchecked Sendable {
     typealias Handler = @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
 
@@ -151,6 +174,9 @@ private final class ReliabilitySuite {
         try await s3HTTPTransportCheck()
         try await s3ListingPaginationCheck()
         try await s3HTTPErrorClassificationCheck()
+        try await negativeObjectSizeCheck()
+        try await rangedDownloadCompatibilityCheck()
+        try await duplicateListedPartsCheck()
         try reconciliationSafetyCheck()
         try initialDestinationAdoptionCheck()
         try storageBalanceCheck()
@@ -166,6 +192,8 @@ private final class ReliabilitySuite {
         try await persistenceJobRemovalCheck()
         try await credentialStoreCheck()
         try await gracefulUnmountPreparationCheck()
+        try await transferPermitCancellationCheck()
+        try await remoteCaseCollisionBaselineCheck()
         try await processCrashRecoveryCheck()
         try await uploadProgressVisibilityCheck()
         try await multipartLostResponseCheck()
@@ -773,6 +801,269 @@ private final class ReliabilitySuite {
         }
     }
 
+    /// A negative `<Size>` in a listing is not a length, and nothing downstream
+    /// used to reject it: multipart planning returns no parts for a negative
+    /// size, the remaining-byte and capacity preflights clamp to zero, and the
+    /// download then converted the total to an unsigned offset — which traps
+    /// rather than throws, taking the agent down on every rescan of the same
+    /// object. Both ends of that path are covered here.
+    private func negativeObjectSizeCheck() async throws {
+        S3URLProtocolStub.install { request in
+            guard let url = request.url,
+                  let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: [:]
+                  ) else {
+                throw CheckFailure.failed("Could not construct the negative-size listing response")
+            }
+            return (
+                response,
+                Data(
+                    """
+                    <ListBucketResult>
+                      <IsTruncated>false</IsTruncated>
+                      <Contents><Key>album/broken.jpg</Key><LastModified>2024-05-06T07:08:09.000Z</LastModified><ETag>\"one\"</ETag><Size>-1</Size></Contents>
+                    </ListBucketResult>
+                    """.utf8
+                )
+            )
+        }
+        defer { S3URLProtocolStub.reset() }
+
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [S3URLProtocolStub.self]
+        let session = URLSession(configuration: sessionConfiguration)
+        defer { session.invalidateAndCancel() }
+        let store = S3ObjectStore(
+            configuration: S3ClientConfiguration(
+                endpoint: URL(string: "https://objects.example.test")!,
+                region: "us-test-1",
+                bucket: "test-bucket",
+                addressingStyle: .path,
+                credentials: S3Credentials(accessKeyID: "ACCESS", secretAccessKey: "SECRET")
+            ),
+            session: session
+        )
+        do {
+            _ = try await store.list(prefix: "album", continuationToken: nil)
+            throw CheckFailure.failed("A negative object size was admitted to the remote manifest")
+        } catch ObjectStoreError.invalidResponse {
+            // Expected.
+        }
+
+        // Defence in depth for a queue row written before that boundary existed,
+        // or by a store that never passed through it.
+        let fixture = try Fixture.make(direction: .download)
+        defer { fixture.cleanup() }
+        let remote = await fixture.store.seed(key: "restore/negative.mov", data: Data("payload".utf8))
+        let transfer = TransferRecord(
+            jobID: fixture.job.id,
+            relativePath: "negative.mov",
+            kind: .download,
+            totalBytes: -1,
+            remoteSource: RemoteObject(key: remote.key, size: -1, eTag: remote.eTag),
+            remoteKey: remote.key
+        )
+        try await fixture.repository.saveTransfer(transfer)
+        let result = await fixture.executor().execute(transfer, job: fixture.job, root: fixture.root)
+        guard case .attention = result else {
+            throw CheckFailure.failed("A negative transfer size was not reported as a per-file failure: \(result)")
+        }
+        let stored = try await fixture.repository.transfer(id: transfer.id)
+        try check(stored?.status == .failed, "A negative transfer size did not leave its row failed")
+        try check(
+            !FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("negative.mov").path),
+            "A transfer with a negative size still wrote a local file"
+        )
+    }
+
+    /// `validate(response:)` accepts any 2xx, so a provider that ignores the
+    /// `Range` header and answers 200 with the whole object used to reach the
+    /// executor as a byte-count mismatch: every multi-part download failed one
+    /// file at a time, permanently, with a message naming the wrong problem.
+    private func rangedDownloadCompatibilityCheck() async throws {
+        let payload = Data("0123456789".utf8)
+        S3URLProtocolStub.install { request in
+            guard let url = request.url else {
+                throw CheckFailure.failed("The ranged S3 request had no URL")
+            }
+            var status = 206
+            var headers: [String: String] = [:]
+            var body = payload
+            if url.path.hasSuffix("ignores-range.bin") {
+                // The whole object, with nothing describing a served window.
+                status = 200
+            } else {
+                body = payload.subdata(in: 2..<6)
+                headers["Content-Range"] = "bytes 2-5/10"
+                // Non-conforming, but it did serve exactly what was asked for.
+                if url.path.hasSuffix("describes-range.bin") { status = 200 }
+            }
+            guard let response = HTTPURLResponse(
+                url: url,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+            ) else {
+                throw CheckFailure.failed("Could not construct the ranged S3 response")
+            }
+            return (response, body)
+        }
+        defer { S3URLProtocolStub.reset() }
+
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [S3URLProtocolStub.self]
+        let session = URLSession(configuration: sessionConfiguration)
+        defer { session.invalidateAndCancel() }
+        let store = S3ObjectStore(
+            configuration: S3ClientConfiguration(
+                endpoint: URL(string: "https://objects.example.test")!,
+                region: "us-test-1",
+                bucket: "test-bucket",
+                addressingStyle: .path,
+                credentials: S3Credentials(accessKeyID: "ACCESS", secretAccessKey: "SECRET")
+            ),
+            session: session
+        )
+
+        do {
+            _ = try await store.getRange(key: "ignores-range.bin", range: 2..<6)
+            throw CheckFailure.failed("A provider that ignored a byte range was accepted as a ranged read")
+        } catch ObjectStoreError.incompatible {
+            // Expected.
+        }
+        let partial = try await store.getRange(key: "honours-range.bin", range: 2..<6)
+        try check(partial == payload.subdata(in: 2..<6), "A 206 partial response was not handed back to the caller")
+        let described = try await store.getRange(key: "describes-range.bin", range: 2..<6)
+        try check(
+            described == payload.subdata(in: 2..<6),
+            "A provider that described the served window in Content-Range was rejected"
+        )
+    }
+
+    /// A provider whose multipart paging overlaps lists the same part on two
+    /// consecutive pages. The resume path indexes the listing by part number,
+    /// and a unique-keys dictionary traps on the duplicate — so the resume
+    /// crashed the process, and so did every resume after it.
+    private func duplicateListedPartsCheck() async throws {
+        let fixture = try Fixture.make(direction: .upload)
+        defer { fixture.cleanup() }
+        let payload = Data("0123456789abcdefghijklmnopqrstuvwxyz".utf8)
+        let source = fixture.root.appendingPathComponent("duplicated.bin")
+        try payload.write(to: source)
+        let fingerprint = try LocalScanner().fingerprint(url: source, relativePath: "duplicated.bin")
+        let transfer = TransferRecord(
+            jobID: fixture.job.id,
+            relativePath: "duplicated.bin",
+            kind: .upload,
+            totalBytes: Int64(payload.count),
+            sourceFingerprint: fingerprint,
+            remoteKey: "backup/duplicated.bin"
+        )
+        try await fixture.repository.saveTransfer(transfer)
+        let executor = TransferExecutor(
+            repository: fixture.repository,
+            objectStore: DuplicateListingObjectStore(base: fixture.store),
+            transferPolicy: TransferPolicy(
+                multipartThreshold: 1,
+                preferredPartSize: 8,
+                maximumPartCount: 10_000,
+                maximumPartSize: 1_024,
+                maximumConcurrentFiles: 1,
+                maximumConcurrentPartsPerFile: 1
+            ),
+            retryPolicy: RetryPolicy(baseDelay: .zero, maximumDelay: .zero, maximumAttempts: 5)
+        )
+        await fixture.store.failOnceAfterAcceptingPart(2)
+        let first = await executor.execute(transfer, job: fixture.job, root: fixture.root)
+        guard case .waiting(.networkUnavailable, _) = first else {
+            throw CheckFailure.failed("The interrupted multipart upload did not enter network waiting state: \(first)")
+        }
+        guard let checkpoint = try await fixture.repository.transfer(id: transfer.id) else {
+            throw CheckFailure.failed("The multipart checkpoint was not saved")
+        }
+        await fixture.store.disableFailures()
+        // The stale copy of each listed part is offered first, so completing at
+        // all proves the later entry is the one the resume adopted: the wrapper
+        // rejects a completion carrying a stale ETag.
+        let second = await executor.execute(checkpoint, job: fixture.job, root: fixture.root)
+        guard case .completed = second else {
+            throw CheckFailure.failed("A provider that listed a part twice broke the resume: \(second)")
+        }
+        let uploaded = await fixture.store.data(for: "backup/duplicated.bin")
+        try check(uploaded == payload, "The resumed upload data did not match its source")
+        let partTwoUploads = await fixture.store.uploadCount(partNumber: 2)
+        try check(partTwoUploads == 1, "A part the provider listed twice was uploaded again")
+    }
+
+    /// Repeats every already-uploaded part in `listParts`, the shape a provider
+    /// produces when its paging overlaps. The stale copy is listed first and
+    /// carries a marked ETag, so completing with it is refused.
+    private actor DuplicateListingObjectStore: ObjectStore {
+        private static let stalePrefix = "stale-"
+
+        private let base: FaultInjectingObjectStore
+
+        init(base: FaultInjectingObjectStore) {
+            self.base = base
+        }
+
+        func list(prefix: String, continuationToken: String?) async throws -> ObjectPage {
+            try await base.list(prefix: prefix, continuationToken: continuationToken)
+        }
+
+        func head(key: String) async throws -> RemoteObject? {
+            try await base.head(key: key)
+        }
+
+        func put(key: String, data: Data, metadata: [String: String]) async throws -> RemoteObject {
+            try await base.put(key: key, data: data, metadata: metadata)
+        }
+
+        func createMultipartUpload(key: String, metadata: [String: String]) async throws -> String {
+            try await base.createMultipartUpload(key: key, metadata: metadata)
+        }
+
+        func uploadPart(key: String, uploadID: String, partNumber: Int, data: Data) async throws -> UploadedPart {
+            try await base.uploadPart(key: key, uploadID: uploadID, partNumber: partNumber, data: data)
+        }
+
+        func listParts(key: String, uploadID: String) async throws -> [UploadedPart] {
+            try await base.listParts(key: key, uploadID: uploadID).flatMap { part in
+                [
+                    UploadedPart(
+                        number: part.number,
+                        eTag: Self.stalePrefix + part.eTag,
+                        size: part.size,
+                        checksum: part.checksum
+                    ),
+                    part
+                ]
+            }
+        }
+
+        func completeMultipartUpload(
+            key: String,
+            uploadID: String,
+            parts: [UploadedPart]
+        ) async throws -> RemoteObject {
+            guard parts.allSatisfy({ !$0.eTag.hasPrefix(Self.stalePrefix) }) else {
+                throw ObjectStoreError.invalidResponse("A stale duplicate part ETag was sent to CompleteMultipartUpload")
+            }
+            return try await base.completeMultipartUpload(key: key, uploadID: uploadID, parts: parts)
+        }
+
+        func abortMultipartUpload(key: String, uploadID: String) async throws {
+            try await base.abortMultipartUpload(key: key, uploadID: uploadID)
+        }
+
+        func getRange(key: String, range: Range<Int64>?) async throws -> Data {
+            try await base.getRange(key: key, range: range)
+        }
+    }
+
     private func reconciliationSafetyCheck() throws {
         let local = FileFingerprint(relativePath: "new.jpg", size: 10, modificationTimeNanoseconds: 2)
         let result = Reconciler().reconcile(
@@ -1143,11 +1434,12 @@ private final class ReliabilitySuite {
             jobID: jobID,
             generation: remoteGeneration
         )
-        let removed = try await repository.removeCaseCollidingRemoteManifestEntries(
+        let removed = try await repository.recordCaseCollidingManifestEntries(
             jobID: jobID,
+            side: .remote,
             generation: remoteGeneration
         )
-        try check(removed == 2, "A case collision split across manifest batches was not removed as a complete group")
+        try check(removed == 2, "A case collision split across manifest batches was not recorded as a complete group")
         try await repository.upsertLocalManifestEntries(
             [FileFingerprint(relativePath: "Photo.JPG", size: 1, modificationTimeNanoseconds: 1)],
             jobID: jobID,
@@ -1328,16 +1620,18 @@ private final class ReliabilitySuite {
         )
         try check(queuedBeforeDetection, "The case-collision fixture could not queue its poisoned transfer")
 
-        let remoteCollisions = try await repository.removeCaseCollidingRemoteManifestEntries(
+        let remoteCollisions = try await repository.recordCaseCollidingManifestEntries(
             jobID: jobID,
+            side: .remote,
             generation: remoteGeneration
         )
         try check(
             remoteCollisions == 0,
             "The fixture's bucket was ambiguous, so a remote-side collision could account for the flags below"
         )
-        let localCollisions = try await repository.recordCaseCollidingLocalManifestEntries(
+        let localCollisions = try await repository.recordCaseCollidingManifestEntries(
             jobID: jobID,
+            side: .local,
             generation: localGeneration
         )
         try check(
@@ -1557,14 +1851,16 @@ private final class ReliabilitySuite {
         )
         try await repository.finishManifestScan(jobID: jobID, side: .local, generation: generation)
         try await repository.finishManifestScan(jobID: jobID, side: .remote, generation: generation)
-        let localCollisions = try await repository.recordCaseCollidingLocalManifestEntries(
+        let localCollisions = try await repository.recordCaseCollidingManifestEntries(
             jobID: jobID,
+            side: .local,
             generation: generation
         )
         // Recorded after the local side deliberately: a cleanup that forgot to
         // name the side would take the local rows out again here.
-        let remoteCollisions = try await repository.removeCaseCollidingRemoteManifestEntries(
+        let remoteCollisions = try await repository.recordCaseCollidingManifestEntries(
             jobID: jobID,
+            side: .remote,
             generation: generation
         )
         try check(
@@ -1581,9 +1877,13 @@ private final class ReliabilitySuite {
             after: nil,
             limit: 100
         )
+        // Both sides keep their colliding rows, so one ambiguous name pairs
+        // with every object it folds onto and can appear more than once. What
+        // matters is that neither path is missing and that every appearance
+        // carries both flags.
         let collidingRows = rows.filter { collidingPaths.contains($0.relativePath) }
         try check(
-            collidingRows.count == collidingPaths.count
+            Set(collidingRows.map(\.relativePath)) == Set(collidingPaths)
                 && collidingRows.allSatisfy { $0.hasLocalPathCollision && $0.hasRemotePathCollision },
             "One canonical path could not hold a local and a remote collision at once, which is what the old primary key merged"
         )
@@ -1612,7 +1912,7 @@ private final class ReliabilitySuite {
         )
         let collidingRowsAfterRelaunch = rowsAfterRelaunch.filter { collidingPaths.contains($0.relativePath) }
         try check(
-            collidingRowsAfterRelaunch.count == collidingPaths.count
+            Set(collidingRowsAfterRelaunch.map(\.relativePath)) == Set(collidingPaths)
                 && collidingRowsAfterRelaunch.allSatisfy { $0.hasLocalPathCollision && $0.hasRemotePathCollision },
             "Launching again dropped a conflict table that was already the current shape"
         )
@@ -2403,6 +2703,241 @@ private final class ReliabilitySuite {
             "Graceful unmount preparation disturbed a job on another volume"
         )
         await coordinator.stop()
+    }
+
+    /// The other half of that promise. `prepareForVolumeUnmount` cancels the
+    /// affected job's transfers and waits for them, and the permit pool those
+    /// transfers queue on is one instance shared by every sync — so a
+    /// cancelled transfer can be waiting on a slot held by a job nobody is
+    /// ejecting. Disk Arbitration allows the approval callback twenty seconds;
+    /// a wait that ignored cancellation could spend all of them behind another
+    /// job's 128 MiB part and have the eject refused over work StorageSync had
+    /// already finished checkpointing.
+    private func transferPermitCancellationCheck() async throws {
+        let pool = TransferPermitPool(limit: 2)
+        let gate = PermitPoolGate()
+
+        let holder = Task { await pool.perform(weight: 2) { await gate.holdUntilReleased() } }
+        var held = false
+        for _ in 0..<1_000 {
+            if await gate.isHolding() { held = true; break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        try check(held, "The permit-pool fixture never took the whole pool")
+
+        // Two waiters behind it: one cancelled while it waits, and one that
+        // has to still be admitted once the pool frees up.
+        let cancelled = Task { await pool.perform(weight: 2) { await gate.markRan("cancelled") } }
+        let queued = Task { await pool.perform(weight: 1) { await gate.markRan("queued") } }
+        try await Task.sleep(for: .milliseconds(50))
+        let cancelledRanEarly = await gate.ran("cancelled")
+        let queuedRanEarly = await gate.ran("queued")
+        try check(
+            !cancelledRanEarly && !queuedRanEarly,
+            "The permit pool admitted work past its capacity"
+        )
+
+        cancelled.cancel()
+        var unblocked = false
+        for _ in 0..<600 {
+            if await gate.ran("cancelled") { unblocked = true; break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try check(
+            unblocked,
+            "A cancelled transfer stayed parked on a permit another job holds, which is how an unmount misses Disk Arbitration's deadline"
+        )
+        let stillHolding = await gate.isHolding()
+        try check(
+            stillHolding,
+            "The permit-pool fixture let its holder go before the cancelled waiter unblocked, so nothing was proven"
+        )
+
+        await gate.release()
+        _ = await holder.value
+        var admitted = false
+        for _ in 0..<600 {
+            if await gate.ran("queued") { admitted = true; break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try check(admitted, "Cancelling one waiter stranded the transfer queued behind it")
+        _ = await cancelled.value
+        _ = await queued.value
+
+        // A cancelled waiter never took a permit, so it has none to give back.
+        // The pool has to come back to exactly its full capacity: one permit
+        // too few parks the next large part forever, one too many is the
+        // concurrency bound quietly gone.
+        let refill = Task { await pool.perform(weight: 2) { await gate.markRan("refill") } }
+        var refilled = false
+        for _ in 0..<600 {
+            if await gate.ran("refill") { refilled = true; break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try check(
+            refilled,
+            "A cancelled waiter leaked a permit and the pool never returned to its full capacity"
+        )
+        _ = await refill.value
+    }
+
+    /// A bucket holding `Trip/Photo.JPG` and `Trip/photo.jpg`, restored onto a
+    /// volume that folds case. Which of them one local name would hold is
+    /// unknowable, so the group is skipped — but a download job prunes its
+    /// baselines against the remote manifest, and while the colliding objects
+    /// were deleted from it the prune read them as objects that had been
+    /// removed and took their baselines with them, every single cycle. The
+    /// next pairing then found no baseline with both sides present, adopted
+    /// whatever was already on this Mac as current, and silently never
+    /// downloaded the object again however much it had changed meanwhile.
+    private func remoteCaseCollisionBaselineCheck() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try SyncRepository(
+            databaseURL: directory.appendingPathComponent("remote-collision.sqlite")
+        )
+        let jobID = SyncJobID()
+        let prefix = "restore"
+        let colliding = ["Trip/Photo.JPG", "Trip/photo.jpg"]
+        let uncontested = "Trip/Sunset.jpg"
+
+        let localGeneration = try await repository.nextManifestGeneration(jobID: jobID, side: .local)
+        let remoteGeneration = try await repository.nextManifestGeneration(jobID: jobID, side: .remote)
+        try await repository.upsertRemoteManifestEntries(
+            (colliding + [uncontested]).map { path in
+                RemoteManifestRecord(
+                    relativePath: path,
+                    canonicalPath: Reconciler.canonicalLocalPath(path),
+                    object: RemoteObject(key: prefix + "/" + path, size: 20, eTag: "etag-" + path)
+                )
+            },
+            jobID: jobID,
+            generation: remoteGeneration
+        )
+        // One local file is all a case-folding volume can hold for the pair.
+        let restored = FileFingerprint(
+            relativePath: "Trip/photo.jpg",
+            size: 20,
+            modificationTimeNanoseconds: 1
+        )
+        try await repository.upsertLocalManifestEntries(
+            [
+                restored,
+                FileFingerprint(relativePath: uncontested, size: 20, modificationTimeNanoseconds: 2)
+            ],
+            jobID: jobID,
+            generation: localGeneration,
+            caseSensitive: false
+        )
+        try await repository.finishManifestScan(jobID: jobID, side: .local, generation: localGeneration)
+        try await repository.finishManifestScan(jobID: jobID, side: .remote, generation: remoteGeneration)
+
+        for path in colliding {
+            try await repository.saveBaseline(
+                ReconciliationBaseline(
+                    relativePath: path,
+                    localFingerprint: restored,
+                    remoteETag: "etag-" + path,
+                    remoteChecksum: nil,
+                    remoteSize: 20
+                ),
+                jobID: jobID
+            )
+        }
+        // What an earlier cycle queued, before the second object turned this
+        // name into an ambiguous one.
+        let queuedBeforeDetection = try await repository.enqueueTransferIfNeeded(
+            TransferPlan(
+                relativePath: colliding[0],
+                remoteKey: prefix + "/" + colliding[0],
+                kind: .download,
+                totalBytes: 20,
+                localFingerprint: nil,
+                remoteObject: RemoteObject(
+                    key: prefix + "/" + colliding[0],
+                    size: 20,
+                    eTag: "etag-" + colliding[0]
+                )
+            ),
+            jobID: jobID
+        )
+        try check(
+            queuedBeforeDetection,
+            "The remote case-collision fixture could not queue its ambiguous download"
+        )
+
+        let remoteCollisions = try await repository.recordCaseCollidingManifestEntries(
+            jobID: jobID,
+            side: .remote,
+            generation: remoteGeneration
+        )
+        try check(
+            remoteCollisions == 2,
+            "Two objects folding to one local name were not both recorded as colliding"
+        )
+
+        // The download job's prune, run exactly as the cycle runs it.
+        try await repository.pruneBaselinesAbsentFromManifest(
+            jobID: jobID,
+            side: .remote,
+            generation: remoteGeneration
+        )
+        let survivingBaselines = Set(try await repository.baselines(jobID: jobID).map(\.relativePath))
+        try check(
+            survivingBaselines == Set(colliding),
+            "A case collision in the bucket destroyed the baselines its own pair still needs: \(survivingBaselines.sorted())"
+        )
+
+        let downloadRows = try await repository.reconciliationRows(
+            jobID: jobID,
+            direction: .download,
+            localGeneration: localGeneration,
+            remoteGeneration: remoteGeneration,
+            localCaseSensitive: false,
+            after: nil,
+            limit: 100
+        )
+        let ambiguous = downloadRows.filter { colliding.contains($0.relativePath) }
+        try check(
+            Set(ambiguous.map(\.relativePath)) == Set(colliding)
+                && ambiguous.allSatisfy(\.hasRemotePathCollision),
+            "Case-colliding objects left the manifest, so nothing is left to discard a download already queued against one of them"
+        )
+
+        // The coordinator's rule over those rows: skip the group, and take
+        // back whatever was queued against it.
+        let reconciler = Reconciler()
+        var plans: [TransferPlan] = []
+        var obsoletePaths: [String] = []
+        for row in downloadRows {
+            if row.hasLocalPathCollision || row.hasRemotePathCollision {
+                obsoletePaths.append(row.relativePath)
+                continue
+            }
+            if let plan = reconciler.transferPlan(
+                direction: .download,
+                prefix: prefix,
+                relativePath: row.relativePath,
+                local: row.local,
+                remote: row.remote,
+                baseline: row.baseline
+            ) {
+                plans.append(plan)
+            }
+        }
+        try check(
+            plans.allSatisfy { !colliding.contains($0.relativePath) },
+            "A restore was planned from a bucket name another object folds onto: \(plans.map(\.relativePath))"
+        )
+        try await repository.discardTransfers(jobID: jobID, relativePaths: obsoletePaths)
+        let queueAfterDetection = try await repository.transfers(
+            jobID: jobID,
+            relativePaths: colliding
+        )
+        try check(
+            queueAfterDetection.isEmpty,
+            "A download queued against a case-colliding object outlived the cycle that found the collision"
+        )
     }
 
     private func processCrashRecoveryCheck() async throws {

@@ -23,6 +23,7 @@ public enum TransferExecutionError: Error, LocalizedError {
     case destinationChanged
     case shortRead(expected: Int64, actual: Int)
     case unexpectedObjectSize(expected: Int64, actual: Int64)
+    case invalidRemoteSize(Int64)
     case insufficientSpace(required: Int64, available: Int64)
     case fileTooLarge(size: Int64, maximum: Int64)
     case invalidTransfer
@@ -35,6 +36,7 @@ public enum TransferExecutionError: Error, LocalizedError {
         case .destinationChanged: "The local destination changed while it was being downloaded."
         case .shortRead(let expected, let actual): "Expected \(expected) bytes but read \(actual)."
         case .unexpectedObjectSize(let expected, let actual): "Expected a \(expected)-byte object but S3 reported \(actual) bytes."
+        case .invalidRemoteSize(let size): "The S3 provider reported an invalid object size of \(size) bytes."
         case .insufficientSpace(let required, let available): "The destination needs \(required) free bytes but only \(available) are available."
         case .fileTooLarge(let size, let maximum): "The destination filesystem supports files up to \(maximum) bytes, but this file is \(size) bytes."
         case .invalidTransfer: "The saved transfer record is incomplete."
@@ -367,11 +369,18 @@ public struct TransferExecutor: Sendable {
             serverParts = []
         }
         let plannedByNumber = Dictionary(uniqueKeysWithValues: plannedParts.map { ($0.number, $0) })
-        var completed: [Int: UploadedPart] = Dictionary(uniqueKeysWithValues: serverParts.compactMap { serverPart -> (Int, UploadedPart)? in
-            guard let planned = plannedByNumber[serverPart.number],
-                  serverPart.size == nil || serverPart.size == planned.length else { return nil }
-            return (serverPart.number, serverPart)
-        })
+        // `serverParts` is whatever the provider listed, so it may repeat a part
+        // number; a unique-keys initializer would trap on that and take the
+        // process down on every later resume. The last entry wins, matching the
+        // order the S3 store accumulates overlapping listing pages in.
+        var completed: [Int: UploadedPart] = Dictionary(
+            serverParts.compactMap { serverPart -> (Int, UploadedPart)? in
+                guard let planned = plannedByNumber[serverPart.number],
+                      serverPart.size == nil || serverPart.size == planned.length else { return nil }
+                return (serverPart.number, serverPart)
+            },
+            uniquingKeysWith: { _, latest in latest }
+        )
         transfer.completedBytes = 0
         for part in plannedParts {
             if let serverPart = completed[part.number] {
@@ -529,6 +538,14 @@ public struct TransferExecutor: Sendable {
         progress: @escaping TransferProgressHandler
     ) async throws -> ReconciliationBaseline {
         guard let plannedRemote = transfer.remoteSource else { throw TransferExecutionError.invalidTransfer }
+        // A provider that reports a negative object size is rejected at the
+        // listing boundary, so reaching here means a queue row written before
+        // that check or a store that never went through it. Fail this one file
+        // rather than plan parts, preflight space, and truncate against a byte
+        // count that has no unsigned equivalent.
+        guard transfer.totalBytes >= 0 else {
+            throw TransferExecutionError.invalidRemoteSize(transfer.totalBytes)
+        }
         guard let currentRemote = try await objectStore.head(key: transfer.remoteKey) else {
             throw ObjectStoreError.notFound
         }
@@ -674,7 +691,10 @@ public struct TransferExecutor: Sendable {
                 }
             }
         }
-        try handle.truncate(atOffset: UInt64(transfer.totalBytes))
+        // Clamped rather than converted directly: the guard above already
+        // excludes a negative total, and this conversion traps rather than
+        // throws if it ever stops doing so.
+        try handle.truncate(atOffset: UInt64(max(0, transfer.totalBytes)))
         try handle.synchronize()
         try handle.close()
 
