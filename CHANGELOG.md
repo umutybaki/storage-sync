@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.2
+
+**A second pre-release review, of the whole tree.** No feature changes. Eight
+defects: two that crashed the background agent repeatedly, one that could
+silently skip a change made in the bucket, and five that left the app or a
+drive waiting.
+
+- A storage provider that reports a nonsensical file size, or that lists the
+  same piece of an interrupted upload twice, can no longer crash the
+  background agent. Either used to take the agent down, after which it
+  restarted, reached the same object and crashed again.
+- Pressing **Resume** while a sync was still stopping could start a second
+  check for the same sync. Two checks at once could erase each other's record
+  of what is on the drive, copy one file twice, and leave an unfinished upload
+  behind in the bucket.
+- On download syncs, two bucket objects whose names differ only in
+  capitalization no longer cause a later change to be skipped without notice.
+  Such a pair is still reported and skipped until one is renamed, but it no
+  longer discards what StorageSync knew about that file.
+- Ejecting an external drive is no longer refused because a *different* sync
+  was in the middle of a large transfer. StorageSync now steps out of the way
+  as soon as the eject is requested, still finishing the checkpoint it owes.
+- **Quit** no longer leaves the app running without a menu bar icon while it
+  waits for the background agent. The agent still finishes writing down
+  in-flight work before it exits.
+- Selecting a sync that is transferring many small files no longer piles up
+  requests to the background agent faster than they can be answered.
+- A storage provider that cannot serve partial downloads is now named as
+  incompatible, instead of failing each large file in turn with a message
+  about byte counts.
+
 ## 0.4.1
 
 **Reliability and safety fixes from a full pre-release review.** No feature
