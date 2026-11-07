@@ -29,7 +29,8 @@ public struct ReconciliationBaseline: Codable, Hashable, Sendable {
         if let remoteChecksum, let checksum = object.checksum {
             return remoteChecksum == checksum
         }
-        if let remoteETag, let eTag = object.eTag {
+        if let remoteETag = RemoteObject.comparableETag(remoteETag),
+           let eTag = RemoteObject.comparableETag(object.eTag) {
             return remoteETag == eTag
         }
         if let remoteLastModified, let lastModified = object.lastModified {
@@ -220,13 +221,20 @@ public struct Reconciler: Sendable {
     /// installed. On the first pairing of a relative path, preserve the
     /// existing destination and record both observed versions as the baseline.
     /// Later source changes are still detected against this baseline.
+    ///
+    /// Only a destination of the same size is adopted. Adoption means "this is
+    /// already a copy of the source", and a different size proves it is not:
+    /// another camera's `IMG_0001.JPG`, an object a different tool left
+    /// truncated, or a file edited while its folder was outside the sync. Taking
+    /// any of those as the copy reported the source as backed up when it never
+    /// was. See `isConflictingExistingDestination` for what happens instead.
     public func initialAdoptionBaseline(
         relativePath: String,
         local: FileFingerprint?,
         remote: RemoteObject?,
         existingBaseline: ReconciliationBaseline?
     ) -> ReconciliationBaseline? {
-        guard existingBaseline == nil, let local, let remote else { return nil }
+        guard existingBaseline == nil, let local, let remote, local.size == remote.size else { return nil }
         return ReconciliationBaseline(
             relativePath: relativePath,
             localFingerprint: local,
@@ -235,6 +243,23 @@ public struct Reconciler: Sendable {
             remoteSize: remote.size,
             remoteLastModified: remote.lastModified
         )
+    }
+
+    /// A first pairing whose two sides are visibly different files.
+    ///
+    /// Neither answer that moves bytes is safe here. Copying would overwrite a
+    /// destination StorageSync has never seen a copy of — on a bucket without
+    /// versioning, or a Mac without a backup, that file is then gone — and
+    /// adopting would claim a copy that does not exist. The path is left alone
+    /// on both sides and reported, and it is reconsidered every scan, so it
+    /// resolves itself the moment either side is renamed, removed, or replaced.
+    public func isConflictingExistingDestination(
+        local: FileFingerprint?,
+        remote: RemoteObject?,
+        baseline: ReconciliationBaseline?
+    ) -> Bool {
+        guard baseline == nil, let local, let remote else { return false }
+        return local.size != remote.size
     }
 
     public static func isSafeRelativePath(_ path: String) -> Bool {

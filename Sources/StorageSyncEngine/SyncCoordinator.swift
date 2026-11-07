@@ -46,6 +46,10 @@ private struct ManifestScanResult: Sendable {
     /// Summed while scanning. The manifest keeps each entry as an encoded
     /// payload, so there is no column for SQLite to total afterwards.
     var byteCount: Int64
+    /// Entries the scan could not read and stepped over. Nonzero means the
+    /// manifest is not a complete picture of this side, so absence from it
+    /// proves nothing about deletion.
+    var skippedEntryCount: Int = 0
 }
 
 private enum CycleDisposition: Sendable {
@@ -58,6 +62,10 @@ private enum CycleDisposition: Sendable {
 private struct CycleOutcome: Sendable {
     var direction: SyncDirection
     var disposition: CycleDisposition
+    /// Transfers this cycle abandoned because their source or destination
+    /// changed underneath them. Each one asks for a rescan, and a file that
+    /// never stops changing asks for one every cycle.
+    var supersededTransferCount: Int = 0
 }
 
 /// Bounds how many files move at once across every sync, not just one.
@@ -165,6 +173,10 @@ public actor SyncCoordinator {
     private var jobTasks: [SyncJobID: Task<Void, Never>] = [:]
     private var activeJobIDs: Set<SyncJobID> = []
     private var pendingWakeJobIDs: Set<SyncJobID> = []
+    /// The subset of pending wakes that came from outside the cycle — Sync Now,
+    /// a volume or network event, new keys — rather than from a transfer the
+    /// cycle itself superseded. Only the cycle's own requests are slowed down.
+    private var externalWakeJobIDs: Set<SyncJobID> = []
     private var attentionJobIDs: Set<SyncJobID> = []
     private var removingJobIDs: Set<SyncJobID> = []
     private var unmountingJobIDs: Set<SyncJobID> = []
@@ -467,7 +479,7 @@ public actor SyncCoordinator {
         guard var job = try await repository.job(id: jobID) else { return }
         job.isPaused = true
         try await repository.saveJob(job)
-        pendingWakeJobIDs.remove(jobID)
+        clearPendingWake(jobID)
         // The task stays in `jobTasks` for as long as it takes to unwind.
         // `remove` and `prepareForVolumeUnmount` set a flag that keeps
         // `schedule` from starting anything while they wait; pausing sets
@@ -488,7 +500,7 @@ public actor SyncCoordinator {
         job.isPaused = false
         try await repository.saveJob(job)
         try await repository.makeWaitingTransfersRunnable(jobID: jobID)
-        pendingWakeJobIDs.remove(jobID)
+        clearPendingWake(jobID)
         attentionJobIDs.remove(jobID)
         schedule(jobID: jobID, immediate: true)
     }
@@ -502,7 +514,7 @@ public actor SyncCoordinator {
               !removingJobIDs.contains(jobID) else { return }
 
         removingJobIDs.insert(jobID)
-        pendingWakeJobIDs.remove(jobID)
+        clearPendingWake(jobID)
         attentionJobIDs.remove(jobID)
 
         let jobTask = jobTasks.removeValue(forKey: jobID)
@@ -603,7 +615,7 @@ public actor SyncCoordinator {
         unmountingJobIDs.formUnion(affectedJobs.map(\.id))
         var runningTasks: [Task<Void, Never>] = []
         for job in affectedJobs {
-            pendingWakeJobIDs.remove(job.id)
+            clearPendingWake(job.id)
             if let task = jobTasks.removeValue(forKey: job.id) {
                 task.cancel()
                 runningTasks.append(task)
@@ -645,6 +657,7 @@ public actor SyncCoordinator {
               !unmountingJobIDs.contains(jobID) else { return }
         guard allowAttention || !attentionJobIDs.contains(jobID) else { return }
         if activeJobIDs.contains(jobID) {
+            externalWakeJobIDs.insert(jobID)
             let isNewRequest = pendingWakeJobIDs.insert(jobID).inserted
             if isNewRequest, var snapshot = try? await repository.snapshot(jobID: jobID) {
                 snapshot.isRescanPending = true
@@ -689,12 +702,40 @@ public actor SyncCoordinator {
                 try? await Task.sleep(for: .seconds(2))
             }
             var transientFailureAttempt = 0
+            var changeRescanAttempt = 0
             while !Task.isCancelled {
                 guard let self else { return }
                 let outcome = await self.runCycle(jobID: jobID)
                 guard !Task.isCancelled else { return }
-                if await self.consumePendingWake(jobID: jobID) {
+                if outcome.supersededTransferCount == 0 { changeRescanAttempt = 0 }
+                if let wake = await self.consumePendingWake(jobID: jobID) {
                     transientFailureAttempt = 0
+                    // A rescan the cycle asked for itself, because something it
+                    // was copying changed, used to start at once every time. A
+                    // file that never stops changing — a Lightroom catalog in
+                    // use, a video still being copied in, an object whose
+                    // listed and fetched versions never agree — then drove
+                    // full bucket listings and drive walks back to back for as
+                    // long as it lasted. The first such rescan is still
+                    // immediate; consecutive ones back off. Anything from
+                    // outside — Sync Now, a drive or network event — replaces
+                    // this task and so is never made to wait.
+                    if !wake.isExternal, outcome.supersededTransferCount > 0 {
+                        if changeRescanAttempt > 0 {
+                            let delay = await self.scanRetryDelay(forAttempt: changeRescanAttempt - 1)
+                            if delay >= .seconds(10) {
+                                await self.noteDelayedChangeRescan(jobID: jobID)
+                            }
+                            do {
+                                try await Task.sleep(for: delay)
+                            } catch {
+                                return
+                            }
+                        }
+                        changeRescanAttempt += 1
+                    } else {
+                        changeRescanAttempt = 0
+                    }
                     continue
                 }
                 switch outcome.disposition {
@@ -746,8 +787,34 @@ public actor SyncCoordinator {
         scanRetryPolicy.delay(forAttempt: attempt, randomUnit: 1) ?? .seconds(5 * 60)
     }
 
-    private func consumePendingWake(jobID: SyncJobID) -> Bool {
-        pendingWakeJobIDs.remove(jobID) != nil
+    private struct PendingWake {
+        var isExternal: Bool
+    }
+
+    private func consumePendingWake(jobID: SyncJobID) -> PendingWake? {
+        let isExternal = externalWakeJobIDs.remove(jobID) != nil
+        guard pendingWakeJobIDs.remove(jobID) != nil else { return nil }
+        return PendingWake(isExternal: isExternal)
+    }
+
+    private func clearPendingWake(_ jobID: SyncJobID) {
+        pendingWakeJobIDs.remove(jobID)
+        externalWakeJobIDs.remove(jobID)
+    }
+
+    /// Only for a wait long enough to notice. The cycle left the snapshot
+    /// reading "Checking for changes…" with a rescan pending, which also greys
+    /// out Sync Now; across a wait of minutes that is untrue and leaves the
+    /// user no way to say "check now". Snapshots that ended blocked or in
+    /// attention are not in the scanning phase and are left as they are.
+    private func noteDelayedChangeRescan(jobID: SyncJobID) async {
+        guard var snapshot = try? await repository.snapshot(jobID: jobID),
+              snapshot.phase == .scanning,
+              snapshot.blockers.isEmpty else { return }
+        snapshot.phase = .watching
+        snapshot.isRescanPending = false
+        snapshot.message = "Some files are still changing. StorageSync checks them again shortly."
+        try? await repository.setSnapshot(snapshot)
     }
 
     @discardableResult
@@ -813,15 +880,26 @@ public actor SyncCoordinator {
             let (localScan, remoteScan) = try await (localTask, remoteTask)
             var invalidRemoteKeyCount = remoteScan.invalidRemoteKeyCount
             let caseCollisionCount = localScan.caseCollisionCount + remoteScan.caseCollisionCount
-            try await repository.pruneBaselinesAbsentFromManifest(
-                jobID: job.id,
-                side: job.direction == .upload ? .local : .remote,
-                generation: job.direction == .upload ? localScan.generation : remoteScan.generation
-            )
+            // A baseline is retired when its source path is absent, which is
+            // only evidence of deletion when the scan saw everything. A folder
+            // the scan could not read is absent too, and retiring its
+            // baselines turned the next successful scan into a first pairing
+            // that took whatever the destination held as the copy — so an edit
+            // made in between was never sent. The remote side has no partial
+            // scan: a listing either completes or throws.
+            let sourceScanIsComplete = job.direction == .download || localScan.skippedEntryCount == 0
+            if sourceScanIsComplete {
+                try await repository.pruneBaselinesAbsentFromManifest(
+                    jobID: job.id,
+                    side: job.direction == .upload ? .local : .remote,
+                    generation: job.direction == .upload ? localScan.generation : remoteScan.generation
+                )
+            }
 
             let reconciliationPageSize = 512
             var reconciliationCursor: String?
             var alreadyPresentCount = 0
+            var destinationConflictCount = 0
             var supersededDestinationBytes: Int64 = 0
             var newlyQueuedCount = 0
             // A bounded sample makes detection visible without letting an
@@ -863,6 +941,19 @@ public actor SyncCoordinator {
                             obsoleteTransferPaths.append(row.relativePath)
                             continue
                         }
+                    }
+                    // A first pairing with a visibly different file on the
+                    // other side: neither adopted as a copy nor overwritten.
+                    // Anything already queued for the path is withdrawn too,
+                    // because it was planned before that file was seen.
+                    if reconciler.isConflictingExistingDestination(
+                        local: row.local,
+                        remote: row.remote,
+                        baseline: row.baseline
+                    ) {
+                        destinationConflictCount += 1
+                        obsoleteTransferPaths.append(row.relativePath)
+                        continue
                     }
                     if let adoption = reconciler.initialAdoptionBaseline(
                         relativePath: row.relativePath,
@@ -992,6 +1083,7 @@ public actor SyncCoordinator {
             // Files that fail outright are counted rather than allowed to stop
             // the run, so the headline has to be rebuilt as they accumulate.
             var failedFileCount = 0
+            var supersededTransferCount = 0
             var jobWideAttention = false
             let transferHeadline = queue.count == 0
                 ? nil
@@ -1000,6 +1092,7 @@ public actor SyncCoordinator {
                 Self.notices(
                     invalidRemoteKeys: invalidRemoteKeyCount,
                     caseCollisions: caseCollisionCount,
+                    destinationConflicts: destinationConflictCount,
                     failedFiles: failedFileCount
                 )
             }
@@ -1144,6 +1237,9 @@ public actor SyncCoordinator {
                             // The source or destination changed after this scan.
                             // Reconcile the new version immediately instead of
                             // reporting success until the next polling interval.
+                            // The count lets the scheduler back off when the
+                            // same thing happens cycle after cycle.
+                            supersededTransferCount += 1
                             pendingWakeJobIDs.insert(job.id)
                         }
                         snapshot.bytesCompleted = await progressAccumulator.totalCompleted()
@@ -1196,7 +1292,9 @@ public actor SyncCoordinator {
                     // state would claim a destination copy that does not exist,
                     // and the phase is what turns the count into something the
                     // user is shown rather than something they have to notice.
-                    if failedFileCount > 0 { snapshot.phase = .attention }
+                    // A destination conflict is the same claim: that source
+                    // file has no copy until someone decides which one wins.
+                    if failedFileCount > 0 || destinationConflictCount > 0 { snapshot.phase = .attention }
                 } else {
                     snapshot.message = Self.message(
                         headline: "Waiting to retry \(remaining.count) item\(remaining.count == 1 ? "" : "s")…",
@@ -1211,7 +1309,8 @@ public actor SyncCoordinator {
             // until the user fixes something.
             return CycleOutcome(
                 direction: direction,
-                disposition: jobWideAttention ? .attention : .normal
+                disposition: jobWideAttention ? .attention : .normal,
+                supersededTransferCount: supersededTransferCount
             )
         } catch is CancellationError {
             return CycleOutcome(direction: direction, disposition: .normal)
@@ -1288,6 +1387,7 @@ public actor SyncCoordinator {
     private static func notices(
         invalidRemoteKeys: Int,
         caseCollisions: Int,
+        destinationConflicts: Int,
         failedFiles: Int
     ) -> [String] {
         var sentences: [String] = []
@@ -1301,6 +1401,13 @@ public actor SyncCoordinator {
                 caseCollisions == 1
                     ? "Skipped 1 name that differs only by capitalization"
                     : "Skipped \(caseCollisions) names that differ only by capitalization"
+            )
+        }
+        if destinationConflicts > 0 {
+            sentences.append(
+                destinationConflicts == 1
+                    ? "Left 1 file untouched because a different file already has its name at the destination"
+                    : "Left \(destinationConflicts) files untouched because different files already have their names at the destination"
             )
         }
         if failedFiles > 0 {
@@ -1330,8 +1437,9 @@ public actor SyncCoordinator {
         var batch: [FileFingerprint] = []
         var entryCount = 0
         var byteCount: Int64 = 0
+        let skipped = LocalScanSkipCounter()
         batch.reserveCapacity(512)
-        for try await file in scanner.files(at: root) {
+        for try await file in scanner.files(at: root, skipped: skipped) {
             try Task.checkCancellation()
             batch.append(file)
             entryCount += 1
@@ -1375,7 +1483,8 @@ public actor SyncCoordinator {
             invalidRemoteKeyCount: 0,
             caseCollisionCount: caseCollisionCount,
             entryCount: entryCount,
-            byteCount: byteCount
+            byteCount: byteCount,
+            skippedEntryCount: skipped.count
         )
     }
 

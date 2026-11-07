@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+**Fixes from a review of the transfer path.** One behavior change: a file
+that already exists at the destination with a different size is no longer
+treated as a copy.
+
+- A file that already exists at the destination with a different size is no
+  longer taken as a copy of the source. That used to report the source as
+  backed up when it never was — another camera's `IMG_0001.JPG` in the bucket,
+  or an object some other tool left half-uploaded. Such a file is now left
+  untouched on both sides and reported until one of them is renamed or
+  removed. Files of the same size are still adopted as before.
+- A folder the scan could not read no longer makes StorageSync forget what it
+  had already copied from it. Forgetting meant an edit made in the meantime
+  was later taken as already copied, and never sent.
+- One file that cannot be read or written — a bad sector, a permission
+  problem, a download whose folder name is already taken by a file — now fails
+  on its own. It used to be reported as a missing drive, which stopped every
+  other transfer in the sync and repeated at every retry.
+- On download syncs, an object archived to S3 Glacier, or one encrypted with a
+  key these credentials cannot use, now fails on its own instead of stopping
+  the whole sync with a request to sign in again.
+- A file that keeps changing while it is being copied no longer makes
+  StorageSync re-check the whole folder and bucket back to back. Repeated
+  re-checks now wait longer each time, up to five minutes, and **Sync Now**
+  still checks immediately.
+- Object names that begin or end with a space are no longer altered when the
+  bucket is listed, which made downloads of them re-check forever and uploads
+  of them repeat on every sync. Listings now ask for URL-encoded names, so one
+  object with an unusual character in its name can no longer stop every scan.
+- Storage providers that format an object's ETag differently in a listing and
+  in a direct request no longer make every download look changed.
+
 ## 0.4.2
 
 **A second pre-release review, of the whole tree.** No feature changes. Eight

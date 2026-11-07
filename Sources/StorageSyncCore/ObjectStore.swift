@@ -93,6 +93,11 @@ public enum ObjectStoreError: Error, LocalizedError, Sendable, Equatable {
     case incompatible(String)
     case transient(String)
     case checksumMismatch
+    /// One object the provider lists but will not serve: archived to a storage
+    /// class such as Glacier, or locked behind a key these credentials cannot
+    /// use. It says nothing about any other object, so it fails that one file
+    /// and never the whole sync.
+    case objectUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -103,6 +108,7 @@ public enum ObjectStoreError: Error, LocalizedError, Sendable, Equatable {
         case .incompatible(let message): message
         case .transient(let message): message
         case .checksumMismatch: "The downloaded data did not match its expected checksum."
+        case .objectUnavailable(let message): message
         }
     }
 }

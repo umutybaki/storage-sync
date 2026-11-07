@@ -40,9 +40,14 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
     }
 
     public func list(prefix: String, continuationToken: String?) async throws -> ObjectPage {
+        // `encoding-type=url` keeps every key representable in the XML reply.
+        // Without it a key holding a control character that XML 1.0 forbids
+        // makes the whole page unparseable, and one such object anywhere under
+        // the prefix stops every scan of the bucket for good.
         var query = [
             URLQueryItem(name: "list-type", value: "2"),
-            URLQueryItem(name: "max-keys", value: "1000")
+            URLQueryItem(name: "max-keys", value: "1000"),
+            URLQueryItem(name: "encoding-type", value: "url")
         ]
         if !prefix.isEmpty { query.append(URLQueryItem(name: "prefix", value: prefix)) }
         if let continuationToken {
@@ -355,6 +360,15 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             return .authentication(serviceError.message)
         case "NoSuchKey", "NoSuchUpload":
             return .notFound
+        case "InvalidObjectState", "ObjectNotInActiveTierError":
+            // HTTP 403, but nothing to do with the keys: the object is archived
+            // (Glacier, Deep Archive, an Intelligent-Tiering archive tier) and
+            // has to be restored in S3 before it can be read. Classified by the
+            // 403 alone it parked a whole restore as a credentials problem at
+            // the first archived photo.
+            return .objectUnavailable(
+                "\(serviceError.message) This object is archived in a storage class such as S3 Glacier and must be restored in S3 before it can be downloaded."
+            )
         case "NoSuchBucket":
             return .incompatible(serviceError.message)
         default:

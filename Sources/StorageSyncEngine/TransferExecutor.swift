@@ -217,6 +217,14 @@ public struct TransferExecutor: Sendable {
             case .authentication, .accessDenied:
                 await mark(&transfer, status: .failed, message: error.localizedDescription)
                 return .attention(.credentialsUnavailable, error.localizedDescription)
+            case .objectUnavailable:
+                // One object the provider will not serve. Its checkpoints go
+                // now, because the next scan replaces this failed row with a
+                // fresh one and would otherwise strand its partial file.
+                await discardCheckpoints(for: transfer, root: root)
+                transfer.temporaryPath = nil
+                await mark(&transfer, status: .failed, message: error.localizedDescription)
+                return .attention(nil, error.localizedDescription)
             case .incompatible, .invalidResponse:
                 await mark(&transfer, status: .failed, message: error.localizedDescription)
                 return .attention(nil, error.localizedDescription)
@@ -236,18 +244,53 @@ public struct TransferExecutor: Sendable {
             await wait(&transfer, blocker: .insufficientSpace, error: error)
             return .waiting(.insufficientSpace, error.localizedDescription)
         } catch let error as CocoaError {
-            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
-            return .waiting(.localVolumeUnavailable, error.localizedDescription)
+            return await localFailure(&transfer, job: job, root: root, error: error)
         } catch let error as POSIXError where error.code == .ENOSPC {
             await wait(&transfer, blocker: .insufficientSpace, error: error)
             return .waiting(.insufficientSpace, error.localizedDescription)
         } catch let error as POSIXError {
-            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
-            return .waiting(.localVolumeUnavailable, error.localizedDescription)
+            return await localFailure(&transfer, job: job, root: root, error: error)
         } catch {
             await mark(&transfer, status: .failed, message: error.localizedDescription)
             return .attention(nil, error.localizedDescription)
         }
+    }
+
+    /// A file-system error names one path. It means the drive is gone only when
+    /// the drive actually is gone, and that is checked rather than assumed.
+    ///
+    /// Assuming it is what used to happen, and a `.waiting` result stops the
+    /// whole job: one unreadable photo, a bad sector, a download whose folder
+    /// name is already taken by a file, or a name the destination filesystem
+    /// refuses each parked every other transfer behind a "drive unavailable"
+    /// message, cancelled whatever was in flight, and did it again at every
+    /// retry, forever. Now that file fails on its own and the rest carry on.
+    /// Its checkpoints go with it, because the next scan replaces the failed
+    /// row with a fresh one — which would otherwise leave a multipart upload
+    /// open at the provider and a partial download on the drive.
+    private func localFailure(
+        _ transfer: inout TransferRecord,
+        job: SyncJob,
+        root: URL,
+        error: Error
+    ) async -> TransferExecutionResult {
+        let volumeIsPresent: Bool
+        do {
+            try validateVolume(job: job, root: root)
+            volumeIsPresent = true
+        } catch {
+            volumeIsPresent = false
+        }
+        guard volumeIsPresent else {
+            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
+            return .waiting(.localVolumeUnavailable, error.localizedDescription)
+        }
+        await abortIfNecessary(transfer)
+        await discardCheckpoints(for: transfer, root: root)
+        transfer.multipartUploadID = nil
+        transfer.temporaryPath = nil
+        await mark(&transfer, status: .failed, message: error.localizedDescription)
+        return .attention(nil, error.localizedDescription)
     }
 
     private func uploadClassifyingMissingSource(
@@ -313,7 +356,18 @@ public struct TransferExecutor: Sendable {
             transfer.completedBytes = before.size
             await progress(transfer.completedBytes)
             let after = try scanner.fingerprint(url: sourceURL, relativePath: transfer.relativePath)
-            try validateSourceAfterUpload(after, against: before)
+            do {
+                try validateSourceAfterUpload(after, against: before)
+            } catch {
+                await recordUnverifiedOwnUpload(
+                    transfer,
+                    job: job,
+                    uploadedFrom: before,
+                    remote: remote,
+                    remoteChecksum: remote.checksum ?? checksum
+                )
+                throw error
+            }
             var verified = after
             verified.checksum = checksum
             guard remote.size == before.size else {
@@ -336,7 +390,18 @@ public struct TransferExecutor: Sendable {
                alreadyCompleted.size == before.size,
                alreadyCompleted.metadata["storagesync-transfer-id"] == transfer.id.description {
                 let after = try scanner.fingerprint(url: sourceURL, relativePath: transfer.relativePath)
-                try validateSourceAfterUpload(after, against: before)
+                do {
+                    try validateSourceAfterUpload(after, against: before)
+                } catch {
+                    await recordUnverifiedOwnUpload(
+                        transfer,
+                        job: job,
+                        uploadedFrom: before,
+                        remote: alreadyCompleted,
+                        remoteChecksum: alreadyCompleted.checksum
+                    )
+                    throw error
+                }
                 return ReconciliationBaseline(
                     relativePath: transfer.relativePath,
                     localFingerprint: after,
@@ -516,6 +581,36 @@ public struct TransferExecutor: Sendable {
         )
     }
 
+    /// The object now at this key was written by this transfer, but the source
+    /// moved on before the copy could be verified, so the transfer is about to
+    /// be superseded rather than finalized.
+    ///
+    /// Without a record of that, the next scan would meet the object as a
+    /// stranger: a first pairing whose sizes usually differ, which is left
+    /// alone as a conflict, so the new version of the source would never be
+    /// sent. Recording the pre-upload fingerprint as the baseline makes that
+    /// scan see what actually happened — the source changed since its last
+    /// copy — and send the new version over StorageSync's own object.
+    private func recordUnverifiedOwnUpload(
+        _ transfer: TransferRecord,
+        job: SyncJob,
+        uploadedFrom source: FileFingerprint,
+        remote: RemoteObject,
+        remoteChecksum: String?
+    ) async {
+        try? await repository.saveBaseline(
+            ReconciliationBaseline(
+                relativePath: transfer.relativePath,
+                localFingerprint: source,
+                remoteETag: remote.eTag,
+                remoteChecksum: remoteChecksum,
+                remoteSize: remote.size,
+                remoteLastModified: remote.lastModified
+            ),
+            jobID: job.id
+        )
+    }
+
     /// Preserve the existing conservative transfer behavior while separating
     /// reliable content metadata from an opaque identity-only mismatch. Both
     /// restart safely; only the first is honest enough to show to the user.
@@ -646,7 +741,7 @@ public struct TransferExecutor: Sendable {
                 nextIndex += 1
                 group.addTask {
                     try Task.checkCancellation()
-                    let data = try await objectStore.getRange(
+                    let data = try await fetchRange(
                         key: downloadRemoteKey,
                         range: part.offset..<(part.offset + part.length)
                     )
@@ -678,7 +773,7 @@ public struct TransferExecutor: Sendable {
                     nextIndex += 1
                     group.addTask {
                         try Task.checkCancellation()
-                        let data = try await objectStore.getRange(
+                        let data = try await fetchRange(
                             key: downloadRemoteKey,
                             range: part.offset..<(part.offset + part.length)
                         )
@@ -793,12 +888,31 @@ public struct TransferExecutor: Sendable {
         return try? verifiedPartialDirectory(beneath: root)
     }
 
+    /// A ranged read of an object this download has already HEADed.
+    ///
+    /// HEAD needs the same `s3:GetObject` permission GET does, so a refusal
+    /// here is about this object and not about the keys: typically one
+    /// encrypted with a KMS key these credentials cannot decrypt. Reported as
+    /// access denied it parked the entire sync as a credentials failure at the
+    /// first such object. Keys that really stopped working are still caught —
+    /// they fail the next file's HEAD, which keeps its job-wide meaning.
+    private func fetchRange(key: String, range: Range<Int64>) async throws -> Data {
+        do {
+            return try await objectStore.getRange(key: key, range: range)
+        } catch ObjectStoreError.accessDenied(let message) {
+            throw ObjectStoreError.objectUnavailable(
+                "S3 lists this object but refused to send it, for example because it is encrypted with a KMS key these credentials cannot use. \(message)"
+            )
+        }
+    }
+
     private func sameRemoteObject(_ left: RemoteObject, _ right: RemoteObject) throws -> Bool {
         guard left.size == right.size else { return false }
         if let leftChecksum = left.checksum, let rightChecksum = right.checksum {
             return leftChecksum == rightChecksum
         }
-        if let leftETag = left.eTag, let rightETag = right.eTag {
+        if let leftETag = RemoteObject.comparableETag(left.eTag),
+           let rightETag = RemoteObject.comparableETag(right.eTag) {
             return leftETag == rightETag
         }
         if let leftModified = left.lastModified, let rightModified = right.lastModified {

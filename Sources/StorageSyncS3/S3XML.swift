@@ -7,6 +7,16 @@ struct ListObjectsXMLResult {
     var nextContinuationToken: String?
 }
 
+/// `encoding-type=url` key decoding, exactly as the AWS SDKs do it: S3 writes a
+/// space as `+` and a literal plus as `%2B`, so `+` is turned back into a space
+/// before percent-decoding. Getting that order wrong renames every key with a
+/// space or a plus in it.
+enum S3ListingKeyDecoder {
+    static func decode(_ encoded: String) -> String? {
+        encoded.replacingOccurrences(of: "+", with: " ").removingPercentEncoding
+    }
+}
+
 struct S3ServiceError {
     var code: String?
     var message: String
@@ -51,6 +61,7 @@ private final class S3XMLParserDelegate: NSObject, XMLParserDelegate {
     var rootElement: String?
     var serviceErrorMessage: String?
     var serviceErrorCode: String?
+    var encodingType: String?
     var parseError: Error?
 
     private var elementStack: [String] = []
@@ -101,7 +112,13 @@ private final class S3XMLParserDelegate: NSObject, XMLParserDelegate {
         let parent = elementStack.dropLast().last
         switch (parent, elementName) {
         case ("Contents", "Key"):
-            objectKey = value
+            // Never trimmed. A key is an exact name, and `photo.jpg ` with its
+            // trailing space is a different object from `photo.jpg`: trimming
+            // it made a download fetch a key that does not exist and an upload
+            // re-send a file whose object it could no longer recognise.
+            objectKey = text
+        case (_, "EncodingType"):
+            encodingType = value
         case ("Contents", "Size"):
             objectSize = Int64(value)
         case ("Contents", "LastModified"):
@@ -160,8 +177,22 @@ enum S3XML {
                 "The S3 service reported a negative size for object \(invalid.key)."
             )
         }
+        // Keys arrive URL-encoded only when the provider says it honoured the
+        // request for that. One that ignored it sent raw keys, and decoding a
+        // raw key would turn a real `+` into a space or `%41` into `A`.
+        var objects = delegate.objects
+        if delegate.encodingType?.lowercased() == "url" {
+            for index in objects.indices {
+                guard let decoded = S3ListingKeyDecoder.decode(objects[index].key) else {
+                    throw ObjectStoreError.invalidResponse(
+                        "The S3 service returned an object key that is not valid URL encoding: \(objects[index].key)"
+                    )
+                }
+                objects[index].key = decoded
+            }
+        }
         return ListObjectsXMLResult(
-            objects: delegate.objects,
+            objects: objects,
             isTruncated: delegate.isTruncated,
             nextContinuationToken: delegate.continuationToken
         )

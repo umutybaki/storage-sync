@@ -262,6 +262,22 @@ public struct RemoteObject: Codable, Hashable, Sendable {
         self.checksum = checksum
         self.metadata = metadata
     }
+
+    /// An ETag in the one form two of them can be compared in.
+    ///
+    /// AWS quotes it in both the listing and the HEAD response, but S3-compatible
+    /// providers do not all agree: some drop the quotes in one place and not the
+    /// other, some prefix a weak `W/`, some change the hex case. Comparing the
+    /// raw strings then reads every object as changed since it was listed, and a
+    /// download that sees "changed" re-plans and rescans — forever.
+    public static func comparableETag(_ eTag: String?) -> String? {
+        guard var value = eTag?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        if value.hasPrefix("W/") || value.hasPrefix("w/") { value.removeFirst(2) }
+        if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+            value = String(value.dropFirst().dropLast())
+        }
+        return value.isEmpty ? nil : value.lowercased()
+    }
 }
 
 public enum ManifestSide: String, Codable, Sendable {

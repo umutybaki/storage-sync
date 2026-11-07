@@ -179,6 +179,13 @@ private final class ReliabilitySuite {
         try await duplicateListedPartsCheck()
         try reconciliationSafetyCheck()
         try initialDestinationAdoptionCheck()
+        try eTagComparisonCheck()
+        try await s3EncodedListingCheck()
+        try await localScanSkipCountCheck()
+        try await unreadableSourceFailsOnlyThatFileCheck()
+        try await blockedDownloadFolderFailsOnlyThatFileCheck()
+        try await refusedObjectFailsOnlyThatFileCheck()
+        try await supersededOwnUploadKeepsBaselineCheck()
         try storageBalanceCheck()
         try await diskBackedManifestCheck()
         try await localCaseCollisionCheck()
@@ -747,6 +754,9 @@ private final class ReliabilitySuite {
             case "expired":
                 status = 403
                 code = "ExpiredToken"
+            case "archived":
+                status = 403
+                code = "InvalidObjectState"
             default:
                 status = 404
                 code = "NoSuchBucket"
@@ -792,6 +802,12 @@ private final class ReliabilitySuite {
             throw CheckFailure.failed("An expired S3 session token was accepted")
         } catch ObjectStoreError.authentication(let message) {
             try check(message == "ExpiredToken message", "The S3 authentication error message was lost")
+        }
+        do {
+            _ = try await store.list(prefix: "archived", continuationToken: nil)
+            throw CheckFailure.failed("An archived-object response was accepted")
+        } catch ObjectStoreError.objectUnavailable(let message) {
+            try check(message.hasPrefix("InvalidObjectState message"), "The archived-object message was lost")
         }
         do {
             _ = try await store.list(prefix: "missing", continuationToken: nil)
@@ -1228,7 +1244,7 @@ private final class ReliabilitySuite {
         )
         let remote = RemoteObject(
             key: "backup/existing/photo.jpg",
-            size: 99,
+            size: 10,
             eTag: "destination-version"
         )
         guard let baseline = reconciler.initialAdoptionBaseline(
@@ -1262,6 +1278,314 @@ private final class ReliabilitySuite {
                 baseline: baseline
             ) != nil,
             "A later source change was hidden by initial destination adoption"
+        )
+
+        // A destination of another size is a different file under the same
+        // name — another camera's IMG_0001.JPG, an object some other tool left
+        // truncated. Adopting it reported the source as backed up when it never
+        // was; copying over it would destroy a file StorageSync never saw.
+        let stranger = RemoteObject(key: "backup/existing/photo.jpg", size: 99, eTag: "someone-else")
+        try check(
+            reconciler.initialAdoptionBaseline(
+                relativePath: local.relativePath,
+                local: local,
+                remote: stranger,
+                existingBaseline: nil
+            ) == nil,
+            "A destination file of a different size was adopted as the copy of the source"
+        )
+        try check(
+            reconciler.isConflictingExistingDestination(local: local, remote: stranger, baseline: nil),
+            "A first pairing with a different-sized destination was not reported as a conflict"
+        )
+        try check(
+            !reconciler.isConflictingExistingDestination(local: local, remote: remote, baseline: nil),
+            "A same-sized destination was reported as a conflict instead of being adopted"
+        )
+        try check(
+            !reconciler.isConflictingExistingDestination(local: changed, remote: stranger, baseline: baseline),
+            "A path with a baseline was treated as a first pairing"
+        )
+    }
+
+    private func eTagComparisonCheck() throws {
+        try check(RemoteObject.comparableETag("\"ABC123\"") == "abc123", "A quoted ETag was not made comparable")
+        try check(RemoteObject.comparableETag("W/\"abc123\"") == "abc123", "A weak ETag was not made comparable")
+        try check(RemoteObject.comparableETag(" abc123 ") == "abc123", "An unquoted ETag was not made comparable")
+        try check(RemoteObject.comparableETag("\"\"") == nil, "An empty quoted ETag was treated as an identity")
+        let baseline = ReconciliationBaseline(
+            relativePath: "a.jpg",
+            localFingerprint: FileFingerprint(relativePath: "a.jpg", size: 4, modificationTimeNanoseconds: 1),
+            remoteETag: "\"abc123\"",
+            remoteChecksum: nil,
+            remoteSize: 4
+        )
+        try check(
+            baseline.remoteMatches(RemoteObject(key: "a.jpg", size: 4, eTag: "abc123")),
+            "A provider that unquotes ETags in its listing made an unchanged object look changed"
+        )
+        try check(
+            !baseline.remoteMatches(RemoteObject(key: "a.jpg", size: 4, eTag: "\"def456\"")),
+            "A changed ETag was accepted as the same object"
+        )
+    }
+
+    /// Keys are exact names. The listing parser used to trim them, which made a
+    /// download fetch a key that does not exist (and rescan forever) and an
+    /// upload re-send a file every cycle. `encoding-type=url` also keeps a key
+    /// with an XML-illegal control character from making the page unreadable.
+    private func s3EncodedListingCheck() async throws {
+        S3URLProtocolStub.install { request in
+            guard let url = request.url,
+                  let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [:]) else {
+                throw CheckFailure.failed("Could not construct the encoded listing response")
+            }
+            let prefix = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "prefix" })?.value
+            if prefix == "raw/" {
+                // A provider that ignored encoding-type: its keys are raw and
+                // must not be decoded, and their whitespace is part of them.
+                return (
+                    response,
+                    Data(
+                        """
+                        <ListBucketResult>
+                          <IsTruncated>false</IsTruncated>
+                          <Contents><Key>raw/ lead.jpg </Key><ETag>"a"</ETag><Size>1</Size></Contents>
+                          <Contents><Key>raw/a+b%41.jpg</Key><ETag>"b"</ETag><Size>1</Size></Contents>
+                        </ListBucketResult>
+                        """.utf8
+                    )
+                )
+            }
+            return (
+                response,
+                Data(
+                    """
+                    <ListBucketResult>
+                      <EncodingType>url</EncodingType>
+                      <IsTruncated>false</IsTruncated>
+                      <Contents><Key>album/a+b%2Bc.jpg</Key><ETag>"a"</ETag><Size>1</Size></Contents>
+                      <Contents><Key>album/trailing.jpg+</Key><ETag>"b"</ETag><Size>1</Size></Contents>
+                      <Contents><Key>album/control%01.jpg</Key><ETag>"c"</ETag><Size>1</Size></Contents>
+                    </ListBucketResult>
+                    """.utf8
+                )
+            )
+        }
+        defer { S3URLProtocolStub.reset() }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [S3URLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let store = S3ObjectStore(
+            configuration: S3ClientConfiguration(
+                endpoint: URL(string: "https://objects.example.test")!,
+                region: "us-test-1",
+                bucket: "test-bucket",
+                addressingStyle: .path,
+                credentials: S3Credentials(accessKeyID: "ACCESS", secretAccessKey: "SECRET")
+            ),
+            session: session
+        )
+
+        let encoded = try await store.list(prefix: "album/", continuationToken: nil)
+        try check(
+            encoded.objects.map(\.key) == ["album/a b+c.jpg", "album/trailing.jpg ", "album/control\u{1}.jpg"],
+            "URL-encoded listing keys were not decoded the way S3 encodes them: \(encoded.objects.map(\.key))"
+        )
+        let raw = try await store.list(prefix: "raw/", continuationToken: nil)
+        try check(
+            raw.objects.map(\.key) == ["raw/ lead.jpg ", "raw/a+b%41.jpg"],
+            "A raw listing key was trimmed or decoded: \(raw.objects.map(\.key))"
+        )
+        let listQuery = S3URLProtocolStub.recordedRequests().first?.url?.query ?? ""
+        try check(listQuery.contains("encoding-type=url"), "The listing did not ask for URL-encoded keys")
+    }
+
+    /// An unreadable folder is absent from the manifest just as a deleted one
+    /// is. The cycle retires baselines on absence, so it has to be told.
+    private func localScanSkipCountCheck() async throws {
+        let root = try temporaryDirectory()
+        let locked = root.appendingPathComponent("locked", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+        try Data("seen".utf8).write(to: root.appendingPathComponent("visible.jpg"))
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try Data("unseen".utf8).write(to: locked.appendingPathComponent("hidden.jpg"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+
+        let complete = LocalScanSkipCounter()
+        let fully = root.appendingPathComponent("complete", isDirectory: true)
+        try FileManager.default.createDirectory(at: fully, withIntermediateDirectories: true)
+        try Data("ok".utf8).write(to: fully.appendingPathComponent("ok.jpg"))
+        for try await _ in LocalScanner().files(at: fully, skipped: complete) {}
+        try check(complete.count == 0, "A fully readable scan reported skipped entries")
+
+        let skipped = LocalScanSkipCounter()
+        var paths: [String] = []
+        for try await file in LocalScanner().files(at: root, skipped: skipped) {
+            paths.append(file.relativePath)
+        }
+        try check(paths.contains("visible.jpg"), "An unreadable folder stopped the rest of the scan")
+        try check(!paths.contains("locked/hidden.jpg"), "The unreadable folder fixture was readable after all")
+        try check(skipped.count > 0, "A scan that stepped over an unreadable folder reported itself complete")
+    }
+
+    /// One unreadable source file is that file's problem. Reported as a missing
+    /// drive it stopped every other transfer in the job, again at every retry.
+    private func unreadableSourceFailsOnlyThatFileCheck() async throws {
+        let fixture = try Fixture.make(direction: .upload)
+        defer { fixture.cleanup() }
+        let source = fixture.root.appendingPathComponent("locked.raw")
+        try Data("this-file-cannot-be-read".utf8).write(to: source)
+        let fingerprint = try LocalScanner().fingerprint(url: source, relativePath: "locked.raw")
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: source.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: source.path) }
+        let transfer = TransferRecord(
+            jobID: fixture.job.id,
+            relativePath: "locked.raw",
+            kind: .upload,
+            totalBytes: fingerprint.size,
+            sourceFingerprint: fingerprint,
+            remoteKey: "backup/locked.raw"
+        )
+        try await fixture.repository.saveTransfer(transfer)
+        let result = await fixture.executor().execute(transfer, job: fixture.job, root: fixture.root)
+        guard case .attention(nil, _) = result else {
+            throw CheckFailure.failed("An unreadable source file was reported as a missing drive, which stops the whole sync: \(result)")
+        }
+        let saved = try await fixture.repository.transfer(id: transfer.id)
+        try check(saved?.status == .failed, "The unreadable file was not failed on its own")
+        try check(saved?.multipartUploadID == nil, "The failed file kept a multipart upload the next scan would orphan")
+        let openUploads = await fixture.store.activeUploadCount()
+        try check(openUploads == 0, "A multipart upload was left open at the provider for a file that failed locally")
+    }
+
+    /// S3 can hold both `2020` and `2020/photo.jpg`; a folder cannot share a
+    /// name with a file. That download can never land, and it must not park
+    /// the rest of the restore behind a "drive unavailable" message.
+    private func blockedDownloadFolderFailsOnlyThatFileCheck() async throws {
+        let fixture = try Fixture.make(direction: .download)
+        defer { fixture.cleanup() }
+        let payload = Data("a-photo-whose-folder-name-is-taken".utf8)
+        let remote = await fixture.store.seed(key: "restore/2020/photo.jpg", data: payload)
+        try Data("a file, not a folder".utf8).write(to: fixture.root.appendingPathComponent("2020"))
+        let transfer = TransferRecord(
+            jobID: fixture.job.id,
+            relativePath: "2020/photo.jpg",
+            kind: .download,
+            totalBytes: Int64(payload.count),
+            remoteSource: remote,
+            remoteKey: remote.key
+        )
+        try await fixture.repository.saveTransfer(transfer)
+        let result = await fixture.executor().execute(transfer, job: fixture.job, root: fixture.root)
+        guard case .attention(nil, _) = result else {
+            throw CheckFailure.failed("A download blocked by a same-named file was reported as a missing drive: \(result)")
+        }
+        let partial = fixture.root
+            .appendingPathComponent(ReservedName.partialsDirectory, isDirectory: true)
+            .appendingPathComponent(transfer.id.description + ".partial")
+        try check(
+            !FileManager.default.fileExists(atPath: partial.path),
+            "A download that failed on its own left its partial file behind"
+        )
+        let parts = try await fixture.repository.parts(transferID: transfer.id)
+        try check(parts.isEmpty, "A download that failed on its own kept part checkpoints")
+    }
+
+    /// A 403 for one object — archived to Glacier, or encrypted with a key these
+    /// credentials cannot use — used to park a whole restore as a credentials
+    /// failure. A 403 on HEAD still means the keys cannot read objects at all.
+    private func refusedObjectFailsOnlyThatFileCheck() async throws {
+        let fixture = try Fixture.make(direction: .download)
+        defer { fixture.cleanup() }
+        let payload = Data("an-object-the-provider-will-not-serve".utf8)
+        let remote = await fixture.store.seed(key: "restore/archived.jpg", data: payload)
+        func attempt() async throws -> TransferExecutionResult {
+            let transfer = TransferRecord(
+                jobID: fixture.job.id,
+                relativePath: "archived.jpg",
+                kind: .download,
+                totalBytes: Int64(payload.count),
+                remoteSource: remote,
+                remoteKey: remote.key
+            )
+            try await fixture.repository.saveTransfer(transfer)
+            return await fixture.executor().execute(transfer, job: fixture.job, root: fixture.root)
+        }
+
+        await fixture.store.failRanges(with: .objectUnavailable("archived"))
+        guard case .attention(nil, _) = try await attempt() else {
+            throw CheckFailure.failed("An archived object stopped the whole restore")
+        }
+        await fixture.store.failRanges(with: .accessDenied("kms key"))
+        let kms = try await attempt()
+        guard case .attention(nil, let message) = kms, message.contains("refused to send it") else {
+            throw CheckFailure.failed("An object-level refusal after a successful HEAD was treated as bad credentials: \(kms)")
+        }
+        await fixture.store.failRanges(with: nil)
+        await fixture.store.failHeads(with: .accessDenied("no s3:GetObject"))
+        guard case .attention(.credentialsUnavailable, _) = try await attempt() else {
+            throw CheckFailure.failed("Keys that cannot read objects at all no longer stop the sync")
+        }
+    }
+
+    /// A single-request upload whose source changes right after the PUT leaves
+    /// StorageSync's own object at the key. Without a record of it the next
+    /// scan met that object as a stranger — once adopted as the copy, now a
+    /// size conflict — and the edited source was never sent.
+    private func supersededOwnUploadKeepsBaselineCheck() async throws {
+        let fixture = try Fixture.make(direction: .upload)
+        defer { fixture.cleanup() }
+        let source = fixture.root.appendingPathComponent("edited.jpg")
+        try Data("original".utf8).write(to: source)
+        let before = try LocalScanner().fingerprint(url: source, relativePath: "edited.jpg")
+        let transfer = TransferRecord(
+            jobID: fixture.job.id,
+            relativePath: "edited.jpg",
+            kind: .upload,
+            totalBytes: before.size,
+            sourceFingerprint: before,
+            remoteKey: "backup/edited.jpg"
+        )
+        try await fixture.repository.saveTransfer(transfer)
+        await fixture.store.mutateSourceOnPut(url: source, replacement: Data("edited while it was uploading".utf8))
+        let executor = TransferExecutor(
+            repository: fixture.repository,
+            objectStore: fixture.store,
+            retryPolicy: RetryPolicy(baseDelay: .zero, maximumDelay: .zero, maximumAttempts: 5)
+        )
+        let result = await executor.execute(transfer, job: fixture.job, root: fixture.root)
+        guard case .superseded = result else {
+            throw CheckFailure.failed("A source edited during its upload was not superseded: \(result)")
+        }
+        guard let baseline = try await fixture.repository.baselines(jobID: fixture.job.id)
+            .first(where: { $0.relativePath == "edited.jpg" }) else {
+            throw CheckFailure.failed("StorageSync kept no record of the object it had just written")
+        }
+        let edited = try LocalScanner().fingerprint(url: source, relativePath: "edited.jpg")
+        let listed = try await fixture.store.list(prefix: "backup/", continuationToken: nil).objects
+            .first(where: { $0.key == "backup/edited.jpg" })
+        let reconciler = Reconciler()
+        try check(
+            !reconciler.isConflictingExistingDestination(local: edited, remote: listed, baseline: baseline),
+            "StorageSync's own interrupted upload was reported as someone else's file"
+        )
+        try check(
+            reconciler.transferPlan(
+                direction: .upload,
+                prefix: "backup",
+                relativePath: "edited.jpg",
+                local: edited,
+                remote: listed,
+                baseline: baseline
+            ) != nil,
+            "The edited source would never be sent over StorageSync's own interrupted upload"
         )
     }
 
@@ -3650,6 +3974,9 @@ private actor FaultInjectingObjectStore: ObjectStore {
     private var maximumInFlightPartUploads = 0
     private var headCalls = 0
     private var localWriteOnHead: (call: Int, url: URL, data: Data)?
+    private var headError: ObjectStoreError?
+    private var rangeError: ObjectStoreError?
+    private var sourceMutationOnPut: (url: URL, replacement: Data)?
 
     func failOnceAfterAcceptingPart(_ number: Int) { partFailure = number; didFail = false }
     func failOnceOnRangeCall(_ number: Int) { rangeFailureCall = number; didFail = false }
@@ -3661,6 +3988,11 @@ private actor FaultInjectingObjectStore: ObjectStore {
     func maximumObservedPartUploads() -> Int { maximumInFlightPartUploads }
     func writeLocalFileOnHeadCall(_ call: Int, url: URL, data: Data) {
         localWriteOnHead = (call, url, data)
+    }
+    func failHeads(with error: ObjectStoreError?) { headError = error }
+    func failRanges(with error: ObjectStoreError?) { rangeError = error }
+    func mutateSourceOnPut(url: URL, replacement: Data) {
+        sourceMutationOnPut = (url, replacement)
     }
     func mutateSourceAfterAcceptingPart(_ part: Int, url: URL, replacement: Data) {
         sourceMutation = (part, url, replacement)
@@ -3709,6 +4041,7 @@ private actor FaultInjectingObjectStore: ObjectStore {
 
     func head(key: String) async throws -> RemoteObject? {
         headCalls += 1
+        if let headError { throw headError }
         if let localWriteOnHead, localWriteOnHead.call == headCalls {
             try localWriteOnHead.data.write(to: localWriteOnHead.url)
             self.localWriteOnHead = nil
@@ -3718,6 +4051,10 @@ private actor FaultInjectingObjectStore: ObjectStore {
 
     func put(key: String, data: Data, metadata: [String: String]) async throws -> RemoteObject {
         objects[key] = StoredObject(data: data, metadata: metadata, eTag: hash(data))
+        if let sourceMutationOnPut {
+            self.sourceMutationOnPut = nil
+            try sourceMutationOnPut.replacement.write(to: sourceMutationOnPut.url)
+        }
         return remoteObject(key)!
     }
 
@@ -3787,6 +4124,7 @@ private actor FaultInjectingObjectStore: ObjectStore {
 
     func getRange(key: String, range: Range<Int64>?) async throws -> Data {
         guard let object = objects[key] else { throw ObjectStoreError.notFound }
+        if let rangeError { throw rangeError }
         rangeCalls += 1
         requestedRanges.append(range)
         if let rangeDetachment, rangeDetachment.call == rangeCalls, !didDetachRange {
