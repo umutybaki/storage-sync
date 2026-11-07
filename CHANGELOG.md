@@ -1,5 +1,84 @@
 # Changelog
 
+## Unreleased
+
+**Fixes from a review of the transfer path.** Three behavior changes: a file
+that already exists at the destination with a different size is no longer
+treated as a copy; a destination that changed while its source did not is no
+longer overwritten; and system files such as `.DS_Store` and `Thumbs.db` are
+no longer copied.
+
+### Behavior changes
+
+- A file that already exists at the destination with a different size is no
+  longer taken as a copy of the source. That used to report the source as
+  backed up when it never was — another camera's `IMG_0001.JPG` in the bucket,
+  or an object some other tool left half-uploaded. Such a file is now left
+  untouched on both sides and reported until one of them is renamed or
+  removed. Files of the same size are still adopted as before.
+- A file that changed at the destination while its source did not is no
+  longer copied over. Editing a restored photo used to see the edit replaced
+  by the next sync, and an object changed in the bucket by someone else was
+  overwritten. Such changes are now reported and left alone; a change that kept
+  the file's size, such as a moved timestamp, is accepted quietly. A change to
+  the source is still copied as before.
+- `.DS_Store`, `._` AppleDouble files, `Thumbs.db`, `desktop.ini` and volume
+  index and trash folders are no longer copied in either direction. Copies
+  already in the bucket are left where they are.
+
+### Fixes
+
+- One file that cannot be read or written — a bad sector, a permission
+  problem, a download whose folder name is already taken by a file — now fails
+  on its own. It used to be reported as a missing drive, which stopped every
+  other transfer in the sync and repeated at every retry.
+- On download syncs, an object archived to S3 Glacier, or one encrypted with a
+  key these credentials cannot use, now fails on its own instead of stopping
+  the whole sync with a request to sign in again.
+- A folder the scan could not read no longer makes StorageSync forget what it
+  had already copied from it, which let an edit made in the meantime be taken
+  as already copied.
+- Uploads now tell S3 what they expect to find: nothing, or the version that
+  was there when the upload was planned. An object that appeared or changed in
+  the meantime is no longer replaced. Providers that do not support this get a
+  plain upload, as before.
+- A file whose bytes are already in the bucket is no longer uploaded again
+  just because its timestamp moved — for example after `touch`, or a daylight
+  saving change on a FAT-formatted drive. The bytes are compared with the
+  object's ETag first.
+- Downloads from Amazon S3 are now checked against the object's MD5 when its
+  ETag is one. A download that fails verification three times in a row is
+  reported instead of being fetched forever.
+- An object that shrank while it was downloading is planned again instead of
+  failing for good.
+- A temporary error on one file no longer cancels the other transfers that
+  are already in progress.
+- Retrying a waiting file no longer rescans the whole folder and bucket first.
+- A file that keeps changing while it is being copied no longer makes
+  StorageSync re-check everything back to back; repeated re-checks wait up to
+  five minutes, and **Sync Now** still checks immediately.
+- Queueing a large first sync no longer slows down with the square of its
+  size.
+- Partial downloads that can no longer be resumed are deleted, and removing a
+  sync now deletes all of its partial files. Replacing a failed upload aborts
+  its unfinished multipart upload in the bucket instead of leaving it behind.
+- Ejecting a drive now waits for StorageSync's checkpoint, and reconnecting it
+  wakes the sync, even when the drive mounted under a different name.
+- A drive that was replaced, or a folder copied to a new drive, can be chosen
+  again with **Choose Folder…** instead of removing and recreating the sync.
+- A pasted region, bucket name, secret key or folder name with a stray space
+  or line break no longer fails as rejected keys.
+- A Mac clock that is out of step with S3 is reported as a clock problem and
+  retried, not as rejected keys. A request body damaged in transit is retried
+  instead of failing the file.
+- Object names that begin or end with a space are no longer altered when the
+  bucket is listed, and object names are encoded strictly in requests, so a
+  `+` or `;` cannot be read two ways. Listings ask for URL-encoded names, so
+  one object with an unusual character in its name can no longer stop every
+  scan.
+- Storage providers that format ETags differently in a listing and in a
+  direct request no longer make every download look changed.
+
 ## 0.4.2
 
 **A second pre-release review, of the whole tree.** No feature changes. Eight

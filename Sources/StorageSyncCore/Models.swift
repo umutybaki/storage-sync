@@ -246,6 +246,11 @@ public struct RemoteObject: Codable, Hashable, Sendable {
     public var eTag: String?
     public var checksum: String?
     public var metadata: [String: String]
+    /// `x-amz-server-side-encryption` from a HEAD, when the provider sends it.
+    /// Listings never carry it. It decides whether an ETag can be read as the
+    /// object's MD5: with KMS or customer keys it is not, and checking a
+    /// download against it would fail every time.
+    public var serverSideEncryption: String?
 
     public init(
         key: String,
@@ -253,7 +258,8 @@ public struct RemoteObject: Codable, Hashable, Sendable {
         lastModified: Date? = nil,
         eTag: String? = nil,
         checksum: String? = nil,
-        metadata: [String: String] = [:]
+        metadata: [String: String] = [:],
+        serverSideEncryption: String? = nil
     ) {
         self.key = key
         self.size = size
@@ -261,6 +267,23 @@ public struct RemoteObject: Codable, Hashable, Sendable {
         self.eTag = eTag
         self.checksum = checksum
         self.metadata = metadata
+        self.serverSideEncryption = serverSideEncryption
+    }
+
+    /// An ETag in the one form two of them can be compared in.
+    ///
+    /// AWS quotes it in both the listing and the HEAD response, but S3-compatible
+    /// providers do not all agree: some drop the quotes in one place and not the
+    /// other, some prefix a weak `W/`, some change the hex case. Comparing the
+    /// raw strings then reads every object as changed since it was listed, and a
+    /// download that sees "changed" re-plans and rescans — forever.
+    public static func comparableETag(_ eTag: String?) -> String? {
+        guard var value = eTag?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        if value.hasPrefix("W/") || value.hasPrefix("w/") { value.removeFirst(2) }
+        if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+            value = String(value.dropFirst().dropLast())
+        }
+        return value.isEmpty ? nil : value.lowercased()
     }
 }
 
@@ -331,6 +354,11 @@ public struct TransferRecord: Codable, Hashable, Sendable, Identifiable {
     /// reports the wrong cause on a non-English system. Optional so queue rows
     /// written before this field still decode.
     public var waitingBlocker: SyncBlocker?
+    /// Downloads of this transfer that arrived whole but failed verification.
+    /// A transient fault does not repeat; an object whose recorded checksum is
+    /// simply wrong fails every time, and used to be fetched again forever.
+    /// Optional so queue rows written before this field still decode.
+    public var integrityFailureCount: Int?
     public let createdAt: Date
     public var updatedAt: Date
 

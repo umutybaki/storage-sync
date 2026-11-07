@@ -21,3 +21,45 @@ public enum ReservedName {
         component == volumeMarker || component == partialsDirectory
     }
 }
+
+/// Names operating systems leave beside user files for their own use: Finder's
+/// per-folder view state, AppleDouble sidecars on non-Apple filesystems,
+/// Windows thumbnail caches, and volume-level indexes and trash. None is part
+/// of a photo library, and several change on their own — `.DS_Store` whenever
+/// a Finder window is resized — so copying them filled the bucket with junk
+/// that was then copied again and again. They are skipped on both sides, at
+/// any depth, the same way StorageSync's own names are.
+public enum IgnoredName {
+    private static let exact: Set<String> = [
+        ".DS_Store",
+        "Icon\r",
+        ".Spotlight-V100",
+        ".fseventsd",
+        ".Trashes",
+        ".TemporaryItems",
+        ".DocumentRevisions-V100"
+    ]
+
+    /// Windows names, which Windows itself treats case-insensitively.
+    private static let caseInsensitive: Set<String> = [
+        "thumbs.db",
+        "ehthumbs.db",
+        "ehthumbs_vista.db",
+        "desktop.ini",
+        "$recycle.bin",
+        "system volume information"
+    ]
+
+    public static func isIgnored(_ component: some StringProtocol) -> Bool {
+        let name = String(component)
+        if exact.contains(name) { return true }
+        // AppleDouble: macOS writes `._name` to hold the metadata of `name`
+        // on filesystems that cannot store it, such as exFAT.
+        if name.hasPrefix("._") { return true }
+        return caseInsensitive.contains(name.lowercased())
+    }
+
+    public static func isIgnoredPath(_ path: String) -> Bool {
+        path.split(separator: "/", omittingEmptySubsequences: false).contains(where: isIgnored)
+    }
+}

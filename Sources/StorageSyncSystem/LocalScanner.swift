@@ -2,10 +2,40 @@ import CryptoKit
 import Foundation
 import StorageSyncCore
 
+/// Counts the entries a scan stepped over because they could not be read.
+///
+/// A skipped entry is absent from that scan's manifest exactly as a deleted
+/// file is, and the cycle uses absence to retire a file's baseline. A baseline
+/// retired by a read error is not just a lost record: the next scan that does
+/// see the file pairs it as a first meeting, and any change made in between is
+/// then taken as the copy instead of being sent. So the caller needs to know a
+/// scan was incomplete, not merely that it finished.
+public final class LocalScanSkipCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    public init() {}
+
+    public var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func increment() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+}
+
 public struct LocalScanner: Sendable {
     public init() {}
 
-    public func files(at root: URL) -> AsyncThrowingStream<FileFingerprint, Error> {
+    public func files(
+        at root: URL,
+        skipped: LocalScanSkipCounter? = nil
+    ) -> AsyncThrowingStream<FileFingerprint, Error> {
         AsyncThrowingStream(bufferingPolicy: .bufferingOldest(512)) { continuation in
             let task = Task.detached(priority: .utility) {
                 do {
@@ -31,6 +61,7 @@ public struct LocalScanner: Sendable {
                             // reads as a disconnected volume and retries forever;
                             // only a failure on the root itself really is that.
                             guard url.standardizedFileURL.pathComponents == rootComponents else {
+                                skipped?.increment()
                                 return true
                             }
                             continuation.finish(throwing: error)
@@ -52,7 +83,10 @@ public struct LocalScanner: Sendable {
                         // scan's knowledge of the entry — deletion never
                         // propagates to the destination, so an entry missing
                         // from one manifest cannot remove anything.
-                        guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
+                        guard let values = try? url.resourceValues(forKeys: Set(keys)) else {
+                            skipped?.increment()
+                            continue
+                        }
                         let fileComponents = url.standardizedFileURL.pathComponents
                         guard fileComponents.starts(with: rootComponents) else {
                             throw CocoaError(.fileReadInvalidFileName)
@@ -62,7 +96,7 @@ public struct LocalScanner: Sendable {
                         // StorageSync's own bookkeeping is skipped at every depth,
                         // so a sync rooted at a parent folder never picks up the
                         // state of a sync rooted at a child.
-                        if relativeComponents.contains(where: ReservedName.isReserved) {
+                        if relativeComponents.contains(where: { ReservedName.isReserved($0) || IgnoredName.isIgnored($0) }) {
                             if values.isDirectory == true { enumerator.skipDescendants() }
                             continue
                         }
@@ -151,6 +185,25 @@ public struct LocalScanner: Sendable {
             return nanoseconds < 0 ? .min : .max
         }
         return exact
+    }
+
+    /// SHA-256 and, when asked, MD5 of one file in a single read, so checking a
+    /// download against an MD5 ETag costs no second pass over a large file.
+    public func digests(url: URL, includingMD5: Bool) async throws -> (sha256: String, md5: String?) {
+        try await Task.detached(priority: .utility) {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            var sha256 = SHA256()
+            var md5 = includingMD5 ? Insecure.MD5() : nil
+            while true {
+                try Task.checkCancellation()
+                let data = try handle.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
+                if data.isEmpty { break }
+                sha256.update(data: data)
+                md5?.update(data: data)
+            }
+            return (sha256.finalize().hexadecimalString, md5?.finalize().hexadecimalString)
+        }.value
     }
 
     public func sha256(url: URL) async throws -> String {

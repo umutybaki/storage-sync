@@ -14,6 +14,9 @@ public enum TransferExecutionResult: Sendable {
     /// silent because removable filesystems can change those identifiers
     /// without changing content.
     case superseded(String?)
+    /// This one file waits for its own retry; nothing about it says the rest
+    /// of the sync cannot proceed, so the coordinator keeps scheduling.
+    case retryingFile(String)
 }
 
 public enum TransferExecutionError: Error, LocalizedError {
@@ -119,14 +122,26 @@ public struct TransferExecutor: Sendable {
     private let volumeInspector: VolumeInspector
     private let transferPolicy: TransferPolicy
     private let retryPolicy: RetryPolicy
+    private let verifiesETagDigests: Bool
 
+    /// Three strikes: one verification failure can be a fault in transit or on
+    /// disk; the same failure three times running is the object's recorded
+    /// checksum, and fetching it again cannot change that.
+    public static let maximumIntegrityFailures = 3
+
+    /// - Parameter verifiesETagDigests: Check each finished download against
+    ///   its ETag when that ETag is the object's MD5. True only for Amazon S3,
+    ///   where the rules for when it is are documented; other providers may
+    ///   use 32 hex digits for something else, and a check that fails every
+    ///   time would block the file for good.
     public init(
         repository: SyncRepository,
         objectStore: any ObjectStore,
         scanner: LocalScanner = LocalScanner(),
         volumeInspector: VolumeInspector = VolumeInspector(),
         transferPolicy: TransferPolicy = TransferPolicy(),
-        retryPolicy: RetryPolicy = RetryPolicy()
+        retryPolicy: RetryPolicy = RetryPolicy(),
+        verifiesETagDigests: Bool = false
     ) {
         self.repository = repository
         self.objectStore = objectStore
@@ -134,6 +149,7 @@ public struct TransferExecutor: Sendable {
         self.volumeInspector = volumeInspector
         self.transferPolicy = transferPolicy
         self.retryPolicy = retryPolicy
+        self.verifiesETagDigests = verifiesETagDigests
     }
 
     public func execute(
@@ -196,7 +212,9 @@ public struct TransferExecutor: Sendable {
             await mark(&transfer, status: .superseded, message: TransferExecutionError.remoteChanged.localizedDescription)
             return .superseded(nil)
         } catch TransferExecutionError.destinationChanged {
+            await abortIfNecessary(transfer)
             await discardCheckpoints(for: transfer, root: root)
+            transfer.multipartUploadID = nil
             transfer.temporaryPath = nil
             await mark(&transfer, status: .superseded, message: TransferExecutionError.destinationChanged.localizedDescription)
             return .superseded(nil)
@@ -217,6 +235,14 @@ public struct TransferExecutor: Sendable {
             case .authentication, .accessDenied:
                 await mark(&transfer, status: .failed, message: error.localizedDescription)
                 return .attention(.credentialsUnavailable, error.localizedDescription)
+            case .objectUnavailable:
+                // One object the provider will not serve. Its checkpoints go
+                // now, because the next scan replaces this failed row with a
+                // fresh one and would otherwise strand its partial file.
+                await discardCheckpoints(for: transfer, root: root)
+                transfer.temporaryPath = nil
+                await mark(&transfer, status: .failed, message: error.localizedDescription)
+                return .attention(nil, error.localizedDescription)
             case .incompatible, .invalidResponse:
                 await mark(&transfer, status: .failed, message: error.localizedDescription)
                 return .attention(nil, error.localizedDescription)
@@ -224,10 +250,33 @@ public struct TransferExecutor: Sendable {
                 await discardCheckpoints(for: transfer, root: root)
                 await mark(&transfer, status: .superseded, message: "The remote object no longer exists.")
                 return .superseded(nil)
+            case .objectChanged:
+                // The object is not the version this transfer was planned
+                // against: a write condition failed because something else now
+                // sits at the key, or a ranged read ran past the end of an
+                // object that has shrunk. Re-planning from a fresh listing is
+                // the answer; failing the file for good is not.
+                await abortIfNecessary(transfer)
+                await discardCheckpoints(for: transfer, root: root)
+                transfer.multipartUploadID = nil
+                transfer.temporaryPath = nil
+                let message = transfer.kind == .upload
+                    ? "The S3 object changed after this upload was planned."
+                    : TransferExecutionError.remoteChanged.localizedDescription
+                await mark(&transfer, status: .superseded, message: message)
+                return .superseded(nil)
             case .checksumMismatch:
                 await discardCheckpoints(for: transfer, root: root)
+                transfer.temporaryPath = nil
+                let failures = (transfer.integrityFailureCount ?? 0) + 1
+                transfer.integrityFailureCount = failures
+                guard failures < Self.maximumIntegrityFailures else {
+                    let message = "The downloaded data failed verification \(failures) times in a row, so the checksum recorded for this object is probably wrong. Check the object in S3."
+                    await mark(&transfer, status: .failed, message: message)
+                    return .attention(nil, message)
+                }
                 await wait(&transfer, blocker: .networkUnavailable, error: error)
-                return .waiting(.networkUnavailable, "Downloaded data failed integrity verification and will be fetched again.")
+                return .retryingFile("Downloaded data failed integrity verification and will be fetched again.")
             default:
                 await wait(&transfer, blocker: .networkUnavailable, error: error)
                 return .waiting(.networkUnavailable, error.localizedDescription)
@@ -236,18 +285,53 @@ public struct TransferExecutor: Sendable {
             await wait(&transfer, blocker: .insufficientSpace, error: error)
             return .waiting(.insufficientSpace, error.localizedDescription)
         } catch let error as CocoaError {
-            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
-            return .waiting(.localVolumeUnavailable, error.localizedDescription)
+            return await localFailure(&transfer, job: job, root: root, error: error)
         } catch let error as POSIXError where error.code == .ENOSPC {
             await wait(&transfer, blocker: .insufficientSpace, error: error)
             return .waiting(.insufficientSpace, error.localizedDescription)
         } catch let error as POSIXError {
-            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
-            return .waiting(.localVolumeUnavailable, error.localizedDescription)
+            return await localFailure(&transfer, job: job, root: root, error: error)
         } catch {
             await mark(&transfer, status: .failed, message: error.localizedDescription)
             return .attention(nil, error.localizedDescription)
         }
+    }
+
+    /// A file-system error names one path. It means the drive is gone only when
+    /// the drive actually is gone, and that is checked rather than assumed.
+    ///
+    /// Assuming it is what used to happen, and a `.waiting` result stops the
+    /// whole job: one unreadable photo, a bad sector, a download whose folder
+    /// name is already taken by a file, or a name the destination filesystem
+    /// refuses each parked every other transfer behind a "drive unavailable"
+    /// message, cancelled whatever was in flight, and did it again at every
+    /// retry, forever. Now that file fails on its own and the rest carry on.
+    /// Its checkpoints go with it, because the next scan replaces the failed
+    /// row with a fresh one — which would otherwise leave a multipart upload
+    /// open at the provider and a partial download on the drive.
+    private func localFailure(
+        _ transfer: inout TransferRecord,
+        job: SyncJob,
+        root: URL,
+        error: Error
+    ) async -> TransferExecutionResult {
+        let volumeIsPresent: Bool
+        do {
+            try validateVolume(job: job, root: root)
+            volumeIsPresent = true
+        } catch {
+            volumeIsPresent = false
+        }
+        guard volumeIsPresent else {
+            await wait(&transfer, blocker: .localVolumeUnavailable, error: error)
+            return .waiting(.localVolumeUnavailable, error.localizedDescription)
+        }
+        await abortIfNecessary(transfer)
+        await discardCheckpoints(for: transfer, root: root)
+        transfer.multipartUploadID = nil
+        transfer.temporaryPath = nil
+        await mark(&transfer, status: .failed, message: error.localizedDescription)
+        return .attention(nil, error.localizedDescription)
     }
 
     private func uploadClassifyingMissingSource(
@@ -293,6 +377,14 @@ public struct TransferExecutor: Sendable {
                 throw TransferExecutionError.sourceChanged
             }
             let checksum = sha256(data)
+            if let identical = try await remoteObjectHoldingSource(
+                transfer,
+                sourceURL: sourceURL,
+                size: before.size,
+                loadedData: data
+            ) {
+                return try alreadyPresentBaseline(transfer, sourceURL: sourceURL, before: before, remote: identical)
+            }
             let liveProgress = LiveUploadProgressReporter(
                 repository: repository,
                 transfer: transfer,
@@ -302,6 +394,7 @@ public struct TransferExecutor: Sendable {
                 key: transfer.remoteKey,
                 data: data,
                 metadata: metadata.merging(["storagesync-sha256": checksum]) { _, new in new },
+                precondition: Self.writePrecondition(for: transfer),
                 progress: { bytesSent in
                     await liveProgress.report(
                         requestID: 0,
@@ -313,7 +406,18 @@ public struct TransferExecutor: Sendable {
             transfer.completedBytes = before.size
             await progress(transfer.completedBytes)
             let after = try scanner.fingerprint(url: sourceURL, relativePath: transfer.relativePath)
-            try validateSourceAfterUpload(after, against: before)
+            do {
+                try validateSourceAfterUpload(after, against: before)
+            } catch {
+                await recordUnverifiedOwnUpload(
+                    transfer,
+                    job: job,
+                    uploadedFrom: before,
+                    remote: remote,
+                    remoteChecksum: remote.checksum ?? checksum
+                )
+                throw error
+            }
             var verified = after
             verified.checksum = checksum
             guard remote.size == before.size else {
@@ -332,11 +436,22 @@ public struct TransferExecutor: Sendable {
         var uploadID: String
         if let existing = transfer.multipartUploadID {
             uploadID = existing
-            if let alreadyCompleted = try await objectStore.head(key: transfer.remoteKey),
+            if let alreadyCompleted = try await headTreatingDenialAsAbsent(key: transfer.remoteKey),
                alreadyCompleted.size == before.size,
                alreadyCompleted.metadata["storagesync-transfer-id"] == transfer.id.description {
                 let after = try scanner.fingerprint(url: sourceURL, relativePath: transfer.relativePath)
-                try validateSourceAfterUpload(after, against: before)
+                do {
+                    try validateSourceAfterUpload(after, against: before)
+                } catch {
+                    await recordUnverifiedOwnUpload(
+                        transfer,
+                        job: job,
+                        uploadedFrom: before,
+                        remote: alreadyCompleted,
+                        remoteChecksum: alreadyCompleted.checksum
+                    )
+                    throw error
+                }
                 return ReconciliationBaseline(
                     relativePath: transfer.relativePath,
                     localFingerprint: after,
@@ -347,6 +462,14 @@ public struct TransferExecutor: Sendable {
                 )
             }
         } else {
+            if let identical = try await remoteObjectHoldingSource(
+                transfer,
+                sourceURL: sourceURL,
+                size: before.size,
+                loadedData: nil
+            ) {
+                return try alreadyPresentBaseline(transfer, sourceURL: sourceURL, before: before, remote: identical)
+            }
             uploadID = try await objectStore.createMultipartUpload(key: transfer.remoteKey, metadata: metadata)
             transfer.multipartUploadID = uploadID
             transfer.updatedAt = Date()
@@ -496,7 +619,8 @@ public struct TransferExecutor: Sendable {
         remote = try await objectStore.completeMultipartUpload(
             key: transfer.remoteKey,
             uploadID: uploadID,
-            parts: orderedCompleted
+            parts: orderedCompleted,
+            precondition: Self.writePrecondition(for: transfer)
         )
         guard remote.size == before.size else {
             throw TransferExecutionError.unexpectedObjectSize(expected: before.size, actual: remote.size)
@@ -513,6 +637,181 @@ public struct TransferExecutor: Sendable {
             remoteChecksum: remote.checksum,
             remoteSize: remote.size,
             remoteLastModified: remote.lastModified
+        )
+    }
+
+    /// What the destination must still look like when this upload lands: as it
+    /// was listed when the upload was planned, or absent if it was absent.
+    static func writePrecondition(for transfer: TransferRecord) -> WritePrecondition {
+        guard let planned = transfer.remoteSource else { return .absent }
+        guard planned.key == transfer.remoteKey,
+              let eTag = planned.eTag?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !eTag.isEmpty else { return .none }
+        return .matching(eTag: eTag)
+    }
+
+    /// HEAD for a key that may not exist yet. With `s3:ListBucket` granted only
+    /// for a prefix, as the least-privilege policy in the runbook does, S3
+    /// answers 403 rather than 404 for a missing key — which, read as bad keys,
+    /// parked the whole sync every time a large upload resumed.
+    private func headTreatingDenialAsAbsent(key: String) async throws -> RemoteObject? {
+        do {
+            return try await objectStore.head(key: key)
+        } catch ObjectStoreError.accessDenied {
+            return nil
+        }
+    }
+
+    /// The object already at the key, if it provably holds exactly the source's
+    /// bytes.
+    ///
+    /// A source whose size is unchanged but whose timestamp moved — `touch`, a
+    /// photo app that rewrites dates, or a FAT-family drive whose local-time
+    /// stamps shift an hour at daylight saving — looks changed by size and
+    /// time alone, and was uploaded again in full; for a whole library that is
+    /// days of uploading for nothing. Where the ETag is an MD5 digest (a
+    /// single-request upload, or a multipart one whose part layout this
+    /// policy reproduces) the bytes can be compared without sending them. Any
+    /// other ETag simply fails to match, and the upload goes ahead.
+    private func remoteObjectHoldingSource(
+        _ transfer: TransferRecord,
+        sourceURL: URL,
+        size: Int64,
+        loadedData: Data?
+    ) async throws -> RemoteObject? {
+        guard let planned = transfer.remoteSource,
+              planned.key == transfer.remoteKey,
+              planned.size == size,
+              let expected = Self.md5ETag(planned.eTag) else { return nil }
+        guard let current = try await headTreatingDenialAsAbsent(key: transfer.remoteKey),
+              current.size == size,
+              RemoteObject.comparableETag(current.eTag) == RemoteObject.comparableETag(planned.eTag) else {
+            return nil
+        }
+        let local: String?
+        if let partCount = expected.partCount {
+            local = try multipartETag(url: sourceURL, size: size, partCount: partCount)
+        } else if let loadedData {
+            local = Insecure.MD5.hash(data: loadedData).hexadecimalString
+        } else {
+            local = try md5(url: sourceURL)
+        }
+        return local == expected.digest ? current : nil
+    }
+
+    private func alreadyPresentBaseline(
+        _ transfer: TransferRecord,
+        sourceURL: URL,
+        before: FileFingerprint,
+        remote: RemoteObject
+    ) throws -> ReconciliationBaseline {
+        let after = try scanner.fingerprint(url: sourceURL, relativePath: transfer.relativePath)
+        try validateSourceAfterUpload(after, against: before)
+        return ReconciliationBaseline(
+            relativePath: transfer.relativePath,
+            localFingerprint: after,
+            remoteETag: remote.eTag,
+            remoteChecksum: remote.checksum,
+            remoteSize: remote.size,
+            remoteLastModified: remote.lastModified
+        )
+    }
+
+    /// An ETag that is an MD5 digest: 32 hex digits, or for a multipart object
+    /// the digest of its parts' digests followed by `-` and the part count.
+    static func md5ETag(_ eTag: String?) -> (digest: String, partCount: Int?)? {
+        guard let value = RemoteObject.comparableETag(eTag) else { return nil }
+        let pieces = value.split(separator: "-", omittingEmptySubsequences: false)
+        guard let digest = pieces.first, digest.count == 32,
+              digest.allSatisfy(\.isHexDigit) else { return nil }
+        switch pieces.count {
+        case 1:
+            return (String(digest), nil)
+        case 2:
+            guard let count = Int(pieces[1]), count > 0 else { return nil }
+            return (value, count)
+        default:
+            return nil
+        }
+    }
+
+    /// The MD5 a finished download can be held to: a single-part ETag on an
+    /// object S3 encrypted with its own keys or not at all. With KMS or
+    /// customer keys the ETag is not a digest of the bytes.
+    static func singlePartMD5(of object: RemoteObject) -> String? {
+        if let encryption = object.serverSideEncryption?.lowercased(), encryption != "aes256" {
+            return nil
+        }
+        guard let parsed = md5ETag(object.eTag), parsed.partCount == nil else { return nil }
+        return parsed.digest
+    }
+
+    private func md5(url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = Insecure.MD5()
+        while true {
+            try Task.checkCancellation()
+            let data = try handle.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
+            if data.isEmpty { break }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().hexadecimalString
+    }
+
+    /// The ETag S3 gives a multipart upload of this file cut the way this
+    /// policy cuts it, or nil when that layout has a different part count from
+    /// the object's — in which case it was cut some other way and cannot be
+    /// compared.
+    private func multipartETag(url: URL, size: Int64, partCount: Int) throws -> String? {
+        let parts = try transferPolicy.parts(forFileSize: size, transferID: TransferID())
+        guard parts.count == partCount else { return nil }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var combined = Data()
+        for part in parts {
+            try handle.seek(toOffset: UInt64(part.offset))
+            var hasher = Insecure.MD5()
+            var remaining = part.length
+            while remaining > 0 {
+                try Task.checkCancellation()
+                let chunk = try handle.read(upToCount: Int(min(remaining, 4 * 1_024 * 1_024))) ?? Data()
+                guard !chunk.isEmpty else { return nil }
+                hasher.update(data: chunk)
+                remaining -= Int64(chunk.count)
+            }
+            combined.append(contentsOf: hasher.finalize())
+        }
+        return Insecure.MD5.hash(data: combined).hexadecimalString + "-\(partCount)"
+    }
+
+    /// The object now at this key was written by this transfer, but the source
+    /// moved on before the copy could be verified, so the transfer is about to
+    /// be superseded rather than finalized.
+    ///
+    /// Without a record of that, the next scan would meet the object as a
+    /// stranger: a first pairing whose sizes usually differ, which is left
+    /// alone as a conflict, so the new version of the source would never be
+    /// sent. Recording the pre-upload fingerprint as the baseline makes that
+    /// scan see what actually happened — the source changed since its last
+    /// copy — and send the new version over StorageSync's own object.
+    private func recordUnverifiedOwnUpload(
+        _ transfer: TransferRecord,
+        job: SyncJob,
+        uploadedFrom source: FileFingerprint,
+        remote: RemoteObject,
+        remoteChecksum: String?
+    ) async {
+        try? await repository.saveBaseline(
+            ReconciliationBaseline(
+                relativePath: transfer.relativePath,
+                localFingerprint: source,
+                remoteETag: remote.eTag,
+                remoteChecksum: remoteChecksum,
+                remoteSize: remote.size,
+                remoteLastModified: remote.lastModified
+            ),
+            jobID: job.id
         )
     }
 
@@ -646,12 +945,16 @@ public struct TransferExecutor: Sendable {
                 nextIndex += 1
                 group.addTask {
                     try Task.checkCancellation()
-                    let data = try await objectStore.getRange(
+                    let data = try await fetchRange(
                         key: downloadRemoteKey,
                         range: part.offset..<(part.offset + part.length)
                     )
+                    // A complete response shorter than the range asked for is
+                    // an object shorter than the one this download planned:
+                    // the object changed, which re-planning fixes and failing
+                    // the file for good does not.
                     guard data.count == part.length else {
-                        throw TransferExecutionError.shortRead(expected: part.length, actual: data.count)
+                        throw TransferExecutionError.remoteChanged
                     }
                     try Task.checkCancellation()
                     return DownloadedPartCheckpoint(part: part, data: data, checksum: sha256(data))
@@ -678,12 +981,12 @@ public struct TransferExecutor: Sendable {
                     nextIndex += 1
                     group.addTask {
                         try Task.checkCancellation()
-                        let data = try await objectStore.getRange(
+                        let data = try await fetchRange(
                             key: downloadRemoteKey,
                             range: part.offset..<(part.offset + part.length)
                         )
                         guard data.count == part.length else {
-                            throw TransferExecutionError.shortRead(expected: part.length, actual: data.count)
+                            throw TransferExecutionError.remoteChanged
                         }
                         try Task.checkCancellation()
                         return DownloadedPartCheckpoint(part: part, data: data, checksum: sha256(data))
@@ -702,8 +1005,15 @@ public struct TransferExecutor: Sendable {
               try sameRemoteObject(plannedRemote, afterRemote) else {
             throw TransferExecutionError.remoteChanged
         }
-        let wholeChecksum = try await scanner.sha256(url: partialURL)
+        let expectedMD5 = verifiesETagDigests ? Self.singlePartMD5(of: afterRemote) : nil
+        let digests = try await scanner.digests(url: partialURL, includingMD5: expectedMD5 != nil)
+        let wholeChecksum = digests.sha256
         if let expectedChecksum = afterRemote.checksum, expectedChecksum != wholeChecksum {
+            throw ObjectStoreError.checksumMismatch
+        }
+        // Objects StorageSync did not upload carry no checksum of their own,
+        // so before this the bytes were never compared with anything S3 said.
+        if let expectedMD5, digests.md5 != expectedMD5 {
             throw ObjectStoreError.checksumMismatch
         }
 
@@ -793,12 +1103,31 @@ public struct TransferExecutor: Sendable {
         return try? verifiedPartialDirectory(beneath: root)
     }
 
+    /// A ranged read of an object this download has already HEADed.
+    ///
+    /// HEAD needs the same `s3:GetObject` permission GET does, so a refusal
+    /// here is about this object and not about the keys: typically one
+    /// encrypted with a KMS key these credentials cannot decrypt. Reported as
+    /// access denied it parked the entire sync as a credentials failure at the
+    /// first such object. Keys that really stopped working are still caught —
+    /// they fail the next file's HEAD, which keeps its job-wide meaning.
+    private func fetchRange(key: String, range: Range<Int64>) async throws -> Data {
+        do {
+            return try await objectStore.getRange(key: key, range: range)
+        } catch ObjectStoreError.accessDenied(let message) {
+            throw ObjectStoreError.objectUnavailable(
+                "S3 lists this object but refused to send it, for example because it is encrypted with a KMS key these credentials cannot use. \(message)"
+            )
+        }
+    }
+
     private func sameRemoteObject(_ left: RemoteObject, _ right: RemoteObject) throws -> Bool {
         guard left.size == right.size else { return false }
         if let leftChecksum = left.checksum, let rightChecksum = right.checksum {
             return leftChecksum == rightChecksum
         }
-        if let leftETag = left.eTag, let rightETag = right.eTag {
+        if let leftETag = RemoteObject.comparableETag(left.eTag),
+           let rightETag = RemoteObject.comparableETag(right.eTag) {
             return leftETag == rightETag
         }
         if let leftModified = left.lastModified, let rightModified = right.lastModified {

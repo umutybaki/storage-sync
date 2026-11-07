@@ -37,7 +37,7 @@ struct UpdateCredentialsView: View {
 
     /// Any entry at all means the saved keys are being replaced.
     private var isReplacingKeys: Bool {
-        isCreating || !accessKey.trimmed.isEmpty || !secretKey.isEmpty || !sessionToken.trimmed.isEmpty
+        isCreating || !accessKey.trimmed.isEmpty || !secretKey.trimmed.isEmpty || !sessionToken.trimmed.isEmpty
     }
 
     private var sharedWith: [SyncJob] {
@@ -169,12 +169,12 @@ struct UpdateCredentialsView: View {
             if model.credentials.contains(where: { $0.name.lowercased() == trimmedName.lowercased() }) {
                 return "Credentials named “\(trimmedName)” already exist. Choose another name."
             }
-            if accessKey.trimmed.isEmpty || secretKey.isEmpty {
+            if accessKey.trimmed.isEmpty || secretKey.trimmed.isEmpty {
                 return "Enter the access key and secret key."
             }
             return nil
         }
-        if isReplacingKeys, accessKey.trimmed.isEmpty || secretKey.isEmpty {
+        if isReplacingKeys, accessKey.trimmed.isEmpty || secretKey.trimmed.isEmpty {
             return "Enter the access key and secret key, or clear both to keep the saved ones."
         }
         return nil
@@ -184,7 +184,7 @@ struct UpdateCredentialsView: View {
         guard isReplacingKeys else { return nil }
         return S3Credentials(
             accessKeyID: accessKey.trimmed,
-            secretAccessKey: secretKey,
+            secretAccessKey: secretKey.trimmed,
             sessionToken: sessionToken.nilIfBlank
         )
     }

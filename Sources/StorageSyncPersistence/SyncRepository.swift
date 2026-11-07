@@ -660,6 +660,40 @@ public actor SyncRepository {
         return results
     }
 
+    /// Every transfer identifier a job has, in any state, without decoding a
+    /// payload. Partial downloads are named after these.
+    public func transferIDs(jobID: SyncJobID) throws -> [TransferID] {
+        var identifiers: [TransferID] = []
+        try database.query(
+            "SELECT id FROM transfers WHERE job_id = ?",
+            bindings: [.text(jobID.description)]
+        ) { statement in
+            if let text = database.text(statement, column: 0), let uuid = UUID(uuidString: text) {
+                identifiers.append(TransferID(rawValue: uuid))
+            }
+        }
+        return identifiers
+    }
+
+    /// Which of these identifiers still name a transfer row, in any job and any
+    /// state. A partial download whose row is gone can never be resumed: the
+    /// next attempt at that path is a new transfer with a new name.
+    public func existingTransferIDs(_ candidates: [TransferID]) throws -> Set<TransferID> {
+        var existing: Set<TransferID> = []
+        for chunk in Self.chunks(of: candidates.map(\.description), size: 256) {
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+            try database.query(
+                "SELECT id FROM transfers WHERE id IN (\(placeholders))",
+                bindings: chunk.map(SQLiteValue.text)
+            ) { statement in
+                if let text = database.text(statement, column: 0), let uuid = UUID(uuidString: text) {
+                    existing.insert(TransferID(rawValue: uuid))
+                }
+            }
+        }
+        return existing
+    }
+
     public func discardTransfers(jobID: SyncJobID, relativePaths: [String]) throws {
         guard !relativePaths.isEmpty else { return }
         var revision: Int64 = 0
@@ -1117,6 +1151,12 @@ public actor SyncRepository {
         try? database.execute("ALTER TABLE transfers ADD COLUMN total_bytes INTEGER NOT NULL DEFAULT 0")
         try? database.execute("ALTER TABLE transfers ADD COLUMN completed_bytes INTEGER NOT NULL DEFAULT 0")
         try database.execute("CREATE INDEX IF NOT EXISTS transfer_run_queue ON transfers(job_id, status, next_attempt_at)")
+        // Every enqueue asks whether its path already has queued work, and
+        // every reconciliation page looks paths up. Without an index on the
+        // path each of those scanned the job's whole queue, so planning an
+        // initial pairing cost the square of its size: about forty million row
+        // visits at nine thousand files, and billions at a hundred thousand.
+        try database.execute("CREATE INDEX IF NOT EXISTS transfer_job_path ON transfers(job_id, relative_path)")
         try database.execute(
             """
             CREATE TABLE IF NOT EXISTS transfer_parts(
@@ -1155,6 +1195,9 @@ public actor SyncRepository {
         )
         try database.execute(
             "CREATE INDEX IF NOT EXISTS transfer_activity_status ON transfer_activity(job_id, batch_id, status, updated_at_ms DESC, id DESC)"
+        )
+        try database.execute(
+            "CREATE INDEX IF NOT EXISTS transfer_activity_path ON transfer_activity(job_id, relative_path)"
         )
         try database.execute(
             """
