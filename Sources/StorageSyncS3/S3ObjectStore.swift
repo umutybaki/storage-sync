@@ -93,14 +93,26 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         metadata: [String: String],
         progress: @escaping UploadProgressHandler
     ) async throws -> RemoteObject {
-        let response = try await send(
-            method: "PUT",
-            key: key,
-            headers: metadataHeaders(metadata),
-            body: data,
-            uploadProgress: progress
-        )
-        return remoteObject(key: key, response: response.response, authoritativeSize: Int64(data.count))
+        try await put(key: key, data: data, metadata: metadata, precondition: .none, progress: progress)
+    }
+
+    public func put(
+        key: String,
+        data: Data,
+        metadata: [String: String],
+        precondition: WritePrecondition,
+        progress: @escaping UploadProgressHandler
+    ) async throws -> RemoteObject {
+        try await withPreconditionFallback(precondition) { condition in
+            let response = try await send(
+                method: "PUT",
+                key: key,
+                headers: metadataHeaders(metadata).merging(Self.headers(for: condition)) { _, new in new },
+                body: data,
+                uploadProgress: progress
+            )
+            return remoteObject(key: key, response: response.response, authoritativeSize: Int64(data.count))
+        }
     }
 
     public func createMultipartUpload(key: String, metadata: [String: String]) async throws -> String {
@@ -191,22 +203,64 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         uploadID: String,
         parts: [UploadedPart]
     ) async throws -> RemoteObject {
+        try await completeMultipartUpload(key: key, uploadID: uploadID, parts: parts, precondition: .none)
+    }
+
+    public func completeMultipartUpload(
+        key: String,
+        uploadID: String,
+        parts: [UploadedPart],
+        precondition: WritePrecondition
+    ) async throws -> RemoteObject {
         let body = S3XML.completedPartsDocument(parts)
-        let completion = try await send(
-            method: "POST",
-            key: key,
-            query: [URLQueryItem(name: "uploadId", value: uploadID)],
-            headers: ["Content-Type": "application/xml"],
-            body: body
-        )
-        if let serviceError = S3XML.embeddedError(completion.data) {
-            throw classify(serviceError: serviceError, statusCode: completion.response.statusCode)
+        try await withPreconditionFallback(precondition) { condition in
+            let completion = try await send(
+                method: "POST",
+                key: key,
+                query: [URLQueryItem(name: "uploadId", value: uploadID)],
+                headers: ["Content-Type": "application/xml"].merging(Self.headers(for: condition)) { _, new in new },
+                body: body
+            )
+            if let serviceError = S3XML.embeddedError(completion.data) {
+                throw classify(serviceError: serviceError, statusCode: completion.response.statusCode)
+            }
         }
         guard let object = try await head(key: key) else {
             throw ObjectStoreError.invalidResponse("The completed S3 object could not be read back.")
         }
         return object
     }
+
+    private static func headers(for precondition: WritePrecondition) -> [String: String] {
+        switch precondition {
+        case .none:
+            return [:]
+        case .absent:
+            return ["If-None-Match": "*"]
+        case .matching(let eTag):
+            let trimmed = eTag.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ["If-Match": trimmed.hasPrefix("\"") ? trimmed : "\"\(trimmed)\""]
+        }
+    }
+
+    /// AWS has checked conditional writes since 2024, and most S3-compatible
+    /// services either check them too or ignore the header. One that refuses
+    /// the request outright as not implemented gets it again without the
+    /// condition — the unconditional write every store made before — rather
+    /// than having every upload fail.
+    private func withPreconditionFallback<T>(
+        _ precondition: WritePrecondition,
+        _ operation: (WritePrecondition) async throws -> T
+    ) async throws -> T {
+        do {
+            return try await operation(precondition)
+        } catch ObjectStoreError.incompatible(let message)
+            where precondition != .none && message.hasPrefix(Self.notImplementedPrefix) {
+            return try await operation(.none)
+        }
+    }
+
+    private static let notImplementedPrefix = "Not implemented: "
 
     public func abortMultipartUpload(key: String, uploadID: String) async throws {
         _ = try await send(
@@ -312,7 +366,12 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         if let key, !key.isEmpty {
             pathParts.append(contentsOf: key.split(separator: "/", omittingEmptySubsequences: false).map(String.init))
         }
-        components.path = "/" + pathParts.joined(separator: "/")
+        // Every segment is encoded with the same strict byte-wise rules SigV4
+        // canonicalises with. `URLComponents.path` leaves characters such as
+        // `+`, `;` and `=` bare, and S3-compatible services do not agree on
+        // what a bare `+` in a path means; encoded, there is nothing to read
+        // two ways.
+        components.percentEncodedPath = "/" + pathParts.map(AWSURIEncoder.encode).joined(separator: "/")
         // Build the transmitted query with the same strict byte-wise encoding
         // used by SigV4. URLComponents.queryItems leaves some legal URL
         // characters unescaped, but AWS requires them escaped in canonical
@@ -334,6 +393,10 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             }
             let message = errorMessage(data, fallback: "S3 returned HTTP \(response.statusCode).")
             switch response.statusCode {
+            case 412, 416:
+                throw ObjectStoreError.objectChanged(message)
+            case 501:
+                throw ObjectStoreError.incompatible(Self.notImplementedPrefix + message)
             case 404:
                 throw ObjectStoreError.notFound
             case 401:
@@ -351,12 +414,32 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
     private func classify(serviceError: S3ServiceError, statusCode: Int) -> ObjectStoreError {
         switch serviceError.code {
         case "InternalError", "OperationAborted", "RequestTimeout", "ServiceUnavailable",
-             "SlowDown", "Throttling", "ThrottlingException":
+             "SlowDown", "Throttling", "ThrottlingException", "ConditionalRequestConflict":
             return .transient(serviceError.message)
+        case "IncompleteBody", "XAmzContentSHA256Mismatch", "BadDigest":
+            // HTTP 400, but about the bytes that arrived rather than the
+            // request: a body cut short or damaged in transit. Sending it again
+            // is the fix, so these must not fail the file for good.
+            return .transient(serviceError.message)
+        case "RequestTimeTooSkewed":
+            // Usually a clock that has not resynchronised after sleep, which
+            // fixes itself. Reported as bad keys it asked the user to sign in
+            // again for a problem the keys never had.
+            return .transient(
+                "\(serviceError.message) Check that this Mac sets its date and time automatically."
+            )
+        case "PreconditionFailed":
+            return .objectChanged(serviceError.message)
+        case "InvalidRange":
+            // Only ranged reads send a range. One past the end means the object
+            // is now shorter than the version this download was planned from.
+            return .objectChanged(serviceError.message)
+        case "NotImplemented":
+            return .incompatible(Self.notImplementedPrefix + serviceError.message)
         case "AccessDenied", "AllAccessDisabled":
             return .accessDenied(serviceError.message)
         case "ExpiredToken", "InvalidAccessKeyId", "InvalidToken", "SignatureDoesNotMatch",
-             "TokenRefreshRequired", "AuthorizationHeaderMalformed", "RequestTimeTooSkewed":
+             "TokenRefreshRequired", "AuthorizationHeaderMalformed":
             return .authentication(serviceError.message)
         case "NoSuchKey", "NoSuchUpload":
             return .notFound
@@ -373,6 +456,10 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             return .incompatible(serviceError.message)
         default:
             switch statusCode {
+            case 412, 416:
+                return .objectChanged(serviceError.message)
+            case 501:
+                return .incompatible(Self.notImplementedPrefix + serviceError.message)
             case 408, 425, 429, 500...599:
                 return .transient(serviceError.message)
             case 401:
@@ -414,7 +501,8 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             // before upload. S3 checksum headers may describe a multipart composite and
             // must not be mistaken for a linear full-file digest.
             checksum: metadata["storagesync-sha256"],
-            metadata: metadata
+            metadata: metadata,
+            serverSideEncryption: response.value(forHTTPHeaderField: "x-amz-server-side-encryption")
         )
     }
 

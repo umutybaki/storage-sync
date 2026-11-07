@@ -96,7 +96,7 @@ public struct LocalScanner: Sendable {
                         // StorageSync's own bookkeeping is skipped at every depth,
                         // so a sync rooted at a parent folder never picks up the
                         // state of a sync rooted at a child.
-                        if relativeComponents.contains(where: ReservedName.isReserved) {
+                        if relativeComponents.contains(where: { ReservedName.isReserved($0) || IgnoredName.isIgnored($0) }) {
                             if values.isDirectory == true { enumerator.skipDescendants() }
                             continue
                         }
@@ -185,6 +185,25 @@ public struct LocalScanner: Sendable {
             return nanoseconds < 0 ? .min : .max
         }
         return exact
+    }
+
+    /// SHA-256 and, when asked, MD5 of one file in a single read, so checking a
+    /// download against an MD5 ETag costs no second pass over a large file.
+    public func digests(url: URL, includingMD5: Bool) async throws -> (sha256: String, md5: String?) {
+        try await Task.detached(priority: .utility) {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            var sha256 = SHA256()
+            var md5 = includingMD5 ? Insecure.MD5() : nil
+            while true {
+                try Task.checkCancellation()
+                let data = try handle.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
+                if data.isEmpty { break }
+                sha256.update(data: data)
+                md5?.update(data: data)
+            }
+            return (sha256.finalize().hexadecimalString, md5?.finalize().hexadecimalString)
+        }.value
     }
 
     public func sha256(url: URL) async throws -> String {

@@ -429,6 +429,60 @@ final class AppModel: ObservableObject {
 
     /// The saved path can be stale for a drive that is not mounted, so this
     /// opens the folder only when it is actually there.
+    /// Points a sync at its folder again: after the drive was replaced or
+    /// reformatted, the folder was copied to a new drive, or the identity
+    /// marker StorageSync keeps in it was deleted. Each of those leaves the
+    /// sync unable to prove the drive is the one it was set up with, and until
+    /// now the only way out was to remove the sync and create it again.
+    ///
+    /// The new folder is recorded exactly as a new sync's would be — bookmark,
+    /// volume identity, marker — while everything else stays. What StorageSync
+    /// knows about already-copied files is keyed by path inside the folder, so
+    /// files that are still the same are recognised rather than copied again.
+    func chooseFolderAgain(for job: SyncJob) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Use This Folder"
+        panel.message = "Choose where “\(job.name)” is now. Files that were already copied are recognised and not copied again."
+        if FileManager.default.fileExists(atPath: job.localRoot.fallbackPath) {
+            panel.directoryURL = URL(fileURLWithPath: job.localRoot.fallbackPath)
+        }
+        guard panel.runModal() == .OK, let folderURL = panel.url else { return }
+        Task { await relocate(job, to: folderURL) }
+    }
+
+    private func relocate(_ job: SyncJob, to folderURL: URL) async {
+        do {
+            let locations = try RuntimeLocations.standard()
+            try locations.prepare()
+            let bookmarkStore = try BookmarkStore(directory: locations.bookmarks)
+            let reference = try await bookmarkStore.create(for: folderURL)
+            var updated = job
+            do {
+                let volume = try VolumeInspector().identity(for: folderURL, createMarkerIfNeeded: true)
+                updated.localRoot = LocalRoot(
+                    displayName: folderURL.lastPathComponent,
+                    fallbackPath: folderURL.path,
+                    bookmarkReference: reference,
+                    expectedVolume: volume
+                )
+                try await client.perform(.saveJob, payload: JSONEncoder().encode(updated))
+            } catch {
+                try? await bookmarkStore.remove(reference: reference)
+                throw error
+            }
+            if job.localRoot.bookmarkReference != reference {
+                try? await bookmarkStore.remove(reference: job.localRoot.bookmarkReference)
+            }
+            await refresh()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func revealInFinder(_ job: SyncJob) {
         let path = job.localRoot.fallbackPath
         guard FileManager.default.fileExists(atPath: path) else {
@@ -559,7 +613,14 @@ final class AppModel: ObservableObject {
 
     func createSync(_ draft: SyncDraft) async throws {
         guard let folderURL = draft.folderURL else { throw SyncDraftError.missingFolder }
-        let endpointText = draft.provider == .amazon ? Self.amazonEndpoint(region: draft.region) : draft.endpoint
+        // Every typed field is trimmed before it is used. A value pasted from a
+        // console or a password manager often carries a trailing space or
+        // newline, and an untrimmed region or secret fails the connection test
+        // as rejected keys — the one cause the user would never suspect.
+        let region = draft.region.trimmed
+        let bucket = draft.bucket.trimmed
+        let prefix = draft.prefix.trimmed
+        let endpointText = draft.provider == .amazon ? Self.amazonEndpoint(region: region) : draft.endpoint.trimmed
         guard let endpoint = URL(string: endpointText),
               endpoint.user == nil,
               endpoint.password == nil,
@@ -578,7 +639,7 @@ final class AppModel: ObservableObject {
         case .new:
             newKeys = S3Credentials(
                 accessKeyID: draft.accessKey.trimmingCharacters(in: .whitespacesAndNewlines),
-                secretAccessKey: draft.secretKey,
+                secretAccessKey: draft.secretKey.trimmed,
                 sessionToken: draft.sessionToken.nilIfBlank
             )
             credentialReference = ""
@@ -595,9 +656,9 @@ final class AppModel: ObservableObject {
             id: connectionID,
             name: draft.provider == .amazon ? "Amazon S3" : endpoint.host ?? "S3 Storage",
             endpoint: endpoint,
-            region: draft.region,
-            bucket: draft.bucket,
-            addressingStyle: draft.provider == .amazon && !draft.bucket.contains(".") ? .virtualHost : .path,
+            region: region,
+            bucket: bucket,
+            addressingStyle: draft.provider == .amazon && !bucket.contains(".") ? .virtualHost : .path,
             credentialReference: credentialReference
         )
         // Nothing durable exists yet, so a wrong key or bucket costs only this
@@ -610,7 +671,7 @@ final class AppModel: ObservableObject {
                 ConnectionCredentialPayload(
                     connection: connection,
                     credentials: newKeys,
-                    remotePrefix: SyncJob.normalizedPrefix(draft.prefix)
+                    remotePrefix: SyncJob.normalizedPrefix(prefix)
                 )
             )
         )
@@ -641,7 +702,7 @@ final class AppModel: ObservableObject {
                 expectedVolume: volume
             ),
             connectionID: connectionID,
-            remotePrefix: draft.prefix
+            remotePrefix: prefix
         )
         try await client.perform(.saveJob, payload: JSONEncoder().encode(job))
         selection = .sync(job.id)
@@ -1126,7 +1187,7 @@ struct SyncDraft {
             return "Enter the bucket name."
         }
         guard isCreatingCredential else { return nil }
-        if accessKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || secretKey.isEmpty {
+        if accessKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || secretKey.trimmed.isEmpty {
             return "Enter the access key and secret key."
         }
         // The agent refuses a duplicate name rather than quietly numbering it,

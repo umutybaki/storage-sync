@@ -58,7 +58,7 @@ extension SyncStatus {
             self = SyncStatus(
                 tone: .waiting,
                 title: "Waiting for \(place)",
-                detail: "StorageSync saved its place. Syncing continues on its own once the same drive is connected again."
+                detail: "StorageSync saved its place. Syncing continues on its own once the same drive is connected again. If the folder moved or the drive was replaced, use Choose Folder…."
             )
         } else if snapshot.blockers.contains(.insufficientSpace) {
             self = SyncStatus(

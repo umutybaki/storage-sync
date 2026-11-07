@@ -167,7 +167,7 @@ struct CredentialEditorView: View {
     /// Any entry in the key fields at all means the user intends to replace the
     /// saved keys, so the form starts asking for a complete set.
     private var isReplacingKeys: Bool {
-        !isEditing || !accessKey.trimmed.isEmpty || !secretKey.isEmpty || !sessionToken.trimmed.isEmpty
+        !isEditing || !accessKey.trimmed.isEmpty || !secretKey.trimmed.isEmpty || !sessionToken.trimmed.isEmpty
     }
 
     var body: some View {
@@ -273,7 +273,7 @@ struct CredentialEditorView: View {
         }) {
             return "Credentials named “\(trimmedName)” already exist."
         }
-        if isReplacingKeys, accessKey.trimmed.isEmpty || secretKey.isEmpty {
+        if isReplacingKeys, accessKey.trimmed.isEmpty || secretKey.trimmed.isEmpty {
             return "Enter the access key and secret key."
         }
         return nil
@@ -283,7 +283,7 @@ struct CredentialEditorView: View {
         guard isReplacingKeys else { return nil }
         return S3Credentials(
             accessKeyID: accessKey.trimmed,
-            secretAccessKey: secretKey,
+            secretAccessKey: secretKey.trimmed,
             sessionToken: sessionToken.nilIfBlank
         )
     }

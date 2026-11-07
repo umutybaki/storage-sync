@@ -117,6 +117,7 @@ private struct SyncSidebar: View {
                             }
                             Divider()
                             Button("Show in Finder") { model.revealInFinder(job) }
+                            Button("Choose Folder…") { model.chooseFolderAgain(for: job) }
                             Divider()
                             Button("Remove Sync…", role: .destructive) { model.requestRemoval(of: job) }
                         }
@@ -473,6 +474,7 @@ private struct SyncDetail: View {
             Menu {
                 Button("Change Credentials…") { model.credentialsJob = job }
                 Button("Show in Finder") { model.revealInFinder(job) }
+                Button("Choose Folder…") { model.chooseFolderAgain(for: job) }
                 Divider()
                 Button("Remove Sync…", role: .destructive) { model.requestRemoval(of: job) }
             } label: {

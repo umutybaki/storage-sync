@@ -28,6 +28,22 @@ public struct UploadedPart: Codable, Hashable, Sendable {
 /// still required before those bytes count as durably uploaded.
 public typealias UploadProgressHandler = @Sendable (Int64) async -> Void
 
+/// What the destination must still look like for a write to go ahead.
+///
+/// A transfer is planned from a listing that can be hours or days old by the
+/// time its turn comes. Writing unconditionally replaced whatever had appeared
+/// or changed at the key since then — on a bucket without versioning, someone
+/// else's file, gone. S3 checks these on the server, so there is no window
+/// between looking and writing.
+public enum WritePrecondition: Sendable, Equatable {
+    /// No check: the write always goes ahead.
+    case none
+    /// Only if nothing exists at the key (`If-None-Match: *`).
+    case absent
+    /// Only if the object at the key still has this ETag (`If-Match`).
+    case matching(eTag: String)
+}
+
 public protocol ObjectStore: Sendable {
     func list(prefix: String, continuationToken: String?) async throws -> ObjectPage
     func head(key: String) async throws -> RemoteObject?
@@ -51,9 +67,45 @@ public protocol ObjectStore: Sendable {
     func completeMultipartUpload(key: String, uploadID: String, parts: [UploadedPart]) async throws -> RemoteObject
     func abortMultipartUpload(key: String, uploadID: String) async throws
     func getRange(key: String, range: Range<Int64>?) async throws -> Data
+    /// Conditional forms of the two requests that make an object visible. A
+    /// failed condition throws `ObjectStoreError.objectChanged`.
+    func put(
+        key: String,
+        data: Data,
+        metadata: [String: String],
+        precondition: WritePrecondition,
+        progress: @escaping UploadProgressHandler
+    ) async throws -> RemoteObject
+    func completeMultipartUpload(
+        key: String,
+        uploadID: String,
+        parts: [UploadedPart],
+        precondition: WritePrecondition
+    ) async throws -> RemoteObject
 }
 
 public extension ObjectStore {
+    /// Stores that cannot check a condition write unconditionally, which is
+    /// exactly what every store did before conditions existed.
+    func put(
+        key: String,
+        data: Data,
+        metadata: [String: String],
+        precondition: WritePrecondition,
+        progress: @escaping UploadProgressHandler
+    ) async throws -> RemoteObject {
+        try await put(key: key, data: data, metadata: metadata, progress: progress)
+    }
+
+    func completeMultipartUpload(
+        key: String,
+        uploadID: String,
+        parts: [UploadedPart],
+        precondition: WritePrecondition
+    ) async throws -> RemoteObject {
+        try await completeMultipartUpload(key: key, uploadID: uploadID, parts: parts)
+    }
+
     /// Existing providers and test doubles remain correct without implementing
     /// transport-level progress: they report the complete request at success.
     func put(
@@ -98,6 +150,10 @@ public enum ObjectStoreError: Error, LocalizedError, Sendable, Equatable {
     /// use. It says nothing about any other object, so it fails that one file
     /// and never the whole sync.
     case objectUnavailable(String)
+    /// The object is no longer the version a transfer was planned against: a
+    /// write condition failed, or a ranged read ran past the end of an object
+    /// that has since shrunk. The next scan plans against what is there now.
+    case objectChanged(String)
 
     public var errorDescription: String? {
         switch self {
@@ -109,6 +165,7 @@ public enum ObjectStoreError: Error, LocalizedError, Sendable, Equatable {
         case .transient(let message): message
         case .checksumMismatch: "The downloaded data did not match its expected checksum."
         case .objectUnavailable(let message): message
+        case .objectChanged(let message): message
         }
     }
 }

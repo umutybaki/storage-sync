@@ -178,6 +178,11 @@ public actor SyncCoordinator {
     /// cycle itself superseded. Only the cycle's own requests are slowed down.
     private var externalWakeJobIDs: Set<SyncJobID> = []
     private var attentionJobIDs: Set<SyncJobID> = []
+    /// What the last scan of each job had to report, kept for the cycles that
+    /// run only because a retry came due and so do not scan.
+    private var lastScanNotices: [SyncJobID: ScanNotices] = [:]
+    /// Each job's folder as its bookmark last resolved it.
+    private var resolvedRootPaths: [SyncJobID: String] = [:]
     private var removingJobIDs: Set<SyncJobID> = []
     private var unmountingJobIDs: Set<SyncJobID> = []
 
@@ -523,6 +528,9 @@ public actor SyncCoordinator {
         activeJobIDs.remove(jobID)
 
         let transfers = (try? await repository.activeTransfers(jobID: jobID)) ?? []
+        // Every row's identifier, not just the active ones: a failed download
+        // keeps its partial too, and nothing would find it after this.
+        let allTransferIDs = (try? await repository.transferIDs(jobID: jobID)) ?? transfers.map(\.id)
         let connection = try? await repository.connection(id: job.connectionID)
         let scopedRoot = try? await bookmarks.resolve(reference: job.localRoot.bookmarkReference)
         let store: (any ObjectStore)?
@@ -542,6 +550,8 @@ public actor SyncCoordinator {
             throw error
         }
         removingJobIDs.remove(jobID)
+        lastScanNotices.removeValue(forKey: jobID)
+        resolvedRootPaths.removeValue(forKey: jobID)
 
         // These cleanup operations cannot make removal fail after the durable
         // job row is gone. At worst, a harmless bookmark, credential, partial,
@@ -551,7 +561,7 @@ public actor SyncCoordinator {
             // The security-scoped access has to outlive the deletions, not just
             // the read of its URL, or the sandbox can revoke it mid-cleanup.
             withExtendedLifetime(scopedRoot) {
-                Self.removeDownloadPartials(for: transfers, beneath: scopedRoot.url)
+                Self.removeDownloadPartials(named: allTransferIDs, beneath: scopedRoot.url)
             }
         }
 
@@ -604,9 +614,7 @@ public actor SyncCoordinator {
     public func prepareForVolumeUnmount(at volumeURL: URL) async -> Bool {
         let affectedJobs: [SyncJob]
         do {
-            affectedJobs = try await repository.jobs().filter {
-                Self.localPath($0.localRoot.fallbackPath, isWithin: volumeURL)
-            }
+            affectedJobs = try await jobs(onVolumeAt: volumeURL)
         } catch {
             return false
         }
@@ -641,15 +649,44 @@ public actor SyncCoordinator {
     /// Releases the short unmount-preparation hold after macOS reports a
     /// volume event, or after an eject attempt was declined by another app.
     public func finishVolumeChange(at volumeURL: URL) async throws {
-        let affectedJobs = try await repository.jobs().filter {
-            Self.localPath($0.localRoot.fallbackPath, isWithin: volumeURL)
-        }
+        let affectedJobs = try await jobs(onVolumeAt: volumeURL)
         for job in affectedJobs {
             unmountingJobIDs.remove(job.id)
             guard !job.isPaused else { continue }
             try await repository.makeWaitingTransfersRunnable(jobID: job.id)
             await requestRun(jobID: job.id)
         }
+    }
+
+    /// The jobs whose folder lives on this volume.
+    ///
+    /// The path saved at setup is not enough on its own. A drive that mounts
+    /// while another of the same name is attached, or after an unclean eject
+    /// left its old mount point behind, appears as `/Volumes/Name 1`; a renamed
+    /// drive moves too. The bookmark follows the folder and syncing carries on,
+    /// but matching only the saved path meant an eject no longer waited for a
+    /// checkpoint and reconnecting the drive no longer woke the sync. Where the
+    /// folder last resolved and the volume's own identifier are checked as
+    /// well; the identifier can only be read while the volume is mounted, and
+    /// the resolved path covers the unmount that follows.
+    private func jobs(onVolumeAt volumeURL: URL) async throws -> [SyncJob] {
+        let volumeUUID = Self.volumeUUID(at: volumeURL)
+        return try await repository.jobs().filter { job in
+            if Self.localPath(job.localRoot.fallbackPath, isWithin: volumeURL) { return true }
+            if let resolved = resolvedRootPaths[job.id], Self.localPath(resolved, isWithin: volumeURL) {
+                return true
+            }
+            if let volumeUUID, let expected = job.localRoot.expectedVolume?.persistentUUID {
+                return expected == volumeUUID
+            }
+            return false
+        }
+    }
+
+    private nonisolated static func volumeUUID(at volumeURL: URL) -> String? {
+        var uncached = volumeURL
+        uncached.removeAllCachedResourceValues()
+        return try? uncached.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
     }
 
     private func requestRun(jobID: SyncJobID, allowAttention: Bool = false) async {
@@ -703,9 +740,11 @@ public actor SyncCoordinator {
             }
             var transientFailureAttempt = 0
             var changeRescanAttempt = 0
+            var scanNextCycle = true
             while !Task.isCancelled {
                 guard let self else { return }
-                let outcome = await self.runCycle(jobID: jobID)
+                let outcome = await self.runCycle(jobID: jobID, scan: scanNextCycle)
+                scanNextCycle = true
                 guard !Task.isCancelled else { return }
                 if outcome.supersededTransferCount == 0 { changeRescanAttempt = 0 }
                 if let wake = await self.consumePendingWake(jobID: jobID) {
@@ -771,6 +810,8 @@ public actor SyncCoordinator {
                 } catch {
                     return
                 }
+                // Only a retry came due; the next cycle runs the queue alone.
+                scanNextCycle = false
             }
         }
     }
@@ -789,6 +830,56 @@ public actor SyncCoordinator {
 
     private struct PendingWake {
         var isExternal: Bool
+    }
+
+    private struct ScanNotices {
+        var invalidRemoteKeys: Int
+        var caseCollisions: Int
+        var destinationConflicts: Int
+    }
+
+    private static func isTerminal(_ status: TransferStatus) -> Bool {
+        status == .completed || status == .failed || status == .superseded
+    }
+
+    /// Amazon's own endpoints, where an unencrypted or SSE-S3 single-part ETag
+    /// is documented to be the object's MD5.
+    private nonisolated static func isAmazonS3(_ endpoint: URL) -> Bool {
+        guard let host = endpoint.host?.lowercased() else { return false }
+        return host.hasSuffix(".amazonaws.com") || host.hasSuffix(".amazonaws.com.cn")
+    }
+
+    /// Deletes partial downloads that no transfer row names any more.
+    ///
+    /// A partial is resumable only by the transfer it is named after. Rows go
+    /// away in several ordinary ways — a path adopted or withdrawn, a failed
+    /// row replaced by a fresh attempt, a sync removed — and each left its
+    /// partial behind, gigabytes at a time, in a hidden folder on the user's
+    /// drive. Rows of every job count, because two syncs can share a folder.
+    private func sweepOrphanedPartials(beneath root: URL) async {
+        let directory = root
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .appendingPathComponent(ReservedName.partialsDirectory, isDirectory: true)
+        var uncached = directory
+        uncached.removeAllCachedResourceValues()
+        guard let values = try? uncached.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey]),
+              values.isSymbolicLink != true,
+              values.isDirectory == true,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
+        var candidates: [TransferID: String] = [:]
+        for name in names where name.hasSuffix(".partial") {
+            if let uuid = UUID(uuidString: String(name.dropLast(".partial".count))) {
+                candidates[TransferID(rawValue: uuid)] = name
+            }
+        }
+        guard !candidates.isEmpty,
+              let existing = try? await repository.existingTransferIDs(Array(candidates.keys)) else { return }
+        for (identifier, name) in candidates where !existing.contains(identifier) {
+            let file = directory.appendingPathComponent(name, isDirectory: false)
+            guard (try? FileManager.default.destinationOfSymbolicLink(atPath: file.path)) == nil else { continue }
+            try? FileManager.default.removeItem(at: file)
+        }
     }
 
     private func consumePendingWake(jobID: SyncJobID) -> PendingWake? {
@@ -818,7 +909,7 @@ public actor SyncCoordinator {
     }
 
     @discardableResult
-    private func runCycle(jobID: SyncJobID) async -> CycleOutcome {
+    private func runCycle(jobID: SyncJobID, scan: Bool = true) async -> CycleOutcome {
         activeJobIDs.insert(jobID)
         defer { activeJobIDs.remove(jobID) }
         var direction: SyncDirection = .upload
@@ -836,19 +927,38 @@ public actor SyncCoordinator {
             }
 
             let previousSnapshot = try await repository.snapshot(jobID: jobID)
-            // Completed activity belongs to one scan batch. A new scan clears
-            // it only after the prior resumable queue is empty; interrupted or
-            // restarted backlogs keep their exact batch and history.
-            _ = try await repository.beginTransferActivityBatchIfIdle(jobID: jobID)
-            var snapshot = SyncSnapshot(
-                jobID: jobID,
-                phase: .scanning,
-                message: "Checking for changes…",
-                isRescanPending: false,
-                recentlyQueuedCount: previousSnapshot?.recentlyQueuedCount,
-                recentlyQueuedPaths: previousSnapshot?.recentlyQueuedPaths,
-                recentlyQueuedAt: previousSnapshot?.recentlyQueuedAt
-            )
+            // A cycle woken only because a durable retry came due has nothing
+            // new to look for: the waiting transfer re-checks its own source
+            // and destination before it moves a byte. Rescanning the whole
+            // folder and bucket first made every retry of every file cost a
+            // full scan. Such a cycle reuses the notices the last scan
+            // produced and goes straight to the queue; without one to reuse —
+            // a freshly started agent — it scans as usual.
+            let cachedScan = scan ? nil : lastScanNotices[jobID]
+            let scans = cachedScan == nil
+            var snapshot: SyncSnapshot
+            if scans {
+                // Completed activity belongs to one scan batch. A new scan clears
+                // it only after the prior resumable queue is empty; interrupted or
+                // restarted backlogs keep their exact batch and history.
+                _ = try await repository.beginTransferActivityBatchIfIdle(jobID: jobID)
+                snapshot = SyncSnapshot(
+                    jobID: jobID,
+                    phase: .scanning,
+                    message: "Checking for changes…",
+                    isRescanPending: false,
+                    recentlyQueuedCount: previousSnapshot?.recentlyQueuedCount,
+                    recentlyQueuedPaths: previousSnapshot?.recentlyQueuedPaths,
+                    recentlyQueuedAt: previousSnapshot?.recentlyQueuedAt
+                )
+            } else {
+                snapshot = previousSnapshot ?? SyncSnapshot(jobID: jobID, phase: .transferring)
+                snapshot.phase = .transferring
+                snapshot.blockers = []
+                snapshot.isRescanPending = false
+                snapshot.currentRelativePath = nil
+                snapshot.message = "Retrying…"
+            }
             try await repository.setSnapshot(snapshot)
             let access: ScopedURLAccess
             do {
@@ -863,223 +973,284 @@ public actor SyncCoordinator {
             if let expected = job.localRoot.expectedVolume {
                 _ = try VolumeInspector().validate(expected: expected, selectedURL: access.url)
             }
+            // Where the folder really is now. The saved path goes stale when a
+            // drive mounts under another name, and eject handling matches on
+            // this as well so it still finds the job.
+            resolvedRootPaths[jobID] = access.url.standardizedFileURL.path
 
             let localCaseSensitive = job.localRoot.expectedVolume?.isCaseSensitive ?? false
             let store = try await objectStoreFactory.make(connection: connection)
-            async let localTask = stageLocalManifest(
-                jobID: job.id,
-                root: access.url,
-                caseSensitive: localCaseSensitive
-            )
-            async let remoteTask = stageRemoteManifest(
-                jobID: job.id,
-                store: store,
-                prefix: job.remotePrefix,
-                caseSensitive: localCaseSensitive
-            )
-            let (localScan, remoteScan) = try await (localTask, remoteTask)
-            var invalidRemoteKeyCount = remoteScan.invalidRemoteKeyCount
-            let caseCollisionCount = localScan.caseCollisionCount + remoteScan.caseCollisionCount
-            // A baseline is retired when its source path is absent, which is
-            // only evidence of deletion when the scan saw everything. A folder
-            // the scan could not read is absent too, and retiring its
-            // baselines turned the next successful scan into a first pairing
-            // that took whatever the destination held as the copy — so an edit
-            // made in between was never sent. The remote side has no partial
-            // scan: a listing either completes or throws.
-            let sourceScanIsComplete = job.direction == .download || localScan.skippedEntryCount == 0
-            if sourceScanIsComplete {
-                try await repository.pruneBaselinesAbsentFromManifest(
+            var invalidRemoteKeyCount = cachedScan?.invalidRemoteKeys ?? 0
+            var caseCollisionCount = cachedScan?.caseCollisions ?? 0
+            var destinationConflictCount = cachedScan?.destinationConflicts ?? 0
+            let destinationBytesAtScan: Int64
+            let queue: TransferQueueSummary
+            if scans {
+                async let localTask = stageLocalManifest(
                     jobID: job.id,
-                    side: job.direction == .upload ? .local : .remote,
-                    generation: job.direction == .upload ? localScan.generation : remoteScan.generation
+                    root: access.url,
+                    caseSensitive: localCaseSensitive
                 )
-            }
+                async let remoteTask = stageRemoteManifest(
+                    jobID: job.id,
+                    store: store,
+                    prefix: job.remotePrefix,
+                    caseSensitive: localCaseSensitive
+                )
+                let (localScan, remoteScan) = try await (localTask, remoteTask)
+                invalidRemoteKeyCount = remoteScan.invalidRemoteKeyCount
+                caseCollisionCount = localScan.caseCollisionCount + remoteScan.caseCollisionCount
+                // A baseline is retired when its source path is absent, which is
+                // only evidence of deletion when the scan saw everything. A folder
+                // the scan could not read is absent too, and retiring its
+                // baselines turned the next successful scan into a first pairing
+                // that took whatever the destination held as the copy — so an edit
+                // made in between was never sent. The remote side has no partial
+                // scan: a listing either completes or throws.
+                let sourceScanIsComplete = job.direction == .download || localScan.skippedEntryCount == 0
+                if sourceScanIsComplete {
+                    try await repository.pruneBaselinesAbsentFromManifest(
+                        jobID: job.id,
+                        side: job.direction == .upload ? .local : .remote,
+                        generation: job.direction == .upload ? localScan.generation : remoteScan.generation
+                    )
+                }
 
-            let reconciliationPageSize = 512
-            var reconciliationCursor: String?
-            var alreadyPresentCount = 0
-            var destinationConflictCount = 0
-            var supersededDestinationBytes: Int64 = 0
-            var newlyQueuedCount = 0
-            // A bounded sample makes detection visible without letting an
-            // initial multi-million-file pairing grow the snapshot in memory.
-            var recentlyQueuedPaths: [String] = []
-            while true {
-                try Task.checkCancellation()
-                let rows = try await repository.reconciliationRows(
-                    jobID: job.id,
-                    direction: job.direction,
-                    localGeneration: localScan.generation,
-                    remoteGeneration: remoteScan.generation,
-                    localCaseSensitive: localCaseSensitive,
-                    after: reconciliationCursor,
-                    limit: reconciliationPageSize
-                )
-                guard !rows.isEmpty else { break }
-                var plans: [TransferPlan] = []
-                var adoptions: [ReconciliationBaseline] = []
-                var obsoleteTransferPaths: [String] = []
-                plans.reserveCapacity(rows.count)
-                adoptions.reserveCapacity(rows.count)
-                obsoleteTransferPaths.reserveCapacity(rows.count)
-                for row in rows {
-                    // An ambiguous pairing on either side is skipped whole,
-                    // and any transfer already queued for it is discarded
-                    // before it can run. A local collision is the dangerous
-                    // one: without this, the second of two files that differ
-                    // only by capitalization is handed the first one's remote
-                    // key below and uploaded over its contents.
-                    if row.hasRemotePathCollision || row.hasLocalPathCollision {
-                        obsoleteTransferPaths.append(row.relativePath)
-                        continue
-                    }
-                    if job.direction == .upload {
-                        let key = Reconciler.remoteKey(relativePath: row.relativePath, prefix: job.remotePrefix)
-                        guard Reconciler.isValidRemoteKey(key) else {
-                            invalidRemoteKeyCount += 1
+                let reconciliationPageSize = 512
+                var reconciliationCursor: String?
+                var alreadyPresentCount = 0
+                var supersededDestinationBytes: Int64 = 0
+                var newlyQueuedCount = 0
+                // A bounded sample makes detection visible without letting an
+                // initial multi-million-file pairing grow the snapshot in memory.
+                var recentlyQueuedPaths: [String] = []
+                while true {
+                    try Task.checkCancellation()
+                    let rows = try await repository.reconciliationRows(
+                        jobID: job.id,
+                        direction: job.direction,
+                        localGeneration: localScan.generation,
+                        remoteGeneration: remoteScan.generation,
+                        localCaseSensitive: localCaseSensitive,
+                        after: reconciliationCursor,
+                        limit: reconciliationPageSize
+                    )
+                    guard !rows.isEmpty else { break }
+                    var plans: [TransferPlan] = []
+                    var adoptions: [ReconciliationBaseline] = []
+                    var obsoleteTransferPaths: [String] = []
+                    plans.reserveCapacity(rows.count)
+                    adoptions.reserveCapacity(rows.count)
+                    obsoleteTransferPaths.reserveCapacity(rows.count)
+                    for row in rows {
+                        // An ambiguous pairing on either side is skipped whole,
+                        // and any transfer already queued for it is discarded
+                        // before it can run. A local collision is the dangerous
+                        // one: without this, the second of two files that differ
+                        // only by capitalization is handed the first one's remote
+                        // key below and uploaded over its contents.
+                        if row.hasRemotePathCollision || row.hasLocalPathCollision {
                             obsoleteTransferPaths.append(row.relativePath)
                             continue
                         }
-                    }
-                    // A first pairing with a visibly different file on the
-                    // other side: neither adopted as a copy nor overwritten.
-                    // Anything already queued for the path is withdrawn too,
-                    // because it was planned before that file was seen.
-                    if reconciler.isConflictingExistingDestination(
-                        local: row.local,
-                        remote: row.remote,
-                        baseline: row.baseline
-                    ) {
-                        destinationConflictCount += 1
-                        obsoleteTransferPaths.append(row.relativePath)
-                        continue
-                    }
-                    if let adoption = reconciler.initialAdoptionBaseline(
-                        relativePath: row.relativePath,
-                        local: row.local,
-                        remote: row.remote,
-                        existingBaseline: row.baseline
-                    ) {
-                        adoptions.append(adoption)
-                        alreadyPresentCount += 1
-                        continue
-                    }
-                    let remoteKeyOverride: String?
-                    if job.direction == .upload, !localCaseSensitive, let remote = row.remote,
-                       Reconciler.relativePath(for: remote.key, prefix: job.remotePrefix) != row.relativePath {
-                        remoteKeyOverride = remote.key
-                    } else {
-                        remoteKeyOverride = nil
-                    }
-                    if let plan = reconciler.transferPlan(
-                        direction: job.direction,
-                        prefix: job.remotePrefix,
-                        relativePath: row.relativePath,
-                        local: row.local,
-                        remote: row.remote,
-                        baseline: row.baseline,
-                        remoteKeyOverride: remoteKeyOverride
-                    ) {
-                        plans.append(plan)
-                        // Whatever this transfer lands on is about to be
-                        // replaced, so it is not content the destination
-                        // already has. Counting it would put one file at both
-                        // ends of the storage balance and stretch the total.
-                        supersededDestinationBytes += (
-                            job.direction == .upload ? row.remote?.size : row.local?.size
-                        ) ?? 0
-                    } else if row.local != nil, row.remote != nil {
-                        alreadyPresentCount += 1
-                        obsoleteTransferPaths.append(row.relativePath)
-                    }
-                }
-                if !adoptions.isEmpty {
-                    // A previous build may already have staged multipart work
-                    // for a path that is now being adopted. Abort it before the
-                    // durable queue row is removed so it does not leak remotely.
-                    let staleTransfers = try await repository.transfers(
-                        jobID: job.id,
-                        relativePaths: adoptions.map(\.relativePath)
-                    )
-                    for stale in staleTransfers {
-                        if let uploadID = stale.multipartUploadID {
-                            try? await store.abortMultipartUpload(
-                                key: stale.remoteKey,
-                                uploadID: uploadID
-                            )
+                        if job.direction == .upload {
+                            let key = Reconciler.remoteKey(relativePath: row.relativePath, prefix: job.remotePrefix)
+                            guard Reconciler.isValidRemoteKey(key) else {
+                                invalidRemoteKeyCount += 1
+                                obsoleteTransferPaths.append(row.relativePath)
+                                continue
+                            }
+                        }
+                        // A first pairing with a visibly different file on the
+                        // other side: neither adopted as a copy nor overwritten.
+                        // Anything already queued for the path is withdrawn too,
+                        // because it was planned before that file was seen.
+                        if reconciler.isConflictingExistingDestination(
+                            local: row.local,
+                            remote: row.remote,
+                            baseline: row.baseline
+                        ) {
+                            destinationConflictCount += 1
+                            obsoleteTransferPaths.append(row.relativePath)
+                            continue
+                        }
+                        // The destination changed since StorageSync last copied to
+                        // it while the source did not. Copying again would
+                        // overwrite that change — someone's edit to a restored
+                        // photo, or another writer's object in the bucket — on
+                        // nothing but StorageSync's say-so. A change that kept the
+                        // size (a timestamp moved, an object re-encrypted in place)
+                        // is taken as the current copy; any other is reported.
+                        switch reconciler.destinationDrift(
+                            direction: job.direction,
+                            local: row.local,
+                            remote: row.remote,
+                            baseline: row.baseline
+                        ) {
+                        case .refreshed(let baseline):
+                            adoptions.append(baseline)
+                            alreadyPresentCount += 1
+                            continue
+                        case .conflict:
+                            destinationConflictCount += 1
+                            obsoleteTransferPaths.append(row.relativePath)
+                            continue
+                        case .unchanged:
+                            break
+                        }
+                        if let adoption = reconciler.initialAdoptionBaseline(
+                            relativePath: row.relativePath,
+                            local: row.local,
+                            remote: row.remote,
+                            existingBaseline: row.baseline
+                        ) {
+                            adoptions.append(adoption)
+                            alreadyPresentCount += 1
+                            continue
+                        }
+                        let remoteKeyOverride: String?
+                        if job.direction == .upload, !localCaseSensitive, let remote = row.remote,
+                           Reconciler.relativePath(for: remote.key, prefix: job.remotePrefix) != row.relativePath {
+                            remoteKeyOverride = remote.key
+                        } else {
+                            remoteKeyOverride = nil
+                        }
+                        if let plan = reconciler.transferPlan(
+                            direction: job.direction,
+                            prefix: job.remotePrefix,
+                            relativePath: row.relativePath,
+                            local: row.local,
+                            remote: row.remote,
+                            baseline: row.baseline,
+                            remoteKeyOverride: remoteKeyOverride
+                        ) {
+                            plans.append(plan)
+                            // Whatever this transfer lands on is about to be
+                            // replaced, so it is not content the destination
+                            // already has. Counting it would put one file at both
+                            // ends of the storage balance and stretch the total.
+                            supersededDestinationBytes += (
+                                job.direction == .upload ? row.remote?.size : row.local?.size
+                            ) ?? 0
+                        } else if row.local != nil, row.remote != nil {
+                            alreadyPresentCount += 1
+                            obsoleteTransferPaths.append(row.relativePath)
                         }
                     }
-                    try await repository.adoptExistingDestinations(adoptions, jobID: job.id)
-                }
-                if !obsoleteTransferPaths.isEmpty {
-                    let obsolete = try await repository.transfers(
-                        jobID: job.id,
-                        relativePaths: obsoleteTransferPaths
-                    )
-                    for transfer in obsolete {
-                        if let uploadID = transfer.multipartUploadID {
-                            try? await store.abortMultipartUpload(
-                                key: transfer.remoteKey,
-                                uploadID: uploadID
-                            )
-                        }
-                    }
-                    // Every already-present path lands in `obsoleteTransferPaths`,
-                    // which in a caught-up sync is the entire library. Only the
-                    // paths that actually have a queue row need deleting, and the
-                    // query above already named them, so the steady-state cost of
-                    // a cycle stays proportional to outstanding work rather than
-                    // to the number of files being watched.
-                    let pathsWithQueuedWork = Array(Set(obsolete.map(\.relativePath)))
-                    if !pathsWithQueuedWork.isEmpty {
-                        try await repository.discardTransfers(
+                    if !adoptions.isEmpty {
+                        // A previous build may already have staged multipart work
+                        // for a path that is now being adopted. Abort it before the
+                        // durable queue row is removed so it does not leak remotely.
+                        let staleTransfers = try await repository.transfers(
                             jobID: job.id,
-                            relativePaths: pathsWithQueuedWork
+                            relativePaths: adoptions.map(\.relativePath)
                         )
+                        for stale in staleTransfers {
+                            if let uploadID = stale.multipartUploadID {
+                                try? await store.abortMultipartUpload(
+                                    key: stale.remoteKey,
+                                    uploadID: uploadID
+                                )
+                            }
+                        }
+                        try await repository.adoptExistingDestinations(adoptions, jobID: job.id)
                     }
+                    if !obsoleteTransferPaths.isEmpty {
+                        let obsolete = try await repository.transfers(
+                            jobID: job.id,
+                            relativePaths: obsoleteTransferPaths
+                        )
+                        for transfer in obsolete {
+                            if let uploadID = transfer.multipartUploadID {
+                                try? await store.abortMultipartUpload(
+                                    key: transfer.remoteKey,
+                                    uploadID: uploadID
+                                )
+                            }
+                        }
+                        // Every already-present path lands in `obsoleteTransferPaths`,
+                        // which in a caught-up sync is the entire library. Only the
+                        // paths that actually have a queue row need deleting, and the
+                        // query above already named them, so the steady-state cost of
+                        // a cycle stays proportional to outstanding work rather than
+                        // to the number of files being watched.
+                        let pathsWithQueuedWork = Array(Set(obsolete.map(\.relativePath)))
+                        if !pathsWithQueuedWork.isEmpty {
+                            try await repository.discardTransfers(
+                                jobID: job.id,
+                                relativePaths: pathsWithQueuedWork
+                            )
+                        }
+                    }
+                    if !plans.isEmpty {
+                        // Enqueueing replaces a path's finished, failed or
+                        // superseded row with a fresh one. A failed upload's row
+                        // can still name an open multipart upload, which the
+                        // provider keeps — and bills for — until it is aborted.
+                        let replaced = try await repository.transfers(
+                            jobID: job.id,
+                            relativePaths: plans.map(\.relativePath)
+                        )
+                        for stale in replaced where Self.isTerminal(stale.status) {
+                            if let uploadID = stale.multipartUploadID {
+                                try? await store.abortMultipartUpload(key: stale.remoteKey, uploadID: uploadID)
+                            }
+                        }
+                    }
+                    let enqueuedPaths = try await repository.enqueueTransfersIfNeeded(plans, jobID: job.id)
+                    newlyQueuedCount += enqueuedPaths.count
+                    for path in enqueuedPaths {
+                        recentlyQueuedPaths.append(path)
+                        if recentlyQueuedPaths.count > 3 { recentlyQueuedPaths.removeFirst() }
+                    }
+                    reconciliationCursor = rows.last?.relativePath
+                    if rows.count < reconciliationPageSize { break }
                 }
-                let enqueuedPaths = try await repository.enqueueTransfersIfNeeded(plans, jobID: job.id)
-                newlyQueuedCount += enqueuedPaths.count
-                for path in enqueuedPaths {
-                    recentlyQueuedPaths.append(path)
-                    if recentlyQueuedPaths.count > 3 { recentlyQueuedPaths.removeFirst() }
-                }
-                reconciliationCursor = rows.last?.relativePath
-                if rows.count < reconciliationPageSize { break }
-            }
 
-            let queue = try await repository.activeTransferSummary(jobID: job.id)
+                lastScanNotices[jobID] = ScanNotices(
+                    invalidRemoteKeys: invalidRemoteKeyCount,
+                    caseCollisions: caseCollisionCount,
+                    destinationConflicts: destinationConflictCount
+                )
+                await sweepOrphanedPartials(beneath: access.url)
+
+                queue = try await repository.activeTransferSummary(jobID: job.id)
+                snapshot.sourceFilesFound = job.direction == .upload
+                    ? localScan.entryCount
+                    : remoteScan.entryCount
+                snapshot.destinationFilesFound = job.direction == .upload
+                    ? remoteScan.entryCount
+                    : localScan.entryCount
+                snapshot.filesAlreadyPresent = alreadyPresentCount
+                destinationBytesAtScan = max(
+                    0,
+                    (job.direction == .upload ? remoteScan.byteCount : localScan.byteCount)
+                        - supersededDestinationBytes
+                )
+                snapshot.sourceBytesFound = job.direction == .upload
+                    ? localScan.byteCount
+                    : remoteScan.byteCount
+                if newlyQueuedCount > 0 {
+                    snapshot.recentlyQueuedCount = newlyQueuedCount
+                    snapshot.recentlyQueuedPaths = recentlyQueuedPaths
+                    snapshot.recentlyQueuedAt = Date()
+                } else if queue.count == 0 {
+                    snapshot.recentlyQueuedCount = nil
+                    snapshot.recentlyQueuedPaths = nil
+                    snapshot.recentlyQueuedAt = nil
+                }
+            } else {
+                queue = try await repository.activeTransferSummary(jobID: job.id)
+                // Everything already at the destination, including what earlier
+                // runs moved, was folded into this when the last cycle ended.
+                destinationBytesAtScan = max(0, snapshot.destinationBytesInPlace ?? 0)
+            }
             snapshot.phase = queue.count == 0 ? .watching : .transferring
             snapshot.filesTotal = queue.count
             snapshot.bytesTotal = queue.totalBytes
             snapshot.bytesCompleted = queue.completedBytes
-            snapshot.sourceFilesFound = job.direction == .upload
-                ? localScan.entryCount
-                : remoteScan.entryCount
-            snapshot.destinationFilesFound = job.direction == .upload
-                ? remoteScan.entryCount
-                : localScan.entryCount
-            snapshot.filesAlreadyPresent = alreadyPresentCount
-            let destinationBytesAtScan = max(
-                0,
-                (job.direction == .upload ? remoteScan.byteCount : localScan.byteCount)
-                    - supersededDestinationBytes
-            )
-            snapshot.sourceBytesFound = job.direction == .upload
-                ? localScan.byteCount
-                : remoteScan.byteCount
             snapshot.destinationBytesInPlace = destinationBytesAtScan
             snapshot.isRescanPending = pendingWakeJobIDs.contains(job.id)
-            if newlyQueuedCount > 0 {
-                snapshot.recentlyQueuedCount = newlyQueuedCount
-                snapshot.recentlyQueuedPaths = recentlyQueuedPaths
-                snapshot.recentlyQueuedAt = Date()
-            } else if queue.count == 0 {
-                snapshot.recentlyQueuedCount = nil
-                snapshot.recentlyQueuedPaths = nil
-                snapshot.recentlyQueuedAt = nil
-            }
             // Files that fail outright are counted rather than allowed to stop
             // the run, so the headline has to be rebuilt as they accumulate.
             var failedFileCount = 0
@@ -1102,7 +1273,8 @@ public actor SyncCoordinator {
             let executor = TransferExecutor(
                 repository: repository,
                 objectStore: store,
-                transferPolicy: transferPolicy
+                transferPolicy: transferPolicy,
+                verifiesETagDigests: Self.isAmazonS3(connection.endpoint)
             )
             let maximumParallelFiles = max(1, transferPolicy.maximumConcurrentFiles)
             let transferBatchSize = max(16, maximumParallelFiles * 4)
@@ -1117,11 +1289,29 @@ public actor SyncCoordinator {
                 // from being admitted, which bounds rescan latency without
                 // losing a part checkpoint.
                 if pendingWakeJobIDs.contains(job.id) { break }
-                let transfers = try await repository.runnableTransfers(
+                let fetched = try await repository.runnableTransfers(
                     jobID: job.id,
                     limit: transferBatchSize
                 )
-                guard !transfers.isEmpty else { break }
+                guard !fetched.isEmpty else { break }
+                // Work queued for a name StorageSync now ignores — Finder's
+                // .DS_Store, Windows' Thumbs.db — before it was ignored. The
+                // scan no longer lists these paths, so nothing else would
+                // ever withdraw them.
+                let ignored = fetched.filter { IgnoredName.isIgnoredPath($0.relativePath) }
+                if !ignored.isEmpty {
+                    for transfer in ignored {
+                        if let uploadID = transfer.multipartUploadID {
+                            try? await store.abortMultipartUpload(key: transfer.remoteKey, uploadID: uploadID)
+                        }
+                    }
+                    try await repository.discardTransfers(
+                        jobID: job.id,
+                        relativePaths: ignored.map(\.relativePath)
+                    )
+                }
+                let transfers = fetched.filter { !IgnoredName.isIgnoredPath($0.relativePath) }
+                guard !transfers.isEmpty else { continue }
                 for transfer in transfers { await progressAccumulator.register(transfer) }
                 snapshot.currentRelativePath = transfers.first?.relativePath
                 try await repository.setSnapshot(snapshot)
@@ -1196,10 +1386,18 @@ public actor SyncCoordinator {
                         case .cancelled:
                             break
                         case .waiting(let blocker, let message):
+                            // Nothing new is started, but what is already in
+                            // flight is left to finish. Cancelling it threw
+                            // away a part that might be minutes from done
+                            // whenever any one file hit a brief error; if the
+                            // whole network or drive is really gone, those
+                            // transfers fail and park themselves soon enough.
                             snapshot.blockers.insert(blocker)
                             snapshot.message = message
                             shouldStopScheduling = true
-                            group.cancelAll()
+                        case .retryingFile:
+                            // One file waits for its own retry. The job is fine.
+                            break
                         case .attention(let blocker, let message):
                             if let blocker {
                                 // A blocker names something the whole job runs
@@ -1523,7 +1721,9 @@ public actor SyncCoordinator {
                     invalidRemoteKeyCount += 1
                     continue
                 }
-                if Reconciler.isReservedInternalPath(relativePath) { continue }
+                if Reconciler.isReservedInternalPath(relativePath) || IgnoredName.isIgnoredPath(relativePath) {
+                    continue
+                }
                 guard Reconciler.isSafeRelativePath(relativePath) else {
                     invalidRemoteKeyCount += 1
                     continue
@@ -1587,7 +1787,7 @@ public actor SyncCoordinator {
     }
 
     private nonisolated static func removeDownloadPartials(
-        for transfers: [TransferRecord],
+        named transferIDs: [TransferID],
         beneath root: URL
     ) {
         let partialDirectory = root
@@ -1598,9 +1798,9 @@ public actor SyncCoordinator {
         if (try? FileManager.default.destinationOfSymbolicLink(atPath: partialDirectory.path)) != nil {
             return
         }
-        for transfer in transfers where transfer.kind == .download {
+        for transferID in transferIDs {
             let partial = partialDirectory
-                .appendingPathComponent(transfer.id.description + ".partial", isDirectory: false)
+                .appendingPathComponent(transferID.description + ".partial", isDirectory: false)
                 .standardizedFileURL
             guard partial.deletingLastPathComponent() == partialDirectory,
                   (try? FileManager.default.destinationOfSymbolicLink(atPath: partial.path)) == nil else {
