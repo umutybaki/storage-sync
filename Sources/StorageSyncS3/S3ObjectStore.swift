@@ -103,16 +103,14 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         precondition: WritePrecondition,
         progress: @escaping UploadProgressHandler
     ) async throws -> RemoteObject {
-        try await withPreconditionFallback(precondition) { condition in
-            let response = try await send(
-                method: "PUT",
-                key: key,
-                headers: metadataHeaders(metadata).merging(Self.headers(for: condition)) { _, new in new },
-                body: data,
-                uploadProgress: progress
-            )
-            return remoteObject(key: key, response: response.response, authoritativeSize: Int64(data.count))
-        }
+        let response = try await send(
+            method: "PUT",
+            key: key,
+            headers: metadataHeaders(metadata).merging(Self.headers(for: precondition)) { _, new in new },
+            body: data,
+            uploadProgress: progress
+        )
+        return remoteObject(key: key, response: response.response, authoritativeSize: Int64(data.count))
     }
 
     public func createMultipartUpload(key: String, metadata: [String: String]) async throws -> String {
@@ -169,7 +167,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
     }
 
     public func listParts(key: String, uploadID: String) async throws -> [UploadedPart] {
-        var marker: String?
+        var marker: Int?
         // Keyed by part number rather than accumulated flat: a provider whose
         // paging overlaps lists the same part on two consecutive pages, and the
         // marker guard below only catches a repeated *marker*. Callers index
@@ -182,18 +180,18 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
                 URLQueryItem(name: "uploadId", value: uploadID),
                 URLQueryItem(name: "max-parts", value: "1000")
             ]
-            if let marker { query.append(URLQueryItem(name: "part-number-marker", value: marker)) }
+            if let marker { query.append(URLQueryItem(name: "part-number-marker", value: String(marker))) }
             let response = try await send(method: "GET", key: key, query: query)
             let page = try S3XML.parseParts(response.data)
             for part in page.parts { partsByNumber[part.number] = part }
             guard page.isTruncated else { break }
             guard let next = page.nextPartNumberMarker ?? page.parts.last?.number,
-                  String(next) != marker else {
+                  next > (marker ?? 0), next <= 10_000 else {
                 throw ObjectStoreError.invalidResponse(
                     "The S3 service returned a truncated multipart listing without a usable continuation marker."
                 )
             }
-            marker = String(next)
+            marker = next
         }
         return partsByNumber.values.sorted { $0.number < $1.number }
     }
@@ -213,17 +211,15 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         precondition: WritePrecondition
     ) async throws -> RemoteObject {
         let body = S3XML.completedPartsDocument(parts)
-        try await withPreconditionFallback(precondition) { condition in
-            let completion = try await send(
-                method: "POST",
-                key: key,
-                query: [URLQueryItem(name: "uploadId", value: uploadID)],
-                headers: ["Content-Type": "application/xml"].merging(Self.headers(for: condition)) { _, new in new },
-                body: body
-            )
-            if let serviceError = S3XML.embeddedError(completion.data) {
-                throw classify(serviceError: serviceError, statusCode: completion.response.statusCode)
-            }
+        let completion = try await send(
+            method: "POST",
+            key: key,
+            query: [URLQueryItem(name: "uploadId", value: uploadID)],
+            headers: ["Content-Type": "application/xml"].merging(Self.headers(for: precondition)) { _, new in new },
+            body: body
+        )
+        if let serviceError = S3XML.embeddedError(completion.data) {
+            throw classify(serviceError: serviceError, statusCode: completion.response.statusCode)
         }
         guard let object = try await head(key: key) else {
             throw ObjectStoreError.invalidResponse("The completed S3 object could not be read back.")
@@ -243,23 +239,6 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         }
     }
 
-    /// AWS has checked conditional writes since 2024, and most S3-compatible
-    /// services either check them too or ignore the header. One that refuses
-    /// the request outright as not implemented gets it again without the
-    /// condition — the unconditional write every store made before — rather
-    /// than having every upload fail.
-    private func withPreconditionFallback<T>(
-        _ precondition: WritePrecondition,
-        _ operation: (WritePrecondition) async throws -> T
-    ) async throws -> T {
-        do {
-            return try await operation(precondition)
-        } catch ObjectStoreError.incompatible(let message)
-            where precondition != .none && message.hasPrefix(Self.notImplementedPrefix) {
-            return try await operation(.none)
-        }
-    }
-
     private static let notImplementedPrefix = "Not implemented: "
 
     public func abortMultipartUpload(key: String, uploadID: String) async throws {
@@ -275,22 +254,17 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             return try await send(method: "GET", key: key).data
         }
         guard !range.isEmpty else { return Data() }
-        let response = try await send(
-            method: "GET",
-            key: key,
-            headers: ["Range": "bytes=\(range.lowerBound)-\(range.upperBound - 1)"]
-        )
-        // A provider that does not implement Range answers 200 with the whole
-        // object, and `validate` accepts any 2xx. Left alone that surfaces as a
-        // short read on every part of every multi-part download — one confusing
-        // byte-count failure per file — instead of naming the one thing actually
-        // wrong. Ranged reads are how a large file is fetched and resumed at all.
-        guard satisfiesRequestedRange(response.response, range: range) else {
-            throw ObjectStoreError.incompatible(
-                "The S3 provider ignored a byte-range request and returned the whole object. "
-                    + "StorageSync needs ranged reads to download and resume large files."
-            )
+        return try await getRange(key: key, range: range, matchingETag: nil)
+    }
+
+    public func getRange(key: String, range: Range<Int64>, matchingETag: String?) async throws -> Data {
+        guard range.lowerBound >= 0 else { throw ObjectStoreError.invalidResponse("Invalid byte range.") }
+        guard !range.isEmpty else { return Data() }
+        var headers = ["Range": "bytes=\(range.lowerBound)-\(range.upperBound - 1)", "Accept-Encoding": "identity"]
+        if let eTag = RemoteObject.comparableETag(matchingETag) {
+            headers["If-Match"] = "\"\(eTag)\""
         }
+        let response = try await send(method: "GET", key: key, headers: headers, range: range)
         return response.data
     }
 
@@ -298,12 +272,12 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
     /// still describes exactly the requested window in `Content-Range` did
     /// honour the request, so it is accepted; one that ignored the header
     /// describes nothing.
-    private func satisfiesRequestedRange(_ response: HTTPURLResponse, range: Range<Int64>) -> Bool {
-        if response.statusCode == 206 { return true }
+    fileprivate static func satisfiesRequestedRange(_ response: HTTPURLResponse, range: Range<Int64>) -> Bool {
+        guard response.statusCode == 200 || response.statusCode == 206 else { return false }
         guard let contentRange = response.value(forHTTPHeaderField: "Content-Range") else { return false }
-        return contentRange
-            .trimmingCharacters(in: .whitespaces)
-            .hasPrefix("bytes \(range.lowerBound)-\(range.upperBound - 1)/")
+        let pieces = contentRange.trimmingCharacters(in: .whitespaces).split(separator: "/", omittingEmptySubsequences: false)
+        guard pieces.count == 2, pieces[0].lowercased() == "bytes \(range.lowerBound)-\(range.upperBound - 1)" else { return false }
+        return pieces[1] == "*" || Int64(pieces[1]).map { $0 >= range.upperBound } == true
     }
 
     private func send(
@@ -312,7 +286,8 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
         query: [URLQueryItem] = [],
         headers: [String: String] = [:],
         body: Data = Data(),
-        uploadProgress: UploadProgressHandler? = nil
+        uploadProgress: UploadProgressHandler? = nil,
+        range: Range<Int64>? = nil
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         let url = try requestURL(key: key, query: query)
         var request = URLRequest(url: url, timeoutInterval: configuration.timeout)
@@ -329,7 +304,14 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
 
         do {
             let progressDelegate = uploadProgress.map(UploadRequestProgressDelegate.init(handler:))
-            let (data, urlResponse) = try await session.data(for: request, delegate: progressDelegate)
+            let data: Data
+            let urlResponse: URLResponse
+            if let range {
+                let reader = RangeResponseReader(range: range)
+                (data, urlResponse) = try await reader.read(request, from: session)
+            } else {
+                (data, urlResponse) = try await session.data(for: request, delegate: progressDelegate)
+            }
             guard let response = urlResponse as? HTTPURLResponse else {
                 throw ObjectStoreError.invalidResponse("The S3 endpoint returned a non-HTTP response.")
             }
@@ -343,6 +325,8 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             return (data, response)
         } catch let error as ObjectStoreError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as URLError {
             if error.code == .cancelled { throw CancellationError() }
             throw ObjectStoreError.transient(error.localizedDescription)
@@ -364,7 +348,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             components.host = configuration.bucket + "." + endpointHost
         }
         if let key, !key.isEmpty {
-            pathParts.append(contentsOf: key.split(separator: "/", omittingEmptySubsequences: false).map(String.init))
+            pathParts.append(contentsOf: Reconciler.pathComponents(key))
         }
         // Every segment is encoded with the same strict byte-wise rules SigV4
         // canonicalises with. `URLComponents.path` leaves characters such as
@@ -393,7 +377,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             }
             let message = errorMessage(data, fallback: "S3 returned HTTP \(response.statusCode).")
             switch response.statusCode {
-            case 412, 416:
+            case 409, 412, 416:
                 throw ObjectStoreError.objectChanged(message)
             case 501:
                 throw ObjectStoreError.incompatible(Self.notImplementedPrefix + message)
@@ -414,7 +398,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
     private func classify(serviceError: S3ServiceError, statusCode: Int) -> ObjectStoreError {
         switch serviceError.code {
         case "InternalError", "OperationAborted", "RequestTimeout", "ServiceUnavailable",
-             "SlowDown", "Throttling", "ThrottlingException", "ConditionalRequestConflict":
+             "SlowDown", "Throttling", "ThrottlingException":
             return .transient(serviceError.message)
         case "IncompleteBody", "XAmzContentSHA256Mismatch", "BadDigest":
             // HTTP 400, but about the bytes that arrived rather than the
@@ -428,7 +412,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             return .transient(
                 "\(serviceError.message) Check that this Mac sets its date and time automatically."
             )
-        case "PreconditionFailed":
+        case "PreconditionFailed", "ConditionalRequestConflict":
             return .objectChanged(serviceError.message)
         case "InvalidRange":
             // Only ranged reads send a range. One past the end means the object
@@ -456,7 +440,7 @@ public final class S3ObjectStore: ObjectStore, @unchecked Sendable {
             return .incompatible(serviceError.message)
         default:
             switch statusCode {
-            case 412, 416:
+            case 409, 412, 416:
                 return .objectChanged(serviceError.message)
             case 501:
                 return .incompatible(Self.notImplementedPrefix + serviceError.message)
@@ -548,5 +532,64 @@ private final class UploadRequestProgressDelegate: NSObject, URLSessionTaskDeleg
         totalBytesExpectedToSend: Int64
     ) {
         Task { await handler(totalBytesSent) }
+    }
+}
+
+// Data tasks with a completion handler buffer the entire response before returning.
+// A provider ignoring Range could send a multi-terabyte object for a single part.
+private final class RangeResponseReader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let range: Range<Int64>
+    private var body = Data()
+    private var failure: ObjectStoreError?
+    private let completion = AsyncThrowingStream<(Data, URLResponse), any Error>.makeStream(bufferingPolicy: .bufferingOldest(1))
+
+    init(range: Range<Int64>) {
+        self.range = range
+    }
+
+    func read(_ request: URLRequest, from session: URLSession) async throws -> (Data, URLResponse) {
+        let task = session.dataTask(with: request)
+        task.delegate = self
+        return try await withTaskCancellationHandler {
+            task.resume()
+            for try await result in completion.stream { return result }
+            throw CancellationError()
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
+        if let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+           !S3ObjectStore.satisfiesRequestedRange(http, range: range) {
+            failure = .incompatible("The S3 provider did not return the requested byte range.")
+            completionHandler(.cancel)
+        } else {
+            completionHandler(.allow)
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard failure == nil else { return }
+        let status = (dataTask.response as? HTTPURLResponse)?.statusCode ?? 0
+        let limit = (200..<300).contains(status) ? range.count : 64 * 1024
+        guard data.count <= limit - body.count else {
+            failure = .invalidResponse("The S3 response exceeded the requested size.")
+            dataTask.cancel()
+            return
+        }
+        body.append(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = failure as Error? ?? error {
+            completion.continuation.finish(throwing: error)
+        } else if let response = task.response {
+            completion.continuation.yield((body, response))
+            completion.continuation.finish()
+        } else {
+            completion.continuation.finish(throwing: ObjectStoreError.invalidResponse("Missing S3 response."))
+        }
     }
 }

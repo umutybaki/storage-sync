@@ -85,6 +85,7 @@ SDKROOT="${SDK_PATH}" \
 CLANG_MODULE_CACHE_PATH="${CLANG_CACHE}" \
 SWIFTPM_MODULECACHE_OVERRIDE="${MODULE_CACHE}" \
 swift build \
+    --build-system native \
     --disable-sandbox \
     --configuration release \
     --cache-path "${PACKAGE_CACHE}" \
@@ -93,6 +94,7 @@ swift build \
     --sdk "${SDK_PATH}"
 
 BIN_DIR=$(SDKROOT="${SDK_PATH}" SWIFTPM_MODULECACHE_OVERRIDE="${MODULE_CACHE}" swift build \
+    --build-system native \
     --disable-sandbox \
     --configuration release \
     --cache-path "${PACKAGE_CACHE}" \
@@ -100,6 +102,16 @@ BIN_DIR=$(SDKROOT="${SDK_PATH}" SWIFTPM_MODULECACHE_OVERRIDE="${MODULE_CACHE}" s
     --security-path "${PACKAGE_SECURITY}" \
     --sdk "${SDK_PATH}" \
     --show-bin-path)
+
+# Swift Build can ignore --sdk and stamp the deployment target as the SDK
+# version. Use SwiftPM's native build system above, and verify the result so
+# packaging cannot silently install an app with the wrong interface behavior.
+EXPECTED_SDK_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :Version' "${SDK_PATH}/SDKSettings.plist")"
+BUILT_SDK_VERSION="$(xcrun vtool -show-build "${BIN_DIR}/StorageSync" | awk '$1 == "sdk" { print $2; exit }')"
+if [[ "${BUILT_SDK_VERSION}" != "${EXPECTED_SDK_VERSION}" ]]; then
+    print -u2 "StorageSync was built with SDK ${BUILT_SDK_VERSION}; expected ${EXPECTED_SDK_VERSION}."
+    exit 1
+fi
 
 STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/storagesync-package.XXXXXX")
 trap 'rm -rf "${STAGE_DIR}"' EXIT

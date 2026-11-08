@@ -24,6 +24,7 @@ public enum SyncBlocker: String, Codable, Hashable, Sendable {
     case networkUnavailable
     case credentialsUnavailable
     case insufficientSpace
+    case providerIncompatible
 }
 
 public struct S3Connection: Codable, Hashable, Sendable, Identifiable {
@@ -131,7 +132,8 @@ public struct VolumeIdentity: Codable, Hashable, Sendable {
         if let rootMarker, let otherMarker = other.rootMarker {
             return rootMarker == otherMarker
         }
-        return !isRemovable
+        return persistentUUID == nil && rootMarker == nil && creationDate != nil
+            && filesystemType != nil && totalCapacity != nil && !isRemovable
             && !other.isRemovable
             && creationDate == other.creationDate
             && filesystemType == other.filesystemType
@@ -148,6 +150,8 @@ public struct SyncJob: Codable, Hashable, Sendable, Identifiable {
     public var remotePrefix: String
     public var deletionPolicy: DeletionPolicy
     public var isPaused: Bool
+    /// Changes only when the user explicitly selects a different folder pairing.
+    public var multipartGeneration: UUID?
     public let createdAt: Date
 
     public init(
@@ -173,8 +177,7 @@ public struct SyncJob: Codable, Hashable, Sendable, Identifiable {
     }
 
     public static func normalizedPrefix(_ prefix: String) -> String {
-        prefix
-            .split(separator: "/", omittingEmptySubsequences: true)
+        Reconciler.pathComponents(prefix).filter { !$0.isEmpty }
             .joined(separator: "/")
     }
 }
@@ -270,20 +273,16 @@ public struct RemoteObject: Codable, Hashable, Sendable {
         self.serverSideEncryption = serverSideEncryption
     }
 
-    /// An ETag in the one form two of them can be compared in.
-    ///
-    /// AWS quotes it in both the listing and the HEAD response, but S3-compatible
-    /// providers do not all agree: some drop the quotes in one place and not the
-    /// other, some prefix a weak `W/`, some change the hex case. Comparing the
-    /// raw strings then reads every object as changed since it was listed, and a
-    /// download that sees "changed" re-plans and rescans — forever.
+    /// Strong ETags identify bytes. Quoting is transport syntax, but case is
+    /// significant and a weak validator does not identify an exact representation.
     public static func comparableETag(_ eTag: String?) -> String? {
         guard var value = eTag?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
-        if value.hasPrefix("W/") || value.hasPrefix("w/") { value.removeFirst(2) }
+        guard !value.lowercased().hasPrefix("w/") else { return nil }
         if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
             value = String(value.dropFirst().dropLast())
         }
-        return value.isEmpty ? nil : value.lowercased()
+        guard !value.isEmpty, !value.contains("\""), value.utf8.allSatisfy({ $0 > 32 && $0 != 127 }) else { return nil }
+        return value
     }
 }
 
@@ -344,6 +343,7 @@ public struct TransferRecord: Codable, Hashable, Sendable, Identifiable {
     public var remoteSource: RemoteObject?
     public var remoteKey: String
     public var multipartUploadID: String?
+    public var multipartGeneration: UUID?
     public var temporaryPath: String?
     public var retryCount: Int
     public var nextAttemptAt: Date?
@@ -359,6 +359,8 @@ public struct TransferRecord: Codable, Hashable, Sendable, Identifiable {
     /// simply wrong fails every time, and used to be fetched again forever.
     /// Optional so queue rows written before this field still decode.
     public var integrityFailureCount: Int?
+    /// Saved before publishing a verified download so a restart can identify the installed bytes.
+    public var verifiedDownloadChecksum: String?
     public let createdAt: Date
     public var updatedAt: Date
 

@@ -88,7 +88,7 @@ public struct SigV4Signer: Sendable {
 
     private func canonicalURI(_ url: URL) -> String {
         let path = url.path.isEmpty ? "/" : url.path
-        return path.split(separator: "/", omittingEmptySubsequences: false)
+        return Reconciler.pathComponents(path)
             .map { AWSURIEncoder.encode(String($0)) }
             .joined(separator: "/")
     }

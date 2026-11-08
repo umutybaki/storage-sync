@@ -29,7 +29,7 @@ LaunchAgent / SyncCoordinator
 
 Each job is one-way: local to S3 or S3 to local. Reconciliation never creates a deletion plan.
 
-On the first pairing of a relative path, if both source and destination already contain that path, the coordinator records their observed fingerprints as the initial baseline and removes any obsolete queued copy. This lets StorageSync take over a half-completed archive without uploading or downloading the existing portion again. Once that baseline exists, later source changes are planned normally.
+On the first pairing of a relative path, if source and destination both contain a file of the same size there, the coordinator records their observed fingerprints as the initial baseline and removes any obsolete queued copy. This lets StorageSync take over a half-completed archive without uploading or downloading the existing portion again. Once that baseline exists, later source changes are planned normally.
 
 ## Credentials
 

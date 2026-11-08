@@ -110,79 +110,64 @@ public struct Reconciler: Sendable {
         baselines: [ReconciliationBaseline],
         localCaseSensitive: Bool = false
     ) -> ReconciliationResult {
-        let localByPath = Dictionary(uniqueKeysWithValues: localFiles.map { ($0.relativePath, $0) })
-        let baselineByPath = Dictionary(uniqueKeysWithValues: baselines.map { ($0.relativePath, $0) })
-        var remoteByPath: [String: RemoteObject] = [:]
+        func canonical(_ path: String) -> String { Self.canonicalLocalPath(path, caseSensitive: localCaseSensitive) }
+        let localByName = Dictionary(grouping: localFiles.filter {
+            Self.isSafeRelativePath($0.relativePath) && !IgnoredName.isIgnoredPath($0.relativePath)
+        }, by: { canonical($0.relativePath) })
+        let baselineByPath = Dictionary(baselines.map { (Data($0.relativePath.utf8), $0) }, uniquingKeysWith: { _, last in last })
+        var remoteByName: [String: [RemoteObject]] = [:]
         var invalidKeys: [String] = []
-        var canonicalOwners: [String: String] = [:]
-        var collidedCanonicalPaths: Set<String> = []
-        for object in remoteObjects {
-            guard let relativePath = Self.relativePath(for: object.key, prefix: prefix) else {
+        // Repeated pages may list one exact S3 key twice. Distinct byte spellings
+        // with the same local representation must remain distinct for collision detection.
+        let objects = Dictionary(remoteObjects.map { (Data($0.key.utf8), $0) }, uniquingKeysWith: { _, last in last })
+        for object in objects.values where !object.key.hasSuffix("/") {
+            guard let path = Self.relativePath(for: object.key, prefix: prefix) else {
                 if Self.belongsToPrefix(object.key, prefix: prefix) { invalidKeys.append(object.key) }
                 continue
             }
-            // StorageSync's own bookkeeping can exist below a paired parent
-            // folder (for example when another sync targets a nested folder).
-            // It is neither user content nor an unsafe user object, so ignore
-            // it without leaving a permanent warning in the parent sync.
-            if Self.isReservedInternalPath(relativePath) || IgnoredName.isIgnoredPath(relativePath) { continue }
-            guard Self.isSafeRelativePath(relativePath) else {
-                invalidKeys.append(object.key)
-                continue
-            }
-            if !localCaseSensitive {
-                let canonical = Self.canonicalLocalPath(relativePath)
-                if collidedCanonicalPaths.contains(canonical) {
-                    invalidKeys.append(object.key)
-                    continue
-                }
-                if let owner = canonicalOwners[canonical], owner != relativePath {
-                    if let displaced = remoteByPath.removeValue(forKey: owner) {
-                        invalidKeys.append(displaced.key)
+            if Self.isReservedInternalPath(path) || IgnoredName.isIgnoredPath(path) { continue }
+            guard Self.isSafeRelativePath(path), object.size >= 0 else { invalidKeys.append(object.key); continue }
+            remoteByName[canonical(path), default: []].append(object)
+        }
+        var ambiguous = Set(remoteByName.filter { $0.value.count > 1 }.keys)
+        ambiguous.formUnion(localByName.filter { $0.value.count > 1 }.keys)
+        if direction == .download {
+            for name in remoteByName.keys {
+                var ancestor = ""
+                for component in Self.pathComponents(name).dropLast() {
+                    ancestor += ancestor.isEmpty ? component : "/" + component
+                    if remoteByName[ancestor] != nil {
+                        ambiguous.insert(ancestor)
+                        ambiguous.insert(name)
                     }
-                    invalidKeys.append(object.key)
-                    collidedCanonicalPaths.insert(canonical)
-                    continue
                 }
-                canonicalOwners[canonical] = relativePath
-            }
-            remoteByPath[relativePath] = object
-        }
-
-        let transfers: [TransferPlan]
-        switch direction {
-        case .upload:
-            transfers = localByPath.keys.sorted().compactMap { path in
-                guard let local = localByPath[path] else { return nil }
-                let remote = remoteByPath[path]
-                let remoteKey = Self.remoteKey(relativePath: path, prefix: prefix)
-                guard Self.isValidRemoteKey(remoteKey) else {
-                    invalidKeys.append(remoteKey)
-                    return nil
-                }
-                return transferPlan(
-                    direction: direction,
-                    prefix: prefix,
-                    relativePath: path,
-                    local: local,
-                    remote: remote,
-                    baseline: baselineByPath[path]
-                )
-            }
-        case .download:
-            transfers = remoteByPath.keys.sorted().compactMap { path in
-                guard let remote = remoteByPath[path] else { return nil }
-                return transferPlan(
-                    direction: direction,
-                    prefix: prefix,
-                    relativePath: path,
-                    local: localByPath[path],
-                    remote: remote,
-                    baseline: baselineByPath[path]
-                )
             }
         }
-        return ReconciliationResult(transfers: transfers, invalidRemoteKeys: invalidKeys.sorted())
+        for name in ambiguous { invalidKeys += remoteByName[name]?.map(\.key) ?? [] }
+        let names = direction == .upload ? Array(localByName.keys) : Array(remoteByName.keys)
+        var transfers: [TransferPlan] = []
+        for name in names.sorted() where !ambiguous.contains(name) {
+            let local = localByName[name]?.first
+            let remote = remoteByName[name]?.first
+            let path: String
+            switch direction {
+            case .upload:
+                guard let local else { continue }
+                path = local.relativePath
+                let key = remote?.key ?? Self.remoteKey(relativePath: path, prefix: prefix)
+                guard Self.isValidRemoteKey(key) else { invalidKeys.append(key); continue }
+            case .download:
+                guard let remote, let relative = Self.relativePath(for: remote.key, prefix: prefix) else { continue }
+                path = relative
+            }
+            let baseline = baselineByPath[Data(path.utf8)]
+            if baseline == nil, local != nil, remote != nil { continue }
+            if let plan = transferPlan(direction: direction, prefix: prefix, relativePath: path,
+                                       local: local, remote: remote, baseline: baseline, remoteKeyOverride: remote?.key) {
+                transfers.append(plan)
+            }
+        }
+        return ReconciliationResult(transfers: transfers.sorted { $0.relativePath < $1.relativePath }, invalidRemoteKeys: invalidKeys.sorted())
     }
 
     /// Reconciles one already validated manifest row. This is also used by the
@@ -311,9 +296,15 @@ public struct Reconciler: Sendable {
         }
     }
 
+    /// POSIX treats byte 0x2f as a separator even when Unicode would combine
+    /// the slash with the first character of the next filename.
+    public static func pathComponents(_ path: String) -> [String] {
+        path.utf8.split(separator: 0x2f, omittingEmptySubsequences: false).map { String(decoding: $0, as: UTF8.self) }
+    }
+
     public static func isSafeRelativePath(_ path: String) -> Bool {
         guard !path.isEmpty, !path.hasPrefix("/"), !path.utf8.contains(0) else { return false }
-        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        let components = pathComponents(path)
         return components.allSatisfy {
             !$0.isEmpty
                 && $0 != "."
@@ -324,7 +315,7 @@ public struct Reconciler: Sendable {
     }
 
     public static func isReservedInternalPath(_ path: String) -> Bool {
-        path.split(separator: "/", omittingEmptySubsequences: false)
+        pathComponents(path)
             .contains(where: ReservedName.isReserved)
     }
 
@@ -341,8 +332,8 @@ public struct Reconciler: Sendable {
         let normalized = SyncJob.normalizedPrefix(prefix)
         guard !normalized.isEmpty else { return key }
         let expected = normalized + "/"
-        guard key.hasPrefix(expected) else { return nil }
-        return String(key.dropFirst(expected.count))
+        guard key.utf8.starts(with: expected.utf8) else { return nil }
+        return String(decoding: key.utf8.dropFirst(expected.utf8.count), as: UTF8.self)
     }
 
     private static func belongsToPrefix(_ key: String, prefix: String) -> Bool {
@@ -362,8 +353,10 @@ public struct Reconciler: Sendable {
     ///
     /// `en_US_POSIX` keeps the fold locale-independent, so a Turkish system
     /// locale cannot change how `I` and `i` compare.
-    public static func canonicalLocalPath(_ path: String) -> String {
-        path.precomposedStringWithCanonicalMapping.folding(
+    public static func canonicalLocalPath(_ path: String, caseSensitive: Bool = false) -> String {
+        let normalized = path.precomposedStringWithCanonicalMapping
+        guard !caseSensitive else { return normalized }
+        return normalized.folding(
             options: [.caseInsensitive],
             locale: Locale(identifier: "en_US_POSIX")
         )
@@ -380,6 +373,7 @@ public struct Reconciler: Sendable {
         if let baseline, local.representsSameContent(as: baseline.localFingerprint) {
             return true
         }
+        guard baseline == nil, remote.size == local.size else { return false }
         let recordedSize = remote.metadata["storagesync-source-size"].flatMap(Int64.init)
         let recordedTime = remote.metadata["storagesync-source-mtime-ns"].flatMap(Int64.init)
         return recordedSize == local.size && recordedTime == local.modificationTimeNanoseconds

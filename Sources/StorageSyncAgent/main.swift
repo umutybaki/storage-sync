@@ -16,11 +16,16 @@ enum AgentLog {
 final class AgentService: NSObject, StorageSyncAgentXPCProtocol, @unchecked Sendable {
     private let coordinator: SyncCoordinator
 
-    init(coordinator: SyncCoordinator) {
+    private let onRequest: @Sendable (NSXPCConnection) -> Void
+
+    init(coordinator: SyncCoordinator, onRequest: @escaping @Sendable (NSXPCConnection) -> Void) {
+        self.onRequest = onRequest
         self.coordinator = coordinator
     }
 
     func perform(commandData: Data, reply: @escaping (Data?, NSError?) -> Void) {
+        // Only a message delivered through the pinned requirement can register a subscriber.
+        if let connection = NSXPCConnection.current() { onRequest(connection) }
         let replyBox = ReplyBox(reply)
         Task {
             do {
@@ -218,7 +223,7 @@ final class AgentDelegate: NSObject, NSXPCListenerDelegate {
     private let activityBroadcaster = ActivityBroadcaster()
 
     init(coordinator: SyncCoordinator) {
-        service = AgentService(coordinator: coordinator)
+        service = AgentService(coordinator: coordinator) { [activityBroadcaster] in activityBroadcaster.add($0) }
         peerValidator = XPCPeerValidator()
         if peerValidator == nil {
             // Without a requirement to check against, every connection is
@@ -248,7 +253,6 @@ final class AgentDelegate: NSObject, NSXPCListenerDelegate {
         newConnection.interruptionHandler = { [weak broadcaster = activityBroadcaster] in
             broadcaster?.remove(identifier)
         }
-        activityBroadcaster.add(newConnection)
         newConnection.resume()
         return true
     }

@@ -29,18 +29,19 @@ public struct TransferPolicy: Sendable, Equatable {
 
     public func partSize(forFileSize fileSize: Int64) throws -> Int64 {
         guard fileSize >= 0 else { throw TransferPolicyError.invalidFileSize }
+        guard maximumPartCount > 0, preferredPartSize > 0, maximumPartSize > 0 else { throw TransferPolicyError.invalidLimits }
         guard fileSize <= maximumObjectSize else { throw TransferPolicyError.objectTooLarge }
         let minimumForPartLimit = fileSize == 0
             ? 0
-            : (fileSize + Int64(maximumPartCount) - 1) / Int64(maximumPartCount)
+            : 1 + (fileSize - 1) / Int64(maximumPartCount)
         let selected = max(preferredPartSize, minimumForPartLimit)
         guard selected <= maximumPartSize else { throw TransferPolicyError.objectTooLarge }
         return selected
     }
 
     public func parts(forFileSize fileSize: Int64, transferID: TransferID) throws -> [TransferPart] {
-        guard fileSize > 0 else { return [] }
         let partSize = try partSize(forFileSize: fileSize)
+        guard fileSize > 0 else { return [] }
         var parts: [TransferPart] = []
         var offset: Int64 = 0
         var number = 1
@@ -65,10 +66,12 @@ public struct TransferPolicy: Sendable, Equatable {
 
 public enum TransferPolicyError: Error, LocalizedError, Equatable {
     case invalidFileSize
+    case invalidLimits
     case objectTooLarge
 
     public var errorDescription: String? {
         switch self {
+        case .invalidLimits: "Multipart limits must be positive."
         case .invalidFileSize: "The file has an invalid size."
         case .objectTooLarge: "The file exceeds the S3-compatible provider's object-size or multipart limits."
         }

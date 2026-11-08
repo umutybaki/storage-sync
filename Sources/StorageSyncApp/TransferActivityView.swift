@@ -320,6 +320,7 @@ extension TransferActivityItem {
                 switch waitingBlocker {
                 case .networkUnavailable: return "Waiting for internet"
                 case .localVolumeUnavailable: return "Waiting for drive"
+                case .providerIncompatible: return "Unsupported S3 provider"
                 case .insufficientSpace: return "Not enough space"
                 case .credentialsUnavailable: return "Sign in again"
                 }

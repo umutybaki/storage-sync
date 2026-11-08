@@ -190,15 +190,18 @@ public struct TransferExecutor: Sendable {
         } catch is CancellationError {
             await deferAfterCancellation(&transfer)
             return .cancelled
+        } catch ObjectStoreError.notFound where transfer.kind == .upload && transfer.remoteSource != nil && transfer.multipartUploadID == nil {
+            await mark(&transfer, status: .superseded, message: "The listed object disappeared before the conditional write.")
+            return .superseded(nil)
         } catch TransferExecutionError.sourceChanged {
             await abortIfNecessary(transfer)
-            await discardCheckpoints(for: transfer, root: root)
+            await discardCheckpoints(for: transfer, job: job, root: root)
             transfer.multipartUploadID = nil
             await mark(&transfer, status: .superseded, message: TransferExecutionError.sourceChanged.localizedDescription)
             return .superseded(TransferExecutionError.sourceChanged.localizedDescription)
         } catch TransferExecutionError.sourceIdentityChanged {
             await abortIfNecessary(transfer)
-            await discardCheckpoints(for: transfer, root: root)
+            await discardCheckpoints(for: transfer, job: job, root: root)
             transfer.multipartUploadID = nil
             await mark(
                 &transfer,
@@ -207,13 +210,13 @@ public struct TransferExecutor: Sendable {
             )
             return .superseded(nil)
         } catch TransferExecutionError.remoteChanged {
-            await discardCheckpoints(for: transfer, root: root)
+            await discardCheckpoints(for: transfer, job: job, root: root)
             transfer.temporaryPath = nil
             await mark(&transfer, status: .superseded, message: TransferExecutionError.remoteChanged.localizedDescription)
             return .superseded(nil)
         } catch TransferExecutionError.destinationChanged {
             await abortIfNecessary(transfer)
-            await discardCheckpoints(for: transfer, root: root)
+            await discardCheckpoints(for: transfer, job: job, root: root)
             transfer.multipartUploadID = nil
             transfer.temporaryPath = nil
             await mark(&transfer, status: .superseded, message: TransferExecutionError.destinationChanged.localizedDescription)
@@ -239,15 +242,18 @@ public struct TransferExecutor: Sendable {
                 // One object the provider will not serve. Its checkpoints go
                 // now, because the next scan replaces this failed row with a
                 // fresh one and would otherwise strand its partial file.
-                await discardCheckpoints(for: transfer, root: root)
+                await discardCheckpoints(for: transfer, job: job, root: root)
                 transfer.temporaryPath = nil
                 await mark(&transfer, status: .failed, message: error.localizedDescription)
                 return .attention(nil, error.localizedDescription)
-            case .incompatible, .invalidResponse:
+            case .incompatible:
+                await mark(&transfer, status: .failed, message: error.localizedDescription)
+                return .attention(.providerIncompatible, error.localizedDescription)
+            case .invalidResponse:
                 await mark(&transfer, status: .failed, message: error.localizedDescription)
                 return .attention(nil, error.localizedDescription)
             case .notFound where transfer.kind == .download:
-                await discardCheckpoints(for: transfer, root: root)
+                await discardCheckpoints(for: transfer, job: job, root: root)
                 await mark(&transfer, status: .superseded, message: "The remote object no longer exists.")
                 return .superseded(nil)
             case .objectChanged:
@@ -257,7 +263,7 @@ public struct TransferExecutor: Sendable {
                 // object that has shrunk. Re-planning from a fresh listing is
                 // the answer; failing the file for good is not.
                 await abortIfNecessary(transfer)
-                await discardCheckpoints(for: transfer, root: root)
+                await discardCheckpoints(for: transfer, job: job, root: root)
                 transfer.multipartUploadID = nil
                 transfer.temporaryPath = nil
                 let message = transfer.kind == .upload
@@ -266,7 +272,7 @@ public struct TransferExecutor: Sendable {
                 await mark(&transfer, status: .superseded, message: message)
                 return .superseded(nil)
             case .checksumMismatch:
-                await discardCheckpoints(for: transfer, root: root)
+                await discardCheckpoints(for: transfer, job: job, root: root)
                 transfer.temporaryPath = nil
                 let failures = (transfer.integrityFailureCount ?? 0) + 1
                 transfer.integrityFailureCount = failures
@@ -327,7 +333,7 @@ public struct TransferExecutor: Sendable {
             return .waiting(.localVolumeUnavailable, error.localizedDescription)
         }
         await abortIfNecessary(transfer)
-        await discardCheckpoints(for: transfer, root: root)
+        await discardCheckpoints(for: transfer, job: job, root: root)
         transfer.multipartUploadID = nil
         transfer.temporaryPath = nil
         await mark(&transfer, status: .failed, message: error.localizedDescription)
@@ -342,6 +348,8 @@ public struct TransferExecutor: Sendable {
     ) async throws -> ReconciliationBaseline {
         do {
             return try await upload(&transfer, job: job, root: root, progress: progress)
+        } catch TransferExecutionError.shortRead {
+            throw TransferExecutionError.sourceChanged
         } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
             try validateVolume(job: job, root: root)
             throw TransferExecutionError.sourceChanged
@@ -365,21 +373,28 @@ public struct TransferExecutor: Sendable {
         // between this point and the post-transfer fingerprint below.
         guard before.representsSameContent(as: expected) else { throw TransferExecutionError.sourceChanged }
 
+        let source = try openSource(transfer.relativePath, root: root)
         let metadata = [
             "storagesync-source-size": String(before.size),
             "storagesync-source-mtime-ns": String(before.modificationTimeNanoseconds),
             "storagesync-transfer-id": transfer.id.description
         ]
+        // Old and new folders can contain unrelated files with indistinguishable
+        // size and timestamps. Never finish the old folder's parts with the new one's bytes.
+        if transfer.multipartUploadID != nil, transfer.multipartGeneration != job.multipartGeneration {
+            throw TransferExecutionError.sourceIdentityChanged
+        }
+        let condition = try Self.writePrecondition(for: transfer)
         let remote: RemoteObject
         if before.size < transferPolicy.multipartThreshold {
-            let data = try Data(contentsOf: sourceURL)
+            let data = try read(source: source, offset: 0, length: before.size)
             guard data.count == before.size else {
                 throw TransferExecutionError.sourceChanged
             }
             let checksum = sha256(data)
             if let identical = try await remoteObjectHoldingSource(
                 transfer,
-                sourceURL: sourceURL,
+                source: source,
                 size: before.size,
                 loadedData: data
             ) {
@@ -394,7 +409,7 @@ public struct TransferExecutor: Sendable {
                 key: transfer.remoteKey,
                 data: data,
                 metadata: metadata.merging(["storagesync-sha256": checksum]) { _, new in new },
-                precondition: Self.writePrecondition(for: transfer),
+                precondition: condition,
                 progress: { bytesSent in
                     await liveProgress.report(
                         requestID: 0,
@@ -433,6 +448,7 @@ public struct TransferExecutor: Sendable {
             )
         }
 
+        let plannedParts = try transferPolicy.parts(forFileSize: before.size, transferID: transfer.id)
         var uploadID: String
         if let existing = transfer.multipartUploadID {
             uploadID = existing
@@ -464,7 +480,7 @@ public struct TransferExecutor: Sendable {
         } else {
             if let identical = try await remoteObjectHoldingSource(
                 transfer,
-                sourceURL: sourceURL,
+                source: source,
                 size: before.size,
                 loadedData: nil
             ) {
@@ -472,11 +488,11 @@ public struct TransferExecutor: Sendable {
             }
             uploadID = try await objectStore.createMultipartUpload(key: transfer.remoteKey, metadata: metadata)
             transfer.multipartUploadID = uploadID
+            transfer.multipartGeneration = job.multipartGeneration
             transfer.updatedAt = Date()
             try await repository.saveTransfer(transfer)
         }
 
-        let plannedParts = try transferPolicy.parts(forFileSize: before.size, transferID: transfer.id)
         let serverParts: [UploadedPart]
         do {
             serverParts = try await objectStore.listParts(key: transfer.remoteKey, uploadID: uploadID)
@@ -485,6 +501,7 @@ public struct TransferExecutor: Sendable {
             // outage. Start a fresh upload while retaining the logical transfer.
             uploadID = try await objectStore.createMultipartUpload(key: transfer.remoteKey, metadata: metadata)
             transfer.multipartUploadID = uploadID
+            transfer.multipartGeneration = job.multipartGeneration
             transfer.completedBytes = 0
             transfer.updatedAt = Date()
             try await repository.removeParts(transferID: transfer.id, fromPartNumber: 1)
@@ -538,7 +555,7 @@ public struct TransferExecutor: Sendable {
                     try Task.checkCancellation()
                     let data: Data
                     do {
-                        data = try read(url: sourceURL, offset: part.offset, length: part.length)
+                        data = try read(source: source, offset: part.offset, length: part.length)
                     } catch TransferExecutionError.shortRead {
                         throw TransferExecutionError.sourceChanged
                     }
@@ -584,7 +601,7 @@ public struct TransferExecutor: Sendable {
                         try Task.checkCancellation()
                         let data: Data
                         do {
-                            data = try read(url: sourceURL, offset: part.offset, length: part.length)
+                            data = try read(source: source, offset: part.offset, length: part.length)
                         } catch TransferExecutionError.shortRead {
                             throw TransferExecutionError.sourceChanged
                         }
@@ -620,7 +637,7 @@ public struct TransferExecutor: Sendable {
             key: transfer.remoteKey,
             uploadID: uploadID,
             parts: orderedCompleted,
-            precondition: Self.writePrecondition(for: transfer)
+            precondition: condition
         )
         guard remote.size == before.size else {
             throw TransferExecutionError.unexpectedObjectSize(expected: before.size, actual: remote.size)
@@ -642,11 +659,12 @@ public struct TransferExecutor: Sendable {
 
     /// What the destination must still look like when this upload lands: as it
     /// was listed when the upload was planned, or absent if it was absent.
-    static func writePrecondition(for transfer: TransferRecord) -> WritePrecondition {
+    static func writePrecondition(for transfer: TransferRecord) throws -> WritePrecondition {
         guard let planned = transfer.remoteSource else { return .absent }
-        guard planned.key == transfer.remoteKey,
-              let eTag = planned.eTag?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !eTag.isEmpty else { return .none }
+        guard planned.key.utf8.elementsEqual(transfer.remoteKey.utf8),
+              let eTag = RemoteObject.comparableETag(planned.eTag) else {
+            throw ObjectStoreError.invalidResponse("The listed object has no strong ETag for a safe replacement.")
+        }
         return .matching(eTag: eTag)
     }
 
@@ -675,26 +693,27 @@ public struct TransferExecutor: Sendable {
     /// other ETag simply fails to match, and the upload goes ahead.
     private func remoteObjectHoldingSource(
         _ transfer: TransferRecord,
-        sourceURL: URL,
+        source: FileHandle,
         size: Int64,
         loadedData: Data?
     ) async throws -> RemoteObject? {
-        guard let planned = transfer.remoteSource,
-              planned.key == transfer.remoteKey,
+        guard verifiesETagDigests, let planned = transfer.remoteSource,
+              planned.key.utf8.elementsEqual(transfer.remoteKey.utf8),
               planned.size == size,
               let expected = Self.md5ETag(planned.eTag) else { return nil }
         guard let current = try await headTreatingDenialAsAbsent(key: transfer.remoteKey),
               current.size == size,
+              current.serverSideEncryption.map({ $0.lowercased() == "aes256" }) ?? true,
               RemoteObject.comparableETag(current.eTag) == RemoteObject.comparableETag(planned.eTag) else {
             return nil
         }
         let local: String?
         if let partCount = expected.partCount {
-            local = try multipartETag(url: sourceURL, size: size, partCount: partCount)
+            local = try multipartETag(handle: source, size: size, partCount: partCount)
         } else if let loadedData {
             local = Insecure.MD5.hash(data: loadedData).hexadecimalString
         } else {
-            local = try md5(url: sourceURL)
+            local = try md5(handle: source)
         }
         return local == expected.digest ? current : nil
     }
@@ -726,10 +745,10 @@ public struct TransferExecutor: Sendable {
               digest.allSatisfy(\.isHexDigit) else { return nil }
         switch pieces.count {
         case 1:
-            return (String(digest), nil)
+            return (digest.lowercased(), nil)
         case 2:
             guard let count = Int(pieces[1]), count > 0 else { return nil }
-            return (value, count)
+            return (value.lowercased(), count)
         default:
             return nil
         }
@@ -746,9 +765,8 @@ public struct TransferExecutor: Sendable {
         return parsed.digest
     }
 
-    private func md5(url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
+    private func md5(handle: FileHandle) throws -> String {
+        try handle.seek(toOffset: 0)
         var hasher = Insecure.MD5()
         while true {
             try Task.checkCancellation()
@@ -763,11 +781,9 @@ public struct TransferExecutor: Sendable {
     /// policy cuts it, or nil when that layout has a different part count from
     /// the object's — in which case it was cut some other way and cannot be
     /// compared.
-    private func multipartETag(url: URL, size: Int64, partCount: Int) throws -> String? {
+    private func multipartETag(handle: FileHandle, size: Int64, partCount: Int) throws -> String? {
         let parts = try transferPolicy.parts(forFileSize: size, transferID: TransferID())
         guard parts.count == partCount else { return nil }
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
         var combined = Data()
         for part in parts {
             try handle.seek(toOffset: UInt64(part.offset))
@@ -864,18 +880,18 @@ public struct TransferExecutor: Sendable {
             }
             destinationFingerprintAtStart = currentLocal
         } else {
-            guard !destinationExistedAtStart else { throw TransferExecutionError.destinationChanged }
+            if destinationExistedAtStart {
+                // Directories and special files never appear in the file manifest.
+                // Replanning them as newly appeared files would loop forever.
+                _ = try scanner.fingerprint(url: initialDestination, relativePath: transfer.relativePath)
+                throw TransferExecutionError.destinationChanged
+            }
             destinationFingerprintAtStart = nil
         }
 
-        let partialDirectory = try verifiedPartialDirectory(beneath: root)
-        // Best effort on filesystems such as exFAT that do not expose POSIX modes.
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: partialDirectory.path
-        )
-        let partialURL = partialDirectory.appendingPathComponent(transfer.id.description + ".partial")
-        let existingPartialSize = ((try? partialURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init)) ?? 0
+        let partial = try DownloadPartial(root: root, transferID: transfer.id)
+        let partialURL = root.appendingPathComponent(ReservedName.partialsDirectory).appendingPathComponent(partial.name)
+        let existingPartialSize = partial.sizeAtOpen
         let remainingBytes = max(0, transfer.totalBytes - existingPartialSize)
         let capacity = try volumeInspector.capacity(for: root)
         if let maximumFileSize = capacity.maximumFileSize, maximumFileSize > 0, transfer.totalBytes > maximumFileSize {
@@ -887,13 +903,13 @@ public struct TransferExecutor: Sendable {
             throw TransferExecutionError.insufficientSpace(required: remainingBytes, available: availableBytes)
         }
         transfer.temporaryPath = partialURL.path
-        if !FileManager.default.fileExists(atPath: partialURL.path) {
-            FileManager.default.createFile(atPath: partialURL.path, contents: nil)
-        }
 
         let plannedParts = try transferPolicy.parts(forFileSize: transfer.totalBytes, transferID: transfer.id)
+        if plannedParts.count > 1, RemoteObject.comparableETag(currentRemote.eTag) == nil, currentRemote.checksum == nil {
+            throw ObjectStoreError.invalidResponse("A multi-range download requires a strong ETag or a whole-file checksum.")
+        }
         var savedParts = Dictionary(uniqueKeysWithValues: try await repository.parts(transferID: transfer.id).map { ($0.number, $0) })
-        let handle = try FileHandle(forUpdating: partialURL)
+        let handle = partial.file
         defer { try? handle.close() }
 
         let planByNumber = Dictionary(uniqueKeysWithValues: plannedParts.map { ($0.number, $0) })
@@ -947,6 +963,7 @@ public struct TransferExecutor: Sendable {
                     try Task.checkCancellation()
                     let data = try await fetchRange(
                         key: downloadRemoteKey,
+                        matchingETag: currentRemote.eTag,
                         range: part.offset..<(part.offset + part.length)
                     )
                     // A complete response shorter than the range asked for is
@@ -983,6 +1000,7 @@ public struct TransferExecutor: Sendable {
                         try Task.checkCancellation()
                         let data = try await fetchRange(
                             key: downloadRemoteKey,
+                            matchingETag: currentRemote.eTag,
                             range: part.offset..<(part.offset + part.length)
                         )
                         guard data.count == part.length else {
@@ -999,16 +1017,17 @@ public struct TransferExecutor: Sendable {
         // throws if it ever stops doing so.
         try handle.truncate(atOffset: UInt64(max(0, transfer.totalBytes)))
         try handle.synchronize()
-        try handle.close()
+        try Task.checkCancellation()
 
         guard let afterRemote = try await objectStore.head(key: transfer.remoteKey),
-              try sameRemoteObject(plannedRemote, afterRemote) else {
+              try sameRemoteObject(plannedRemote, afterRemote),
+              try sameRemoteObject(currentRemote, afterRemote) else {
             throw TransferExecutionError.remoteChanged
         }
         let expectedMD5 = verifiesETagDigests ? Self.singlePartMD5(of: afterRemote) : nil
-        let digests = try await scanner.digests(url: partialURL, includingMD5: expectedMD5 != nil)
+        let digests = try scanner.digests(handle: handle, includingMD5: expectedMD5 != nil)
         let wholeChecksum = digests.sha256
-        if let expectedChecksum = afterRemote.checksum, expectedChecksum != wholeChecksum {
+        if [currentRemote.checksum, afterRemote.checksum].compactMap({ $0 }).contains(where: { $0 != wholeChecksum }) {
             throw ObjectStoreError.checksumMismatch
         }
         // Objects StorageSync did not upload carry no checksum of their own,
@@ -1018,28 +1037,42 @@ public struct TransferExecutor: Sendable {
         }
 
         if let nanoseconds = afterRemote.metadata["storagesync-source-mtime-ns"].flatMap(Int64.init) {
-            try FileManager.default.setAttributes(
-                [.modificationDate: Date(timeIntervalSince1970: Double(nanoseconds) / 1_000_000_000)],
-                ofItemAtPath: partialURL.path
-            )
+            var seconds = nanoseconds / 1_000_000_000
+            var nanos = nanoseconds % 1_000_000_000
+            if nanos < 0 { seconds -= 1; nanos += 1_000_000_000 }
+            let stamp = timespec(tv_sec: Int(seconds), tv_nsec: Int(nanos))
+            guard futimens(handle.fileDescriptor, [stamp, stamp]) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
         }
+        transfer.verifiedDownloadChecksum = wholeChecksum
+        try await repository.saveTransfer(transfer)
         let destination = try SafePath.resolve(transfer.relativePath, beneath: root)
         try validateVolume(job: job, root: root)
-        let destinationExists = FileManager.default.fileExists(atPath: destination.path)
+        try Task.checkCancellation()
         if let destinationFingerprintAtStart {
-            guard destinationExists else { throw TransferExecutionError.destinationChanged }
-            let currentLocal = try scanner.fingerprint(url: destination, relativePath: transfer.relativePath)
-            guard currentLocal.representsSameFileState(as: destinationFingerprintAtStart) else {
-                throw TransferExecutionError.destinationChanged
+            // Coordinate with document presenters and other StorageSync jobs through
+            // the final check and rename. The absent-path case uses an exclusive rename.
+            var coordinationError: NSError?
+            var publicationError: Error?
+            NSFileCoordinator().coordinate(writingItemAt: destination, options: .forReplacing, error: &coordinationError) { coordinatedURL in
+                do {
+                    guard coordinatedURL.standardizedFileURL == destination.standardizedFileURL,
+                          FileManager.default.fileExists(atPath: coordinatedURL.path) else {
+                        throw TransferExecutionError.destinationChanged
+                    }
+                    let current = try scanner.fingerprint(url: coordinatedURL, relativePath: destinationFingerprintAtStart.relativePath)
+                    guard current.representsSameFileState(as: destinationFingerprintAtStart) else {
+                        throw TransferExecutionError.destinationChanged
+                    }
+                    try partial.publish(relativePath: transfer.relativePath, root: root, replacing: true)
+                } catch {
+                    publicationError = error
+                }
             }
-        } else if destinationExists {
-            throw TransferExecutionError.destinationChanged
-        }
-        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: destination.path) {
-            _ = try FileManager.default.replaceItemAt(destination, withItemAt: partialURL, backupItemName: nil, options: [])
+            if let error = publicationError ?? coordinationError { throw error }
         } else {
-            try FileManager.default.moveItem(at: partialURL, to: destination)
+            try partial.publish(relativePath: transfer.relativePath, root: root, replacing: false)
         }
         let local = try scanner.fingerprint(url: destination, relativePath: transfer.relativePath)
         var verified = local
@@ -1054,53 +1087,45 @@ public struct TransferExecutor: Sendable {
         )
     }
 
+    /// A process can stop after S3 or the filesystem published a file but before
+    /// SQLite committed its first baseline. Attribute only a provable prior copy.
+    package func publishedBaseline(for transfer: TransferRecord, local: FileFingerprint,
+                                   remote: RemoteObject, root: URL) async throws -> ReconciliationBaseline? {
+        guard transfer.remoteKey.utf8.elementsEqual(remote.key.utf8) else { return nil }
+        let copiedLocal: FileFingerprint
+        let copiedRemote: RemoteObject
+        switch transfer.kind {
+        case .upload:
+            guard transfer.status != .queued, let source = transfer.sourceFingerprint,
+                  let current = try await headTreatingDenialAsAbsent(key: remote.key),
+                  current.metadata["storagesync-transfer-id"] == transfer.id.description,
+                  current.size == source.size else { return nil }
+            copiedLocal = source
+            copiedRemote = current
+        case .download:
+            guard let checksum = transfer.verifiedDownloadChecksum, let source = transfer.remoteSource,
+                  local.size == source.size else { return nil }
+            let url = try SafePath.resolve(transfer.relativePath, beneath: root)
+            let handle = try openSource(transfer.relativePath, root: root)
+            guard try scanner.digests(handle: handle, includingMD5: false).sha256 == checksum,
+                  try scanner.fingerprint(url: url, relativePath: transfer.relativePath)
+                    .representsSameFileState(as: local) else { return nil }
+            copiedLocal = local
+            copiedRemote = source
+        }
+        return ReconciliationBaseline(
+            relativePath: transfer.relativePath, localFingerprint: copiedLocal,
+            remoteETag: copiedRemote.eTag, remoteChecksum: copiedRemote.checksum,
+            remoteSize: copiedRemote.size, remoteLastModified: copiedRemote.lastModified
+        )
+    }
+
     private func validateVolume(job: SyncJob, root: URL) throws {
         if let expected = job.localRoot.expectedVolume {
             _ = try volumeInspector.validate(expected: expected, selectedURL: root)
         } else if !FileManager.default.fileExists(atPath: root.path) {
             throw VolumeInspectorError.notMounted
         }
-    }
-
-    private func verifiedPartialDirectory(beneath root: URL) throws -> URL {
-        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
-        let directory = resolvedRoot.appendingPathComponent(
-            ReservedName.partialsDirectory,
-            isDirectory: true
-        )
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory) {
-            var uncached = directory
-            uncached.removeAllCachedResourceValues()
-            let values = try uncached.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
-            guard values.isSymbolicLink != true, values.isDirectory == true, isDirectory.boolValue else {
-                throw SafePathError.escapesRoot(ReservedName.partialsDirectory)
-            }
-        } else {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        }
-        var uncached = directory
-        uncached.removeAllCachedResourceValues()
-        let values = try uncached.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
-        let descendantPrefix = resolvedRoot.path == "/" ? "/" : resolvedRoot.path + "/"
-        guard values.isSymbolicLink != true,
-              values.isDirectory == true,
-              directory.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(descendantPrefix) else {
-            throw SafePathError.escapesRoot(ReservedName.partialsDirectory)
-        }
-        return directory
-    }
-
-    /// The partials directory only if it is already there, validated the same
-    /// way the write path validates it. Cleanup has nothing to do when it never
-    /// existed and must not conjure it on a volume that may have gone away.
-    private func existingPartialDirectory(beneath root: URL) -> URL? {
-        let candidate = root
-            .resolvingSymlinksInPath()
-            .standardizedFileURL
-            .appendingPathComponent(ReservedName.partialsDirectory, isDirectory: true)
-        guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }
-        return try? verifiedPartialDirectory(beneath: root)
     }
 
     /// A ranged read of an object this download has already HEADed.
@@ -1111,9 +1136,9 @@ public struct TransferExecutor: Sendable {
     /// access denied it parked the entire sync as a credentials failure at the
     /// first such object. Keys that really stopped working are still caught —
     /// they fail the next file's HEAD, which keeps its job-wide meaning.
-    private func fetchRange(key: String, range: Range<Int64>) async throws -> Data {
+    private func fetchRange(key: String, matchingETag: String?, range: Range<Int64>) async throws -> Data {
         do {
-            return try await objectStore.getRange(key: key, range: range)
+            return try await objectStore.getRange(key: key, range: range, matchingETag: matchingETag)
         } catch ObjectStoreError.accessDenied(let message) {
             throw ObjectStoreError.objectUnavailable(
                 "S3 lists this object but refused to send it, for example because it is encrypted with a KMS key these credentials cannot use. \(message)"
@@ -1133,19 +1158,44 @@ public struct TransferExecutor: Sendable {
         if let leftModified = left.lastModified, let rightModified = right.lastModified {
             return leftModified == rightModified
         }
-        throw ObjectStoreError.incompatible(
+        throw ObjectStoreError.invalidResponse(
             "The S3 provider did not return an ETag, checksum, or modification date needed to verify a stable download."
         )
     }
 
-    private func read(url: URL, offset: Int64, length: Int64) throws -> Data {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        return try read(handle: handle, offset: offset, length: length)
+    private func openSource(_ path: String, root: URL) throws -> FileHandle {
+        let directory = open(root.resolvingSymlinksInPath().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard directory >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(directory) }
+        let descriptor = openat(directory, path, O_RDONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+            throw CocoaError(.fileReadUnsupportedScheme)
+        }
+        return handle
+    }
+
+    private func read(source: FileHandle, offset: Int64, length: Int64) throws -> Data {
+        var data = Data(count: Int(length))
+        try data.withUnsafeMutableBytes { bytes in
+            var count = 0
+            while count < bytes.count {
+                try Task.checkCancellation()
+                let n = pread(source.fileDescriptor, bytes.baseAddress!.advanced(by: count), bytes.count - count, offset + Int64(count))
+                if n < 0, errno == EINTR { continue }
+                guard n >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                guard n > 0 else { throw TransferExecutionError.shortRead(expected: length, actual: count) }
+                count += n
+            }
+        }
+        return data
     }
 
     private func read(handle: FileHandle, offset: Int64, length: Int64) throws -> Data {
         try handle.seek(toOffset: UInt64(offset))
+        if length == 0 { return Data() }
         let data = try handle.read(upToCount: Int(length)) ?? Data()
         guard data.count == length else {
             throw TransferExecutionError.shortRead(expected: length, actual: data.count)
@@ -1202,17 +1252,10 @@ public struct TransferExecutor: Sendable {
         try? await repository.saveTransfer(transfer)
     }
 
-    private func discardCheckpoints(for transfer: TransferRecord, root: URL) async {
+    private func discardCheckpoints(for transfer: TransferRecord, job: SyncJob, root: URL) async {
         try? await repository.removeParts(transferID: transfer.id, fromPartNumber: 1)
-        guard transfer.kind == .download else { return }
-        // Resolved through the same check the write path uses. Deleting through
-        // an internal directory that has been replaced by a symlink would reach
-        // outside the selected root, and this runs on error paths where the
-        // volume is exactly the thing that may have been tampered with.
-        guard let partialDirectory = existingPartialDirectory(beneath: root) else { return }
-        let partialURL = partialDirectory
-            .appendingPathComponent(transfer.id.description + ".partial", isDirectory: false)
-        try? FileManager.default.removeItem(at: partialURL)
+        guard transfer.kind == .download, (try? validateVolume(job: job, root: root)) != nil else { return }
+        DownloadPartial.remove(transfer.id.description + ".partial", beneath: root)
     }
 
     private func abortIfNecessary(_ transfer: TransferRecord) async {

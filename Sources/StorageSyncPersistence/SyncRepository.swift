@@ -183,7 +183,11 @@ public actor SyncRepository {
     }
 
     public func saveJob(_ job: SyncJob) throws {
-        try upsert(table: "jobs", id: job.id.description, payload: encoder.encode(job))
+        var stored = job
+        if let previous = try self.job(id: job.id) {
+            stored.multipartGeneration = previous.localRoot == job.localRoot ? previous.multipartGeneration : UUID()
+        }
+        try upsert(table: "jobs", id: job.id.description, payload: encoder.encode(stored))
         publishStateUpdate()
     }
 
@@ -377,6 +381,25 @@ public actor SyncRepository {
             bindings: [.text(jobID.description)],
             order: "updated_at ASC"
         )
+    }
+
+    /// Only transfers with external cleanup work. This also includes failed multipart uploads.
+    package func transfersWithArtifacts(jobID: SyncJobID) throws -> [TransferRecord] {
+        try loadTransfer(where: """
+            job_id = ? AND (
+                json_extract(CAST(payload AS TEXT), '$.multipartUploadID') IS NOT NULL OR
+                json_extract(CAST(payload AS TEXT), '$.temporaryPath') IS NOT NULL
+            )
+            """, bindings: [.text(jobID.description)])
+    }
+
+    package func transfersAbsentFromSource(jobID: SyncJobID, side: ManifestSide, generation: Int64) throws -> [TransferRecord] {
+        try loadTransfer(where: """
+            job_id = ? AND NOT EXISTS (
+              SELECT 1 FROM manifest m WHERE m.job_id = transfers.job_id AND m.side = ?
+              AND m.scan_generation = ? AND m.relative_path = transfers.relative_path
+            )
+            """, bindings: [.text(jobID.description), .text(side.rawValue), .integer(generation)], limit: 256)
     }
 
     /// Starts a fresh visible batch only when no resumable work remains. A
@@ -798,9 +821,7 @@ public actor SyncRepository {
     ) throws {
         try database.transaction {
             for file in files {
-                let canonical = caseSensitive
-                    ? file.relativePath
-                    : Reconciler.canonicalLocalPath(file.relativePath)
+                let canonical = Reconciler.canonicalLocalPath(file.relativePath, caseSensitive: caseSensitive)
                 try database.execute(
                     """
                     INSERT INTO manifest(job_id, side, relative_path, canonical_path, scan_generation, payload)
@@ -915,14 +936,16 @@ public actor SyncRepository {
     public func recordCaseCollidingManifestEntries(
         jobID: SyncJobID,
         side: ManifestSide,
-        generation: Int64
+        generation: Int64,
+        detectFileDirectoryConflicts: Bool = false
     ) throws -> Int {
         var count = 0
         try database.transaction {
             count = try recordCaseCollisionsInsideTransaction(
                 jobID: jobID,
                 side: side,
-                generation: generation
+                generation: generation,
+                detectFileDirectoryConflicts: detectFileDirectoryConflicts
             )
         }
         return count
@@ -931,7 +954,8 @@ public actor SyncRepository {
     private func recordCaseCollisionsInsideTransaction(
         jobID: SyncJobID,
         side: ManifestSide,
-        generation: Int64
+        generation: Int64,
+        detectFileDirectoryConflicts: Bool
     ) throws -> Int {
         let bindings: [SQLiteValue] = [
             .text(jobID.description),
@@ -942,23 +966,6 @@ public actor SyncRepository {
             "DELETE FROM manifest_conflicts WHERE job_id = ? AND side = ? AND scan_generation = ?",
             bindings: bindings
         )
-        var count = 0
-        try database.query(
-            """
-            SELECT COALESCE(SUM(entry_count), 0)
-            FROM (
-              SELECT COUNT(*) AS entry_count
-              FROM manifest
-              WHERE job_id = ? AND side = ? AND scan_generation = ?
-              GROUP BY canonical_path
-              HAVING COUNT(*) > 1
-            )
-            """,
-            bindings: bindings
-        ) { statement in
-            count = Int(database.integer(statement, column: 0))
-        }
-        guard count > 0 else { return 0 }
         try database.execute(
             """
             INSERT INTO manifest_conflicts(job_id, side, scan_generation, canonical_path)
@@ -970,6 +977,34 @@ public actor SyncRepository {
             """,
             bindings: bindings + bindings
         )
+        if detectFileDirectoryConflicts {
+            // "a" and "a/b" can both exist in a bucket, but publishing either
+            // one locally would arbitrarily decide which object can be restored.
+            try database.execute(
+                """
+                WITH pairs(parent, child) AS (
+                    SELECT p.canonical_path, c.canonical_path
+                    FROM manifest p JOIN manifest c
+                      ON c.job_id = p.job_id AND c.side = p.side AND c.scan_generation = p.scan_generation
+                     AND c.canonical_path >= p.canonical_path || '/' AND c.canonical_path < p.canonical_path || '0'
+                    WHERE p.job_id = ? AND p.side = ? AND p.scan_generation = ?
+                )
+                INSERT OR IGNORE INTO manifest_conflicts(job_id, side, scan_generation, canonical_path)
+                SELECT ?, ?, ?, path FROM (SELECT parent AS path FROM pairs UNION SELECT child FROM pairs)
+                """,
+                bindings: bindings + bindings
+            )
+        }
+        var count = 0
+        try database.query(
+            """
+            SELECT COUNT(*) FROM manifest AS m JOIN manifest_conflicts AS c
+              ON c.job_id = m.job_id AND c.side = m.side AND c.scan_generation = m.scan_generation
+             AND c.canonical_path = m.canonical_path
+            WHERE m.job_id = ? AND m.side = ? AND m.scan_generation = ?
+            """,
+            bindings: bindings
+        ) { count = Int(database.integer($0, column: 0)) }
         return count
     }
 
@@ -987,18 +1022,12 @@ public actor SyncRepository {
         let primaryGeneration = direction == .upload ? localGeneration : remoteGeneration
         let secondarySide = direction == .upload ? "remote" : "local"
         let secondaryGeneration = direction == .upload ? remoteGeneration : localGeneration
-        let joinPath: String
-        if !localCaseSensitive {
-            joinPath = "secondary.canonical_path = source.canonical_path"
-        } else {
-            joinPath = "secondary.relative_path = source.relative_path"
-        }
         let cursorClause = relativePath == nil ? "" : "AND source.relative_path > ?"
         var bindings: [SQLiteValue] = [
-            .text(secondarySide),
-            .integer(secondaryGeneration),
             .integer(remoteGeneration),
             .integer(localGeneration),
+            .text(secondarySide),
+            .integer(secondaryGeneration),
             .text(jobID.description),
             .text(primarySide),
             .integer(primaryGeneration)
@@ -1017,11 +1046,6 @@ public actor SyncRepository {
                    remote_conflict.canonical_path IS NOT NULL,
                    local_conflict.canonical_path IS NOT NULL
             FROM manifest AS source
-            LEFT JOIN manifest AS secondary
-              ON secondary.job_id = source.job_id
-             AND secondary.side = ?
-             AND secondary.scan_generation = ?
-             AND \(joinPath)
             LEFT JOIN manifest_conflicts AS remote_conflict
               ON remote_conflict.job_id = source.job_id
              AND remote_conflict.side = 'remote'
@@ -1032,6 +1056,12 @@ public actor SyncRepository {
              AND local_conflict.side = 'local'
              AND local_conflict.scan_generation = ?
              AND local_conflict.canonical_path = source.canonical_path
+            LEFT JOIN manifest AS secondary
+              ON secondary.job_id = source.job_id
+             AND secondary.side = ?
+             AND secondary.scan_generation = ?
+             AND secondary.canonical_path = source.canonical_path
+             AND \(secondarySide)_conflict.canonical_path IS NULL
             LEFT JOIN baselines AS baseline
               ON baseline.job_id = source.job_id
              AND baseline.relative_path = source.relative_path

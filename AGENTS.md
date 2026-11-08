@@ -20,6 +20,7 @@ Do not declare the app complete from automated tests alone. Notarization and the
 
 - Full Xcode is installed and selected (`xcode-select -p`), but every build still passes the Command Line Tools' macOS 26 SDK explicitly, as below. Check `xcode-select -p` rather than trusting this line.
 - **Build against `MacOSX26.sdk`.** macOS picks its interface from the SDK in `LC_BUILD_VERSION`, so an older one silently produces a dated-looking app, and `StorageSyncApp` uses `ToolbarSpacer`, absent before macOS 26. Deployment target stays macOS 14.
+- Pass **`--build-system native`** to SwiftPM. The current default Swift Build engine ignores the requested SDK: it compiled with SDK 27.2 and stamped SDK 14.0, breaking the menu-bar layout. Packaging checks the executable's SDK version before signing.
 - **`codesign --verify --strict` on `.build/StorageSync.app` always fails, and that is not a real failure.** iCloud's file provider re-adds `com.apple.FinderInfo` and `xattr -cr` cannot keep it off. Copy the bundle out with `ditto --noextattr --norsrc` first, or check what `install-app.sh` put in `/Applications` — that is the copy that matters.
 - This **is** a Git repository (earlier versions of this file said it was not). Tracked files have an undo; untracked ones do not, so copy those outside the tree before replacing them.
 - Moving the workspace invalidates the module cache; clear `.build/*/ModuleCache`.
@@ -28,7 +29,7 @@ Do not declare the app complete from automated tests alone. Notarization and the
 SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk \
 CLANG_MODULE_CACHE_PATH=/tmp/storagesync-clang-module-cache \
 SWIFTPM_MODULECACHE_OVERRIDE=/tmp/storagesync-swiftpm-module-cache \
-swift run --disable-sandbox \
+swift run --build-system native --disable-sandbox \
   --cache-path /tmp/storagesync-swiftpm-cache \
   --config-path /tmp/storagesync-swiftpm-config \
   --security-path /tmp/storagesync-swiftpm-security \
@@ -81,12 +82,12 @@ Changing the signing identity (ad hoc → Developer ID, observed 2026-11-08) is 
 
 An ad-hoc rebuild changes the helper's Keychain identity, so macOS may prompt when the new helper first reads a credential — answer **Always Allow**. A blocked helper looks like a long `Checking for changes…` scan.
 
+Activity subscription begins with the first incoming command on the requirement-pinned connection. Provider-wide incompatibilities park the job. Individual object identity failures remain per-file.
+
 ## Known gaps
 
 - Notarization, stapling, Gatekeeper assessment, login-restart survival, and helper replacement across an update are all unproven and each needs an Apple identity. `scripts/release-app.sh` implements a fail-closed workflow for it but has never run end to end.
-- An accepted XPC peer joins the activity broadcaster before sending anything, so a silent peer could receive job UUIDs, revisions and byte counts until libxpc invalidates it. No credentials, paths or file contents. Closing it needs a "peer verified" signal `NSXPCConnection` does not expose.
-- `ObjectStoreError.incompatible` is classified per-file, so a genuinely incompatible provider fails file by file instead of parking the job. Making it job-wide needs a new `SyncBlocker` case.
-- No UI change has ever been verified visually: no session has had Screen Recording or Accessibility permission. Evidence has always been a warning-free build plus the reliability suite.
+- The two-bar storage display and menu-bar popover were visually verified in the installed app on 2026-11-08 using computer use. Other UI flows have not had that visual verification.
 
 ## Safety while resuming
 

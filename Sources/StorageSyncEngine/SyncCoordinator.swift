@@ -31,6 +31,11 @@ private actor TransferProgressAccumulator {
         return aggregateCompleted
     }
 
+    func finish(transferID: TransferID) {
+        totals.removeValue(forKey: transferID)
+        completed.removeValue(forKey: transferID)
+    }
+
     func totalCompleted() -> Int64 {
         aggregateCompleted
     }
@@ -164,13 +169,14 @@ public actor SyncCoordinator {
     private let repository: SyncRepository
     private let bookmarks: BookmarkStore
     private let keychain: KeychainStore
-    private let objectStoreFactory: ObjectStoreFactory
+    private let objectStoreFactory: any ObjectStoreProviding
     private let scanner: LocalScanner
     private let reconciler: Reconciler
     private let transferPolicy: TransferPolicy
     private let scanRetryPolicy: RetryPolicy
     private let transferPermitPool: TransferPermitPool
     private var jobTasks: [SyncJobID: Task<Void, Never>] = [:]
+    private var isStopping = false
     private var activeJobIDs: Set<SyncJobID> = []
     private var pendingWakeJobIDs: Set<SyncJobID> = []
     /// The subset of pending wakes that came from outside the cycle — Sync Now,
@@ -194,10 +200,17 @@ public actor SyncCoordinator {
         reconciler: Reconciler = Reconciler(),
         transferPolicy: TransferPolicy = TransferPolicy()
     ) {
+        self.init(repository: repository, bookmarks: bookmarks, keychain: keychain, scanner: scanner,
+                  reconciler: reconciler, transferPolicy: transferPolicy, objectStoreFactory: ObjectStoreFactory(keychain: keychain))
+    }
+
+    package init(repository: SyncRepository, bookmarks: BookmarkStore, keychain: KeychainStore,
+                 scanner: LocalScanner = LocalScanner(), reconciler: Reconciler = Reconciler(),
+                 transferPolicy: TransferPolicy = TransferPolicy(), objectStoreFactory: any ObjectStoreProviding) {
         self.repository = repository
         self.bookmarks = bookmarks
         self.keychain = keychain
-        objectStoreFactory = ObjectStoreFactory(keychain: keychain)
+        self.objectStoreFactory = objectStoreFactory
         self.scanner = scanner
         self.reconciler = reconciler
         self.transferPolicy = transferPolicy
@@ -206,6 +219,7 @@ public actor SyncCoordinator {
     }
 
     public func start() async throws {
+        isStopping = false
         await adoptCredentialsFromConnections()
         for job in try await repository.jobs() {
             if job.isPaused {
@@ -233,6 +247,7 @@ public actor SyncCoordinator {
     /// suspension, so nothing can observe the actor still holding jobs it has
     /// already cancelled.
     public func stop() async {
+        isStopping = true
         let runningTasks = Array(jobTasks.values)
         jobTasks.removeAll()
         for task in runningTasks { task.cancel() }
@@ -481,7 +496,7 @@ public actor SyncCoordinator {
     }
 
     public func pause(jobID: SyncJobID) async throws {
-        guard var job = try await repository.job(id: jobID) else { return }
+        guard var job = try await repository.job(id: jobID), !removingJobIDs.contains(jobID) else { return }
         job.isPaused = true
         try await repository.saveJob(job)
         clearPendingWake(jobID)
@@ -494,14 +509,15 @@ public actor SyncCoordinator {
         let task = jobTasks[jobID]
         task?.cancel()
         await task?.value
-        if jobTasks[jobID] == task { jobTasks.removeValue(forKey: jobID) }
+        guard try await repository.job(id: jobID)?.isPaused == true, jobTasks[jobID] == task else { return }
+        jobTasks.removeValue(forKey: jobID)
         try await repository.setSnapshot(
             SyncSnapshot(jobID: jobID, phase: .paused, message: "Paused")
         )
     }
 
     public func resume(jobID: SyncJobID) async throws {
-        guard var job = try await repository.job(id: jobID) else { return }
+        guard var job = try await repository.job(id: jobID), !removingJobIDs.contains(jobID) else { return }
         job.isPaused = false
         try await repository.saveJob(job)
         try await repository.makeWaitingTransfersRunnable(jobID: jobID)
@@ -527,10 +543,8 @@ public actor SyncCoordinator {
         await jobTask?.value
         activeJobIDs.remove(jobID)
 
-        let transfers = (try? await repository.activeTransfers(jobID: jobID)) ?? []
-        // Every row's identifier, not just the active ones: a failed download
-        // keeps its partial too, and nothing would find it after this.
-        let allTransferIDs = (try? await repository.transferIDs(jobID: jobID)) ?? transfers.map(\.id)
+        let transfers = (try? await repository.transfersWithArtifacts(jobID: jobID)) ?? []
+        let partialIDs = transfers.filter { $0.kind == .download }.map(\.id)
         let connection = try? await repository.connection(id: job.connectionID)
         let scopedRoot = try? await bookmarks.resolve(reference: job.localRoot.bookmarkReference)
         let store: (any ObjectStore)?
@@ -561,7 +575,9 @@ public actor SyncCoordinator {
             // The security-scoped access has to outlive the deletions, not just
             // the read of its URL, or the sandbox can revoke it mid-cleanup.
             withExtendedLifetime(scopedRoot) {
-                Self.removeDownloadPartials(named: allTransferIDs, beneath: scopedRoot.url)
+                if let expected = job.localRoot.expectedVolume,
+                   (try? VolumeInspector().validate(expected: expected, selectedURL: scopedRoot.url)) == nil { return }
+                Self.removeDownloadPartials(named: partialIDs, beneath: scopedRoot.url)
             }
         }
 
@@ -621,15 +637,18 @@ public actor SyncCoordinator {
         guard !affectedJobs.isEmpty else { return true }
 
         unmountingJobIDs.formUnion(affectedJobs.map(\.id))
-        var runningTasks: [Task<Void, Never>] = []
+        var runningTasks: [SyncJobID: Task<Void, Never>] = [:]
         for job in affectedJobs {
             clearPendingWake(job.id)
-            if let task = jobTasks.removeValue(forKey: job.id) {
+            if let task = jobTasks[job.id] {
                 task.cancel()
-                runningTasks.append(task)
+                runningTasks[job.id] = task
             }
         }
-        for task in runningTasks { await task.value }
+        for (id, task) in runningTasks {
+            await task.value
+            if jobTasks[id] == task { jobTasks.removeValue(forKey: id) }
+        }
 
         for job in affectedJobs {
             activeJobIDs.remove(job.id)
@@ -690,7 +709,7 @@ public actor SyncCoordinator {
     }
 
     private func requestRun(jobID: SyncJobID, allowAttention: Bool = false) async {
-        guard !removingJobIDs.contains(jobID),
+        guard !isStopping, !removingJobIDs.contains(jobID),
               !unmountingJobIDs.contains(jobID) else { return }
         guard allowAttention || !attentionJobIDs.contains(jobID) else { return }
         if activeJobIDs.contains(jobID) {
@@ -715,7 +734,7 @@ public actor SyncCoordinator {
     }
 
     private func schedule(jobID: SyncJobID, immediate: Bool) {
-        guard !removingJobIDs.contains(jobID),
+        guard !isStopping, !removingJobIDs.contains(jobID),
               !unmountingJobIDs.contains(jobID) else { return }
         // Cancellation is cooperative, so the outgoing cycle can still be
         // inside an upload or a listing long after it was cancelled. Two
@@ -836,6 +855,8 @@ public actor SyncCoordinator {
         var invalidRemoteKeys: Int
         var caseCollisions: Int
         var destinationConflicts: Int
+        var skippedLocalEntries: Int
+        var failedFiles: Int = 0
     }
 
     private static func isTerminal(_ status: TransferStatus) -> Bool {
@@ -866,20 +887,27 @@ public actor SyncCoordinator {
         guard let values = try? uncached.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey]),
               values.isSymbolicLink != true,
               values.isDirectory == true,
-              let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
-        var candidates: [TransferID: String] = [:]
-        for name in names where name.hasSuffix(".partial") {
-            if let uuid = UUID(uuidString: String(name.dropLast(".partial".count))) {
-                candidates[TransferID(rawValue: uuid)] = name
+              let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [],
+                                                          options: [.skipsSubdirectoryDescendants]) else { return }
+        var candidates: [(TransferID, String)] = []
+        func cleanBatch(_ candidates: [(TransferID, String)]) async {
+            guard let existing = try? await repository.existingTransferIDs(candidates.map { $0.0 }) else { return }
+            for (id, name) in candidates where !existing.contains(id) {
+                DownloadPartial.remove(name, beneath: root)
             }
         }
-        guard !candidates.isEmpty,
-              let existing = try? await repository.existingTransferIDs(Array(candidates.keys)) else { return }
-        for (identifier, name) in candidates where !existing.contains(identifier) {
-            let file = directory.appendingPathComponent(name, isDirectory: false)
-            guard (try? FileManager.default.destinationOfSymbolicLink(atPath: file.path)) == nil else { continue }
-            try? FileManager.default.removeItem(at: file)
+        while let file = files.nextObject() as? URL {
+            if Task.isCancelled { return }
+            let name = file.lastPathComponent
+            if name.hasSuffix(".partial"), let uuid = UUID(uuidString: String(name.dropLast(".partial".count))) {
+                candidates.append((TransferID(rawValue: uuid), name))
+            }
+            if candidates.count == 256 {
+                await cleanBatch(candidates)
+                candidates.removeAll(keepingCapacity: true)
+            }
         }
+        if !candidates.isEmpty { await cleanBatch(candidates) }
     }
 
     private func consumePendingWake(jobID: SyncJobID) -> PendingWake? {
@@ -959,6 +987,7 @@ public actor SyncCoordinator {
                 snapshot.currentRelativePath = nil
                 snapshot.message = "Retrying…"
             }
+            snapshot.lastSuccessfulSync = previousSnapshot?.lastSuccessfulSync
             try await repository.setSnapshot(snapshot)
             let access: ScopedURLAccess
             do {
@@ -980,9 +1009,16 @@ public actor SyncCoordinator {
 
             let localCaseSensitive = job.localRoot.expectedVolume?.isCaseSensitive ?? false
             let store = try await objectStoreFactory.make(connection: connection)
+            let executor = TransferExecutor(
+                repository: repository,
+                objectStore: store,
+                transferPolicy: transferPolicy,
+                verifiesETagDigests: Self.isAmazonS3(connection.endpoint)
+            )
             var invalidRemoteKeyCount = cachedScan?.invalidRemoteKeys ?? 0
             var caseCollisionCount = cachedScan?.caseCollisions ?? 0
             var destinationConflictCount = cachedScan?.destinationConflicts ?? 0
+            var skippedLocalEntries = cachedScan?.skippedLocalEntries ?? 0
             let destinationBytesAtScan: Int64
             let queue: TransferQueueSummary
             if scans {
@@ -995,9 +1031,14 @@ public actor SyncCoordinator {
                     jobID: job.id,
                     store: store,
                     prefix: job.remotePrefix,
+                    downloading: job.direction == .download,
                     caseSensitive: localCaseSensitive
                 )
                 let (localScan, remoteScan) = try await (localTask, remoteTask)
+                skippedLocalEntries = localScan.skippedEntryCount
+                if let expected = job.localRoot.expectedVolume {
+                    _ = try VolumeInspector().validate(expected: expected, selectedURL: access.url)
+                }
                 invalidRemoteKeyCount = remoteScan.invalidRemoteKeyCount
                 caseCollisionCount = localScan.caseCollisionCount + remoteScan.caseCollisionCount
                 // A baseline is retired when its source path is absent, which is
@@ -1009,11 +1050,20 @@ public actor SyncCoordinator {
                 // scan: a listing either completes or throws.
                 let sourceScanIsComplete = job.direction == .download || localScan.skippedEntryCount == 0
                 if sourceScanIsComplete {
-                    try await repository.pruneBaselinesAbsentFromManifest(
-                        jobID: job.id,
-                        side: job.direction == .upload ? .local : .remote,
-                        generation: job.direction == .upload ? localScan.generation : remoteScan.generation
-                    )
+                    let sourceSide: ManifestSide = job.direction == .upload ? .local : .remote
+                    let generation = job.direction == .upload ? localScan.generation : remoteScan.generation
+                    try await repository.pruneBaselinesAbsentFromManifest(jobID: job.id, side: sourceSide, generation: generation)
+                    while true {
+                        try Task.checkCancellation()
+                        let stale = try await repository.transfersAbsentFromSource(jobID: job.id, side: sourceSide, generation: generation)
+                        guard !stale.isEmpty else { break }
+                        for transfer in stale {
+                            if let uploadID = transfer.multipartUploadID {
+                                try? await store.abortMultipartUpload(key: transfer.remoteKey, uploadID: uploadID)
+                            }
+                        }
+                        try await repository.discardTransfers(jobID: job.id, relativePaths: stale.map(\.relativePath))
+                    }
                 }
 
                 let reconciliationPageSize = 512
@@ -1042,6 +1092,9 @@ public actor SyncCoordinator {
                     plans.reserveCapacity(rows.count)
                     adoptions.reserveCapacity(rows.count)
                     obsoleteTransferPaths.reserveCapacity(rows.count)
+                    let firstPairs = rows.filter { $0.baseline == nil && $0.local != nil && $0.remote != nil }
+                    let previousAttempts = try await repository.transfers(jobID: job.id, relativePaths: firstPairs.map(\.relativePath))
+                    let attemptsByPath = Dictionary(grouping: previousAttempts, by: \.relativePath)
                     for row in rows {
                         // An ambiguous pairing on either side is skipped whole,
                         // and any transfer already queued for it is discarded
@@ -1061,6 +1114,13 @@ public actor SyncCoordinator {
                                 continue
                             }
                         }
+                        var baseline = row.baseline
+                        if baseline == nil, let attempt = attemptsByPath[row.relativePath]?.first,
+                           let local = row.local, let remote = row.remote,
+                           let published = try await executor.publishedBaseline(for: attempt, local: local, remote: remote, root: access.url) {
+                            try await repository.saveBaseline(published, jobID: job.id)
+                            baseline = published
+                        }
                         // A first pairing with a visibly different file on the
                         // other side: neither adopted as a copy nor overwritten.
                         // Anything already queued for the path is withdrawn too,
@@ -1068,7 +1128,7 @@ public actor SyncCoordinator {
                         if reconciler.isConflictingExistingDestination(
                             local: row.local,
                             remote: row.remote,
-                            baseline: row.baseline
+                            baseline: baseline
                         ) {
                             destinationConflictCount += 1
                             obsoleteTransferPaths.append(row.relativePath)
@@ -1085,7 +1145,7 @@ public actor SyncCoordinator {
                             direction: job.direction,
                             local: row.local,
                             remote: row.remote,
-                            baseline: row.baseline
+                            baseline: baseline
                         ) {
                         case .refreshed(let baseline):
                             adoptions.append(baseline)
@@ -1102,18 +1162,11 @@ public actor SyncCoordinator {
                             relativePath: row.relativePath,
                             local: row.local,
                             remote: row.remote,
-                            existingBaseline: row.baseline
+                            existingBaseline: baseline
                         ) {
                             adoptions.append(adoption)
                             alreadyPresentCount += 1
                             continue
-                        }
-                        let remoteKeyOverride: String?
-                        if job.direction == .upload, !localCaseSensitive, let remote = row.remote,
-                           Reconciler.relativePath(for: remote.key, prefix: job.remotePrefix) != row.relativePath {
-                            remoteKeyOverride = remote.key
-                        } else {
-                            remoteKeyOverride = nil
                         }
                         if let plan = reconciler.transferPlan(
                             direction: job.direction,
@@ -1121,8 +1174,8 @@ public actor SyncCoordinator {
                             relativePath: row.relativePath,
                             local: row.local,
                             remote: row.remote,
-                            baseline: row.baseline,
-                            remoteKeyOverride: remoteKeyOverride
+                            baseline: baseline,
+                            remoteKeyOverride: row.remote?.key
                         ) {
                             plans.append(plan)
                             // Whatever this transfer lands on is about to be
@@ -1174,7 +1227,7 @@ public actor SyncCoordinator {
                         // query above already named them, so the steady-state cost of
                         // a cycle stays proportional to outstanding work rather than
                         // to the number of files being watched.
-                        let pathsWithQueuedWork = Array(Set(obsolete.map(\.relativePath)))
+                        let pathsWithQueuedWork = obsolete.map(\.relativePath)
                         if !pathsWithQueuedWork.isEmpty {
                             try await repository.discardTransfers(
                                 jobID: job.id,
@@ -1210,7 +1263,8 @@ public actor SyncCoordinator {
                 lastScanNotices[jobID] = ScanNotices(
                     invalidRemoteKeys: invalidRemoteKeyCount,
                     caseCollisions: caseCollisionCount,
-                    destinationConflicts: destinationConflictCount
+                    destinationConflicts: destinationConflictCount,
+                    skippedLocalEntries: skippedLocalEntries
                 )
                 await sweepOrphanedPartials(beneath: access.url)
 
@@ -1253,8 +1307,9 @@ public actor SyncCoordinator {
             snapshot.isRescanPending = pendingWakeJobIDs.contains(job.id)
             // Files that fail outright are counted rather than allowed to stop
             // the run, so the headline has to be rebuilt as they accumulate.
-            var failedFileCount = 0
+            var failedFileCount = cachedScan?.failedFiles ?? 0
             var supersededTransferCount = 0
+            var copiedBytes: Int64 = 0
             var jobWideAttention = false
             let transferHeadline = queue.count == 0
                 ? nil
@@ -1264,18 +1319,13 @@ public actor SyncCoordinator {
                     invalidRemoteKeys: invalidRemoteKeyCount,
                     caseCollisions: caseCollisionCount,
                     destinationConflicts: destinationConflictCount,
+                    skippedLocalEntries: skippedLocalEntries,
                     failedFiles: failedFileCount
                 )
             }
             snapshot.message = Self.message(headline: transferHeadline, notices: cycleNotices())
             try await repository.setSnapshot(snapshot)
 
-            let executor = TransferExecutor(
-                repository: repository,
-                objectStore: store,
-                transferPolicy: transferPolicy,
-                verifiesETagDigests: Self.isAmazonS3(connection.endpoint)
-            )
             let maximumParallelFiles = max(1, transferPolicy.maximumConcurrentFiles)
             let transferBatchSize = max(16, maximumParallelFiles * 4)
             let progressRepository = repository
@@ -1363,6 +1413,7 @@ public actor SyncCoordinator {
                         snapshot.currentRelativePath = attempt.transfer.relativePath
                         switch attempt.result {
                         case .completed:
+                            copiedBytes += attempt.transfer.totalBytes
                             snapshot.filesCompleted += 1
                             snapshot.filesAlreadyPresent = (snapshot.filesAlreadyPresent ?? 0) + 1
                             let destinationExisted = attempt.transfer.kind == .upload
@@ -1423,6 +1474,7 @@ public actor SyncCoordinator {
                                 // the same file. The rest of the batch runs;
                                 // the count is reported with the cycle.
                                 failedFileCount += 1
+                                lastScanNotices[jobID]?.failedFiles = failedFileCount
                                 snapshot.message = Self.message(
                                     headline: transferHeadline,
                                     notices: cycleNotices()
@@ -1440,6 +1492,7 @@ public actor SyncCoordinator {
                             supersededTransferCount += 1
                             pendingWakeJobIDs.insert(job.id)
                         }
+                        await progressAccumulator.finish(transferID: attempt.transfer.id)
                         snapshot.bytesCompleted = await progressAccumulator.totalCompleted()
                         snapshot.isRescanPending = pendingWakeJobIDs.contains(job.id)
                         try await repository.setSnapshot(snapshot)
@@ -1455,35 +1508,25 @@ public actor SyncCoordinator {
                 }
             }
 
-            // Only a job-wide stop keeps its own snapshot. A cycle that merely
-            // left some files behind still owes the user the inventory and the
-            // storage balance for everything that did move.
+            // Only successfully published files have left the queue for the destination.
+            // An abandoned partial is not a completed copy, even if every byte was fetched.
+            let remaining = try await repository.activeTransferSummary(jobID: job.id)
+            let rescanPending = pendingWakeJobIDs.contains(job.id)
+            snapshot.currentRelativePath = nil
+            snapshot.isRescanPending = rescanPending
+            snapshot.filesCompleted = 0
+            snapshot.filesTotal = remaining.count
+            snapshot.bytesCompleted = remaining.completedBytes
+            snapshot.bytesTotal = remaining.totalBytes
+            snapshot.destinationBytesInPlace = destinationBytesAtScan + min(copiedBytes, Int64.max - destinationBytesAtScan)
             if !jobWideAttention, snapshot.blockers.isEmpty {
-                let remaining = try await repository.activeTransferSummary(jobID: job.id)
-                let rescanPending = pendingWakeJobIDs.contains(job.id)
                 snapshot.phase = rescanPending ? .scanning : .watching
-                snapshot.currentRelativePath = nil
-                snapshot.isRescanPending = rescanPending
-                snapshot.filesCompleted = 0
-                let movedBytes = snapshot.bytesCompleted
-                snapshot.filesTotal = remaining.count
-                snapshot.bytesCompleted = remaining.completedBytes
-                snapshot.bytesTotal = remaining.totalBytes
-                // Progress that left the queue is now at the destination, and
-                // has to be credited there before `bytesCompleted` is reset or
-                // the balance would snap back to what the scan saw. Subtracting
-                // what is still queued keeps a saved partial from counting
-                // twice. The bar therefore reads the same byte on either side
-                // of this line: `atScan + movedBytes`, before and after.
-                snapshot.destinationBytesInPlace = destinationBytesAtScan
-                    + max(0, movedBytes - remaining.completedBytes)
                 if rescanPending {
                     snapshot.message = "Checking for changes…"
                 } else if remaining.count == 0 {
                     snapshot.recentlyQueuedCount = nil
                     snapshot.recentlyQueuedPaths = nil
                     snapshot.recentlyQueuedAt = nil
-                    snapshot.lastSuccessfulSync = Date()
                     snapshot.message = Self.message(headline: nil, notices: cycleNotices())
                     // Nothing is queued to retry, so a file that failed will
                     // not move again on its own. Saying "All caught up" in that
@@ -1492,15 +1535,19 @@ public actor SyncCoordinator {
                     // user is shown rather than something they have to notice.
                     // A destination conflict is the same claim: that source
                     // file has no copy until someone decides which one wins.
-                    if failedFileCount > 0 || destinationConflictCount > 0 { snapshot.phase = .attention }
+                    if cycleNotices().isEmpty {
+                        snapshot.lastSuccessfulSync = Date()
+                    } else {
+                        snapshot.phase = .attention
+                    }
                 } else {
                     snapshot.message = Self.message(
                         headline: "Waiting to retry \(remaining.count) item\(remaining.count == 1 ? "" : "s")…",
                         notices: cycleNotices()
                     )
                 }
-                try await repository.setSnapshot(snapshot)
             }
+            try await repository.setSnapshot(snapshot)
             // Deliberately not `snapshot.phase`: a cycle that ends in attention
             // over individual files is still a healthy job that should keep its
             // timers and be woken normally. Only a job-wide blocker parks it
@@ -1553,7 +1600,7 @@ public actor SyncCoordinator {
                 attentionBlockers = [.credentialsUnavailable]
             case .incompatible:
                 isAttention = true
-                attentionBlockers = []
+                attentionBlockers = [.providerIncompatible]
             default:
                 isAttention = false
                 attentionBlockers = []
@@ -1586,9 +1633,13 @@ public actor SyncCoordinator {
         invalidRemoteKeys: Int,
         caseCollisions: Int,
         destinationConflicts: Int,
+        skippedLocalEntries: Int,
         failedFiles: Int
     ) -> [String] {
         var sentences: [String] = []
+        if skippedLocalEntries > 0 {
+            sentences.append("Could not read \(skippedLocalEntries) local entr\(skippedLocalEntries == 1 ? "y" : "ies") during the scan")
+        }
         if invalidRemoteKeys > 0 {
             sentences.append(
                 "Skipped \(invalidRemoteKeys) unsafe object path\(invalidRemoteKeys == 1 ? "" : "s")"
@@ -1597,8 +1648,8 @@ public actor SyncCoordinator {
         if caseCollisions > 0 {
             sentences.append(
                 caseCollisions == 1
-                    ? "Skipped 1 name that differs only by capitalization"
-                    : "Skipped \(caseCollisions) names that differ only by capitalization"
+                    ? "Skipped 1 ambiguous filename"
+                    : "Skipped \(caseCollisions) filenames that cannot coexist locally"
             )
         }
         if destinationConflicts > 0 {
@@ -1641,7 +1692,9 @@ public actor SyncCoordinator {
             try Task.checkCancellation()
             batch.append(file)
             entryCount += 1
-            byteCount += max(0, file.size)
+            let (total, overflow) = byteCount.addingReportingOverflow(max(0, file.size))
+            guard !overflow else { throw CocoaError(.fileReadTooLarge) }
+            byteCount = total
             if batch.count == 512 {
                 try await repository.upsertLocalManifestEntries(
                     batch,
@@ -1668,14 +1721,11 @@ public actor SyncCoordinator {
         // and lets them overwrite each other's contents there, cycle after
         // cycle. Neither of the pair is reconciled until the names differ by
         // more than capitalization.
-        var caseCollisionCount = 0
-        if !caseSensitive {
-            caseCollisionCount = try await repository.recordCaseCollidingManifestEntries(
-                jobID: jobID,
-                side: .local,
-                generation: generation
-            )
-        }
+        let caseCollisionCount = try await repository.recordCaseCollidingManifestEntries(
+            jobID: jobID,
+            side: .local,
+            generation: generation
+        )
         return ManifestScanResult(
             generation: generation,
             invalidRemoteKeyCount: 0,
@@ -1702,6 +1752,7 @@ public actor SyncCoordinator {
         jobID: SyncJobID,
         store: any ObjectStore,
         prefix: String,
+        downloading: Bool,
         caseSensitive: Bool
     ) async throws -> ManifestScanResult {
         let generation = try await repository.nextManifestGeneration(jobID: jobID, side: .remote)
@@ -1711,6 +1762,11 @@ public actor SyncCoordinator {
         var entryCount = 0
         var byteCount: Int64 = 0
         var token: String?
+        // Brent cycle detection also catches A -> B -> A while retaining a
+        // single opaque token for a listing of any length.
+        var anchor: String?
+        var span = 1
+        var distance = 0
         let normalizedPrefix = SyncJob.normalizedPrefix(prefix)
         let listingPrefix = normalizedPrefix.isEmpty ? "" : normalizedPrefix + "/"
         repeat {
@@ -1736,13 +1792,13 @@ public actor SyncCoordinator {
                     continue
                 }
                 entryCount += 1
-                byteCount += object.size
+                let (total, overflow) = byteCount.addingReportingOverflow(object.size)
+                guard !overflow else { throw ObjectStoreError.invalidResponse("The S3 inventory exceeds the supported byte count.") }
+                byteCount = total
                 batch.append(
                     RemoteManifestRecord(
                         relativePath: relativePath,
-                        canonicalPath: caseSensitive
-                            ? relativePath
-                            : Reconciler.canonicalLocalPath(relativePath),
+                        canonicalPath: Reconciler.canonicalLocalPath(relativePath, caseSensitive: caseSensitive),
                         object: object
                     )
                 )
@@ -1756,6 +1812,17 @@ public actor SyncCoordinator {
                 }
             }
             token = page.nextContinuationToken
+            if let token {
+                guard token != anchor else {
+                    throw ObjectStoreError.invalidResponse("The S3 object listing repeated a continuation token.")
+                }
+                distance += 1
+                if distance == span {
+                    anchor = token
+                    span = span <= Int.max / 2 ? span * 2 : Int.max
+                    distance = 0
+                }
+            }
         } while token != nil
         if !batch.isEmpty {
             try await repository.upsertRemoteManifestEntries(
@@ -1769,14 +1836,12 @@ public actor SyncCoordinator {
         // the local side keeps its own: a download prunes its baselines
         // against this manifest, and a group missing from it reads as objects
         // that were deleted. Reconciliation skips the group on the flag.
-        var caseCollisionCount = 0
-        if !caseSensitive {
-            caseCollisionCount = try await repository.recordCaseCollidingManifestEntries(
-                jobID: jobID,
-                side: .remote,
-                generation: generation
-            )
-        }
+        let caseCollisionCount = try await repository.recordCaseCollidingManifestEntries(
+            jobID: jobID,
+            side: .remote,
+            generation: generation,
+            detectFileDirectoryConflicts: downloading
+        )
         return ManifestScanResult(
             generation: generation,
             invalidRemoteKeyCount: invalidRemoteKeyCount,
@@ -1790,23 +1855,8 @@ public actor SyncCoordinator {
         named transferIDs: [TransferID],
         beneath root: URL
     ) {
-        let partialDirectory = root
-            .appendingPathComponent(ReservedName.partialsDirectory, isDirectory: true)
-            .standardizedFileURL
-        // Never follow a replaced internal directory outside the selected
-        // root. TransferExecutor applies the same defensive rule when writing.
-        if (try? FileManager.default.destinationOfSymbolicLink(atPath: partialDirectory.path)) != nil {
-            return
-        }
         for transferID in transferIDs {
-            let partial = partialDirectory
-                .appendingPathComponent(transferID.description + ".partial", isDirectory: false)
-                .standardizedFileURL
-            guard partial.deletingLastPathComponent() == partialDirectory,
-                  (try? FileManager.default.destinationOfSymbolicLink(atPath: partial.path)) == nil else {
-                continue
-            }
-            try? FileManager.default.removeItem(at: partial)
+            DownloadPartial.remove(transferID.description + ".partial", beneath: root)
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import StorageSyncCore
 
 public enum BookmarkStoreError: Error, LocalizedError {
     case notFound(String)
@@ -49,7 +50,7 @@ public actor BookmarkStore {
     }
 
     public func resolve(reference: String) throws -> ScopedURLAccess {
-        let bookmarkURL = fileURL(reference: reference)
+        let bookmarkURL = try fileURL(reference: reference)
         guard FileManager.default.fileExists(atPath: bookmarkURL.path) else {
             throw BookmarkStoreError.notFound(reference)
         }
@@ -74,13 +75,16 @@ public actor BookmarkStore {
     }
 
     public func remove(reference: String) throws {
-        let url = fileURL(reference: reference)
-        if FileManager.default.fileExists(atPath: url.path) {
-            try FileManager.default.removeItem(at: url)
+        let url = try fileURL(reference: reference)
+        if unlink(url.path) != 0, errno != ENOENT {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 
-    private func fileURL(reference: String) -> URL {
-        directory.appendingPathComponent(reference, isDirectory: false).appendingPathExtension("bookmark")
+    private func fileURL(reference: String) throws -> URL {
+        guard Reconciler.isSafeRelativePath(reference), !reference.utf8.contains(0x2f) else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+        return directory.appendingPathComponent(reference, isDirectory: false).appendingPathExtension("bookmark")
     }
 }

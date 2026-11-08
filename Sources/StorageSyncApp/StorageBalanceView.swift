@@ -1,23 +1,9 @@
 import StorageSyncCore
 import SwiftUI
 
-/// Where a sync's bytes are, as three lines that share one horizontal scale.
-///
-///     On this Mac  ··············▓▓▓▓▓▓▓▓▓▓
-///     Uploading    ··················▓▓▓▓▓▓
-///     In the cloud ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓······
-///                  └only in cloud┘└both┘└to go┘
-///
-/// The bars are not three independent percentages stacked up. They are one
-/// picture: the destination fills from the left, the source is pinned to the
-/// right, and the middle line covers exactly the span the destination has not
-/// reached — because `StorageBalance` guarantees destination + pending is the
-/// whole width. Copying a file moves the boundary rightward through all three
-/// rows at once, which is what the hairline is there to make visible.
-///
-/// Lengths are storage, never file counts. The counts are true but they are
-/// not the question being asked: 200 raw photos and 200 thumbnails are the
-/// same number and nothing like the same amount of waiting.
+/// Local and cloud storage share one scale across two bars. The destination
+/// combines its existing bytes with the yellow pending segment; the three
+/// colors are explained by a legend below the bars.
 struct StorageBalanceView: View {
     enum Style {
         case full
@@ -26,7 +12,7 @@ struct StorageBalanceView: View {
 
     let reading: BalanceReading
     var style: Style = .full
-    /// Drives the sweep on the middle line. Nothing repeats when this is false.
+    /// Drives the sweep on the pending segment. Nothing repeats when this is false.
     var isTransferring = false
 
     @Environment(\.colorScheme) private var colorScheme
@@ -35,11 +21,8 @@ struct StorageBalanceView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: style == .full ? 7 : 4) {
-            if style == .full {
-                labelledBars
-            } else {
-                bars
-            }
+            bars
+            legend
             caption
         }
         // Snapshots arrive once a second, so the bars are told to glide between
@@ -53,21 +36,43 @@ struct StorageBalanceView: View {
 
     // MARK: - Rows
 
-    private var labelledBars: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: rowSpacing) {
-                ForEach(Line.allCases) { label(for: $0) }
+    @ViewBuilder
+    private var legend: some View {
+        if style == .compact {
+            // The menu's text column is narrower than the whole popover.
+            // Short place names keep all three keys on one line below the bars.
+            HStack(spacing: 10) {
+                ForEach(Line.allCases) { legendEntry(for: $0) }
             }
-            bars
-            VStack(alignment: .trailing, spacing: rowSpacing) {
-                ForEach(Line.allCases) { value(for: $0) }
+        } else {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 16) {
+                    ForEach(Line.allCases) { legendEntry(for: $0) }
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Line.allCases) { legendEntry(for: $0) }
+                }
             }
         }
     }
 
+    private func legendEntry(for line: Line) -> some View {
+        HStack(spacing: 5) {
+            label(for: line)
+            if style == .full {
+                value(for: line)
+            }
+        }
+        .fixedSize()
+        .help(help(for: line))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title(for: line))
+        .accessibilityValue(bytes(for: line).formattedByteCount)
+    }
+
     private var bars: some View {
         VStack(spacing: rowSpacing) {
-            ForEach(Line.allCases) { bar(for: $0) }
+            ForEach([Line.local, .cloud]) { bar(for: $0) }
         }
         .overlay { frontier }
     }
@@ -78,12 +83,11 @@ struct StorageBalanceView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(color(for: line))
                 .frame(width: 13)
-            Text(title(for: line))
+            Text(legendTitle(for: line))
                 .lineLimit(1)
         }
-        .font(.caption)
+        .font(style == .full ? .caption : .caption2)
         .foregroundStyle(.secondary)
-        .frame(height: rowHeight)
         .accessibilityHidden(true)
     }
 
@@ -93,43 +97,50 @@ struct StorageBalanceView: View {
             .monospacedDigit()
             .foregroundStyle(.secondary)
             .lineLimit(1)
-            .frame(height: rowHeight)
             .accessibilityHidden(true)
     }
 
     private func bar(for line: Line) -> some View {
-        GeometryReader { proxy in
+        let isDestination = balance.direction == .upload ? line == .cloud : line == .local
+        return GeometryReader { proxy in
             let filled = max(0, proxy.size.width * fraction(for: line))
+            let pending = max(0, proxy.size.width * balance.pendingFraction)
             ZStack(alignment: alignment(for: line)) {
                 Capsule()
                     .fill(Color.primary.opacity(0.09))
-                Capsule()
+                Rectangle()
                     .fill(color(for: line))
                     .frame(width: filled)
-                    .overlay(alignment: .leading) {
-                        // Only ever built while a transfer is running. Removing
-                        // the view is what stops the repeating animation.
-                        if line == .sync, isTransferring, balance.hasPendingWork {
-                            SweepingHighlight(width: filled)
+                if isDestination {
+                    Rectangle()
+                        .fill(color(for: .sync))
+                        .frame(width: pending)
+                        .overlay(alignment: .leading) {
+                            if isTransferring, balance.hasPendingWork {
+                                SweepingHighlight(width: pending)
+                            }
                         }
-                    }
-                    .clipShape(Capsule())
+                        .clipped()
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
             }
             .frame(height: barHeight)
+            .clipShape(Capsule())
             .frame(maxHeight: .infinity)
         }
         .frame(height: rowHeight)
-        .help(help(for: line))
+        .help(isDestination ? "\(help(for: line)) · \(help(for: .sync))" : help(for: line))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title(for: line))
         .accessibilityValue(
             "\(bytes(for: line).formattedByteCount), \(percentage(for: line)) percent of everything"
+                + (isDestination ? ", \(help(for: .sync))" : "")
         )
     }
 
     /// The boundary the sync is working at: where the destination's fill ends
     /// and the waiting work begins. It is the only thing on screen that moves
-    /// while a transfer runs, and it lines the three rows up as one reading.
+    /// while a transfer runs, and it lines the two rows up as one reading.
     @ViewBuilder
     private var frontier: some View {
         if balance.hasPendingWork, balance.totalBytes > 0 {
@@ -213,6 +224,15 @@ struct StorageBalanceView: View {
         }
     }
 
+    private func legendTitle(for line: Line) -> String {
+        guard style == .compact else { return title(for: line) }
+        switch line {
+        case .local: return "Mac"
+        case .cloud: return "Cloud"
+        case .sync: return title(for: line)
+        }
+    }
+
     private func symbol(for line: Line) -> String {
         switch line {
         case .local: "internaldrive"
@@ -223,7 +243,7 @@ struct StorageBalanceView: View {
     }
 
     /// Fixed hues rather than the accent colour: a user whose accent is green
-    /// would otherwise see two of the three lines claim to be the same thing.
+    /// would otherwise see two of the three legend entries claim to be the same thing.
     private func color(for line: Line) -> Color {
         switch line {
         case .local: Color(nsColor: .systemGreen)
@@ -284,7 +304,7 @@ struct StorageBalanceView: View {
     private var rowSpacing: CGFloat { style == .full ? 5 : 3 }
 }
 
-/// A highlight that crosses the middle line while bytes are actually moving, so
+/// A highlight that crosses the pending segment while bytes are actually moving, so
 /// a sync that is working looks different from one that is merely behind.
 private struct SweepingHighlight: View {
     let width: CGFloat

@@ -19,7 +19,7 @@ public enum SafePath {
         }
         let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
         let rootPath = resolvedRoot.path
-        let destination = relativePath.split(separator: "/").reduce(resolvedRoot) { partial, component in
+        let destination = Reconciler.pathComponents(relativePath).reduce(resolvedRoot) { partial, component in
             partial.appendingPathComponent(String(component), isDirectory: false)
         }.standardizedFileURL
         let destinationPath = destination.path
@@ -32,7 +32,7 @@ public enum SafePath {
         }
 
         var cursor = resolvedRoot
-        for component in relativePath.split(separator: "/") {
+        for component in Reconciler.pathComponents(relativePath) {
             cursor.appendPathComponent(String(component), isDirectory: false)
             var uncached = cursor
             uncached.removeAllCachedResourceValues()

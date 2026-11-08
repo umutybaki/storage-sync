@@ -1,7 +1,7 @@
 import Foundation
 
 /// Where a sync's bytes are: on this Mac, in the bucket, or in between. This is
-/// what the three stacked lines in the interface are drawn from, and it is the
+/// what the two storage bars in the interface are drawn from, and it is the
 /// one place the arithmetic lives so the window and the menu bar cannot
 /// disagree about it.
 ///
@@ -13,8 +13,8 @@ import Foundation
 ///     total  = cloudBytes + pendingBytes        (upload; mirrored downward)
 ///
 /// which makes `cloudBytes + pendingBytes == totalBytes` exact rather than
-/// approximate. The middle line is then *precisely* the span the bottom line
-/// has not reached yet, so the two can be drawn as one continuous picture: the
+/// approximate. The pending segment is precisely the span the destination
+/// has not reached yet, so they can be drawn as one continuous bar: the
 /// destination fills from the left, the pending gap sits at the right edge, and
 /// as files copy the first grows into the second.
 public struct StorageBalance: Equatable, Sendable {
@@ -56,12 +56,13 @@ public struct StorageBalance: Equatable, Sendable {
         // bottom line glide instead of jumping one file at a time. The two are
         // written to never overlap: see `SyncSnapshot.destinationBytesInPlace`.
         let moved = max(0, snapshot.bytesCompleted)
-        let destinationBytes = max(0, destinationInPlace) + moved
-        let pending = max(0, snapshot.bytesTotal - moved)
+        let inPlace = max(0, destinationInPlace)
+        let destinationBytes = inPlace + min(moved, Int64.max - inPlace)
+        let pending = max(0, max(0, snapshot.bytesTotal) - moved)
         let source = max(0, sourceBytes)
 
         self.direction = direction
-        totalBytes = destinationBytes + pending
+        totalBytes = destinationBytes + min(pending, Int64.max - destinationBytes)
         runBytes = max(0, snapshot.bytesTotal)
         movedBytes = moved
         pendingBytes = pending

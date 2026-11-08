@@ -56,7 +56,8 @@ private final class S3XMLParserDelegate: NSObject, XMLParserDelegate {
     var continuationToken: String?
     var uploadID: String?
     var parts: [UploadedPart] = []
-    var isTruncated = false
+    var isTruncated: Bool?
+    var malformedEntry = false
     var nextPartNumberMarker: Int?
     var rootElement: String?
     var serviceErrorMessage: String?
@@ -129,8 +130,8 @@ private final class S3XMLParserDelegate: NSObject, XMLParserDelegate {
             continuationToken = value.isEmpty ? nil : value
         case (_, "UploadId"):
             uploadID = value
-        case (_, "IsTruncated"):
-            isTruncated = value.lowercased() == "true"
+        case ("ListBucketResult", "IsTruncated"), ("ListPartsResult", "IsTruncated"):
+            isTruncated = Bool(value.lowercased())
         case (_, "NextPartNumberMarker"):
             nextPartNumberMarker = Int(value)
         case ("Error", "Message"):
@@ -153,6 +154,8 @@ private final class S3XMLParserDelegate: NSObject, XMLParserDelegate {
             objects.append(RemoteObject(key: key, size: size, lastModified: objectModified, eTag: objectETag))
         } else if elementName == "Part", let number = partNumber, let eTag = partETag {
             parts.append(UploadedPart(number: number, eTag: eTag, size: partSize, checksum: partChecksum))
+        } else if elementName == "Contents" || elementName == "Part" {
+            malformedEntry = true
         }
         _ = elementStack.popLast()
         text = ""
@@ -166,6 +169,10 @@ private final class S3XMLParserDelegate: NSObject, XMLParserDelegate {
 enum S3XML {
     static func parseObjects(_ data: Data) throws -> ListObjectsXMLResult {
         let delegate = try parse(data)
+        guard delegate.rootElement == "ListBucketResult", let isTruncated = delegate.isTruncated,
+              !delegate.malformedEntry else {
+            throw ObjectStoreError.invalidResponse("S3 returned an incomplete or unrecognized object listing.")
+        }
         // A negative <Size> is not a length, and it must not reach the manifest:
         // it becomes a transfer's total byte count, which the download path then
         // converts to unsigned offsets. Rejecting the page is deliberate —
@@ -193,7 +200,7 @@ enum S3XML {
         }
         return ListObjectsXMLResult(
             objects: objects,
-            isTruncated: delegate.isTruncated,
+            isTruncated: isTruncated,
             nextContinuationToken: delegate.continuationToken
         )
     }
@@ -208,9 +215,13 @@ enum S3XML {
 
     static func parseParts(_ data: Data) throws -> ListPartsXMLResult {
         let delegate = try parse(data)
+        guard delegate.rootElement == "ListPartsResult", let isTruncated = delegate.isTruncated,
+              !delegate.malformedEntry else {
+            throw ObjectStoreError.invalidResponse("S3 returned an incomplete or unrecognized part listing.")
+        }
         return ListPartsXMLResult(
             parts: delegate.parts.sorted { $0.number < $1.number },
-            isTruncated: delegate.isTruncated,
+            isTruncated: isTruncated,
             nextPartNumberMarker: delegate.nextPartNumberMarker
         )
     }
@@ -238,7 +249,7 @@ enum S3XML {
         parser.shouldResolveExternalEntities = false
         let delegate = S3XMLParserDelegate()
         parser.delegate = delegate
-        guard parser.parse() else {
+        guard parser.parse(), delegate.parseError == nil else {
             throw ObjectStoreError.invalidResponse(delegate.parseError?.localizedDescription ?? "Malformed S3 XML response.")
         }
         return delegate

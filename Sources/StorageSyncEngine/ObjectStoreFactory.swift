@@ -3,7 +3,17 @@ import StorageSyncCore
 import StorageSyncS3
 import StorageSyncSystem
 
-public struct ObjectStoreFactory: Sendable {
+package protocol ObjectStoreProviding: Sendable {
+    func make(connection: S3Connection, credentials: S3Credentials?, timeout: TimeInterval?) async throws -> any ObjectStore
+}
+
+package extension ObjectStoreProviding {
+    func make(connection: S3Connection) async throws -> any ObjectStore {
+        try await make(connection: connection, credentials: nil, timeout: nil)
+    }
+}
+
+public struct ObjectStoreFactory: ObjectStoreProviding {
     private let keychain: KeychainStore
 
     public init(keychain: KeychainStore) {

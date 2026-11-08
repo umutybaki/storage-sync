@@ -1,6 +1,6 @@
 # StorageSync
 
-StorageSync is a native macOS menu bar app that continuously copies new and changed files in one direction between a local folder and an S3-compatible bucket. Local folders may live on internal storage or on removable USB/Thunderbolt SSDs and flash drives.
+StorageSync is a native macOS menu bar app that copies new and changed files on each scan in one direction between a local folder and an S3-compatible bucket. Local folders may live on internal storage or on removable USB/Thunderbolt SSDs and flash drives.
 
 It is built for the case where the transfer is too large to babysit: multi-terabyte, multi-day jobs that have to survive a closed laptop, a dropped network, a full disk, and an external drive being yanked out mid-write. The manager window is SwiftUI and standard macOS controls; the durable engine runs separately as a launchd agent, so closing the window does not stop a transfer in progress.
 
@@ -12,7 +12,7 @@ These are the guarantees the engine is written and tested against.
 
 - Source deletions never delete destination content. The engine has no object-delete operation.
 - Existing destination files are replaced only by a planned source copy; destination-only paths remain untouched.
-- When a folder and bucket are paired for the first time, an item already present at the destination path is adopted as the initial baseline and is not copied again. Later source changes are still detected from that baseline.
+- On first pairing, files with equal sizes at the same relative path are adopted. Different sizes produce a conflict. Adoption compares sizes and can preserve different same-size contents.
 - A partial download never appears under its final name.
 - A changed source, remote object, or destination supersedes the stale plan instead of committing mixed data.
 - Work resumes only after StorageSync proves that the same removable volume returned.
@@ -22,6 +22,8 @@ These are the guarantees the engine is written and tested against.
 - Only one operation in the app writes a secret, and only the background agent ever reads one back.
 
 The manager shows where a sync's storage actually is, as three lines on one shared scale: what is on this Mac, what is still moving, and what is in the bucket. They are drawn against bytes rather than file counts, and they are one picture rather than three percentages — the cloud line fills from the left, the local line is pinned to the right, and the line between them covers exactly the span the cloud has not reached yet, so copying a file moves a single boundary through all three rows. Underneath sit the three concrete numbers: source files found, files already present at the destination, and files remaining to copy. This makes a partially completed first sync auditable before terabytes of transfer begin.
+
+See [Sync behavior](docs/SYNC-BEHAVIOR.md) for the upload and download rules, including deletions, renames, conflicting edits, and interrupted transfers.
 
 ## Credentials
 
@@ -63,13 +65,13 @@ Any S3-compatible endpoint should work — AWS S3, Cloudflare R2, Backblaze B2, 
 The package targets macOS 14 and later, but it must be built against the macOS 26 SDK. macOS decides whether an app draws with the macOS 26 interface or the legacy compatibility one from the SDK recorded in the binary's `LC_BUILD_VERSION`, so an older SDK produces a correct but visibly dated app. The deployment target is unchanged, so the result still runs on macOS 14.
 
 ```sh
-swift build --sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk
+swift build --build-system native --sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk
 ```
 
 Run the dependency-free reliability suite with the `storagesynctest` executable. It is the whole test suite, not a supplement to one: with only the Command Line Tools installed there is no XCTest in the SDK and `import Testing` does not resolve, so an ordinary `swift test` target cannot build. `storagesynctest` is a plain executable that asserts and exits non-zero, which works anywhere the package builds.
 
 ```sh
-swift run --sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk storagesynctest
+swift run --build-system native --sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk storagesynctest
 ```
 
 Build the development app bundle with:

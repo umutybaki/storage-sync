@@ -107,11 +107,14 @@ public struct LocalScanner: Sendable {
                         guard values.isRegularFile == true else { continue }
                         let relativePath = relativeComponents.joined(separator: "/")
                         guard !relativePath.isEmpty else { continue }
-                        let modified = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+                        guard let size = values.fileSize, size >= 0, let modified = values.contentModificationDate else {
+                            skipped?.increment()
+                            continue
+                        }
                         var pending = FileFingerprint(
                             relativePath: relativePath,
-                            size: Int64(values.fileSize ?? 0),
-                            modificationTimeNanoseconds: Self.modificationTimeNanoseconds(modified),
+                            size: Int64(size),
+                            modificationTimeNanoseconds: Self.modificationTimeNanoseconds(modified.timeIntervalSince1970),
                             fileIdentifier: values.fileResourceIdentifier.map { String(describing: $0) },
                             generationIdentifier: values.generationIdentifier.map { String(describing: $0) }
                         )
@@ -163,11 +166,13 @@ public struct LocalScanner: Sendable {
         guard values.isRegularFile == true, values.isSymbolicLink != true else {
             throw CocoaError(.fileReadUnsupportedScheme)
         }
-        let modified = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+        guard let size = values.fileSize, size >= 0, let modified = values.contentModificationDate else {
+            throw CocoaError(.fileReadUnknown)
+        }
         return FileFingerprint(
             relativePath: relativePath,
-            size: Int64(values.fileSize ?? 0),
-            modificationTimeNanoseconds: Self.modificationTimeNanoseconds(modified),
+            size: Int64(size),
+            modificationTimeNanoseconds: Self.modificationTimeNanoseconds(modified.timeIntervalSince1970),
             fileIdentifier: values.fileResourceIdentifier.map { String(describing: $0) },
             generationIdentifier: values.generationIdentifier.map { String(describing: $0) }
         )
@@ -193,17 +198,22 @@ public struct LocalScanner: Sendable {
         try await Task.detached(priority: .utility) {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
-            var sha256 = SHA256()
-            var md5 = includingMD5 ? Insecure.MD5() : nil
-            while true {
-                try Task.checkCancellation()
-                let data = try handle.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
-                if data.isEmpty { break }
-                sha256.update(data: data)
-                md5?.update(data: data)
-            }
-            return (sha256.finalize().hexadecimalString, md5?.finalize().hexadecimalString)
+            return try digests(handle: handle, includingMD5: includingMD5)
         }.value
+    }
+
+    public func digests(handle: FileHandle, includingMD5: Bool) throws -> (sha256: String, md5: String?) {
+        try handle.seek(toOffset: 0)
+        var sha256 = SHA256()
+        var md5 = includingMD5 ? Insecure.MD5() : nil
+        while true {
+            try Task.checkCancellation()
+            let data = try handle.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
+            if data.isEmpty { break }
+            sha256.update(data: data)
+            md5?.update(data: data)
+        }
+        return (sha256.finalize().hexadecimalString, md5?.finalize().hexadecimalString)
     }
 
     public func sha256(url: URL) async throws -> String {

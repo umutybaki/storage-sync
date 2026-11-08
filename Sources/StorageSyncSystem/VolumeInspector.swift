@@ -40,6 +40,9 @@ public struct VolumeInspector: Sendable {
         // must still receive external-volume identity handling.
         let removable = (values.volumeIsRemovable ?? false) || values.volumeIsInternal == false
         let marker = try marker(at: selectedURL, createIfMissing: removable && createMarkerIfNeeded)
+        if createMarkerIfNeeded, removable, marker == nil, values.volumeUUIDString == nil {
+            throw VolumeInspectorError.ambiguousIdentity
+        }
         return VolumeIdentity(
             persistentUUID: values.volumeUUIDString,
             creationDate: values.volumeCreationDate,
@@ -74,18 +77,25 @@ public struct VolumeInspector: Sendable {
 
     private func marker(at selectedURL: URL, createIfMissing: Bool) throws -> UUID? {
         let markerURL = selectedURL.appendingPathComponent(Self.markerFilename, isDirectory: false)
-        if let text = try? String(contentsOf: markerURL, encoding: .utf8),
-           let value = UUID(uuidString: text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return value
+        func readMarker() -> UUID? {
+            let fd = open(markerURL.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { return nil }
+            let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            var info = stat()
+            guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size <= 128,
+                  let bytes = try? file.read(upToCount: 129),
+                  let text = String(data: bytes, encoding: .utf8) else { return nil }
+            return UUID(uuidString: text.trimmingCharacters(in: .whitespacesAndNewlines))
         }
+        if let existing = readMarker() { return existing }
         guard createIfMissing else { return nil }
         let value = UUID()
+        // A marker-shaped user file or a concurrent pairing must never be replaced.
         do {
-            try value.uuidString.data(using: .utf8)?.write(to: markerURL, options: [.atomic])
+            try Data(value.uuidString.utf8).write(to: markerURL, options: .withoutOverwriting)
             return value
         } catch {
-            // A stable filesystem UUID remains sufficient on volumes where a marker is not writable.
-            return nil
+            return readMarker()
         }
     }
 }

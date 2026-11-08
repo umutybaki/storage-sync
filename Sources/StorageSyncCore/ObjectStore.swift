@@ -67,6 +67,7 @@ public protocol ObjectStore: Sendable {
     func completeMultipartUpload(key: String, uploadID: String, parts: [UploadedPart]) async throws -> RemoteObject
     func abortMultipartUpload(key: String, uploadID: String) async throws
     func getRange(key: String, range: Range<Int64>?) async throws -> Data
+    func getRange(key: String, range: Range<Int64>, matchingETag: String?) async throws -> Data
     /// Conditional forms of the two requests that make an object visible. A
     /// failed condition throws `ObjectStoreError.objectChanged`.
     func put(
@@ -85,8 +86,13 @@ public protocol ObjectStore: Sendable {
 }
 
 public extension ObjectStore {
-    /// Stores that cannot check a condition write unconditionally, which is
-    /// exactly what every store did before conditions existed.
+    func getRange(key: String, range: Range<Int64>, matchingETag: String?) async throws -> Data {
+        guard RemoteObject.comparableETag(matchingETag) == nil else {
+            throw ObjectStoreError.incompatible("The store cannot pin a range to an object version.")
+        }
+        return try await getRange(key: key, range: range)
+    }
+
     func put(
         key: String,
         data: Data,
@@ -94,7 +100,8 @@ public extension ObjectStore {
         precondition: WritePrecondition,
         progress: @escaping UploadProgressHandler
     ) async throws -> RemoteObject {
-        try await put(key: key, data: data, metadata: metadata, progress: progress)
+        guard precondition == .none else { throw ObjectStoreError.incompatible("The store cannot perform a conditional upload.") }
+        return try await put(key: key, data: data, metadata: metadata, progress: progress)
     }
 
     func completeMultipartUpload(
@@ -103,7 +110,8 @@ public extension ObjectStore {
         parts: [UploadedPart],
         precondition: WritePrecondition
     ) async throws -> RemoteObject {
-        try await completeMultipartUpload(key: key, uploadID: uploadID, parts: parts)
+        guard precondition == .none else { throw ObjectStoreError.incompatible("The store cannot conditionally complete an upload.") }
+        return try await completeMultipartUpload(key: key, uploadID: uploadID, parts: parts)
     }
 
     /// Existing providers and test doubles remain correct without implementing

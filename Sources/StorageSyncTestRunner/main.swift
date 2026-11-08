@@ -204,6 +204,10 @@ private final class ReliabilitySuite {
         try await localScannerBackpressureCheck()
         try await packageContentsScanCheck()
         try await partialDirectorySymlinkCheck()
+        try await partialLeafSafetyCheck()
+        try await selectedFolderCheckpointCheck()
+        try await coordinatorBehaviorCheck(direction: .upload)
+        try await coordinatorBehaviorCheck(direction: .download)
         try await persistenceRecoveryCheck()
         try await failedTransferQueueSemanticsCheck()
         try await transferActivityCheck()
@@ -506,7 +510,8 @@ private final class ReliabilitySuite {
                     httpVersion: "HTTP/1.1",
                     headerFields: [
                         "Content-Length": request.httpMethod == "PUT" ? "0" : "4",
-                        "ETag": "\"etag\""
+                        "ETag": "\"etag\"",
+                        "Content-Range": "bytes 5-8/10"
                     ]
                   ) else {
                 throw CheckFailure.failed("Could not construct the stub S3 response")
@@ -924,7 +929,8 @@ private final class ReliabilitySuite {
                 status = 200
             } else {
                 body = payload.subdata(in: 2..<6)
-                headers["Content-Range"] = "bytes 2-5/10"
+                headers["Content-Range"] = url.path.hasSuffix("wrong-window.bin") ? "bytes 0-3/10" : "bytes 2-5/10"
+                if url.path.hasSuffix("oversize.bin") { body = payload }
                 // Non-conforming, but it did serve exactly what was asked for.
                 if url.path.hasSuffix("describes-range.bin") { status = 200 }
             }
@@ -961,7 +967,17 @@ private final class ReliabilitySuite {
         } catch ObjectStoreError.incompatible {
             // Expected.
         }
-        let partial = try await store.getRange(key: "honours-range.bin", range: 2..<6)
+        do {
+            _ = try await store.getRange(key: "wrong-window.bin", range: 2..<6)
+            throw CheckFailure.failed("A 206 from the wrong offset was accepted")
+        } catch ObjectStoreError.incompatible {}
+        do {
+            _ = try await store.getRange(key: "oversize.bin", range: 2..<6)
+            throw CheckFailure.failed("An oversized range response was buffered as a valid part")
+        } catch ObjectStoreError.invalidResponse {}
+        let partial = try await store.getRange(key: "honours-range.bin", range: 2..<6, matchingETag: "CaseSensitive")
+        try check(S3URLProtocolStub.recordedRequests().last?.value(forHTTPHeaderField: "If-Match") == "\"CaseSensitive\"",
+                  "The ranged GET was not pinned to the HEAD version")
         try check(partial == payload.subdata(in: 2..<6), "A 206 partial response was not handed back to the caller")
         let described = try await store.getRange(key: "describes-range.bin", range: 2..<6)
         try check(
@@ -1082,8 +1098,20 @@ private final class ReliabilitySuite {
             return try await base.completeMultipartUpload(key: key, uploadID: uploadID, parts: parts)
         }
 
+        func completeMultipartUpload(key: String, uploadID: String, parts: [UploadedPart],
+                                     precondition: WritePrecondition) async throws -> RemoteObject {
+            guard parts.allSatisfy({ !$0.eTag.hasPrefix(Self.stalePrefix) }) else {
+                throw ObjectStoreError.invalidResponse("A stale duplicate part ETag was used")
+            }
+            return try await base.completeMultipartUpload(key: key, uploadID: uploadID, parts: parts, precondition: precondition)
+        }
+
         func abortMultipartUpload(key: String, uploadID: String) async throws {
             try await base.abortMultipartUpload(key: key, uploadID: uploadID)
+        }
+
+        func getRange(key: String, range: Range<Int64>, matchingETag: String?) async throws -> Data {
+            try await base.getRange(key: key, range: range, matchingETag: matchingETag)
         }
 
         func getRange(key: String, range: Range<Int64>?) async throws -> Data {
@@ -1124,6 +1152,10 @@ private final class ReliabilitySuite {
         )
         try check(settled.transfers.isEmpty, "An unchanged file with a matching baseline was queued again")
 
+        try check(!Reconciler.isSafeRelativePath("../\u{0301}outside"), "A combining mark concealed a traversal component")
+        try check(!Reconciler.isSafeRelativePath(".STORAGESYNC-PARTIALS/probe"), "A case alias exposed private partials")
+        try check(Reconciler.relativePath(for: "archive/\u{0301}photo", prefix: "archive") == "\u{0301}photo",
+                  "A combining mark at the start of a filename changed the prefix boundary")
         let unsafe = Reconciler().reconcile(
             direction: .download,
             prefix: "restore",
@@ -1236,6 +1268,9 @@ private final class ReliabilitySuite {
             totalCapacity: 1_000,
             isRemovable: true
         )
+        let unknownVolume = VolumeIdentity(persistentUUID: nil, creationDate: nil, filesystemType: nil,
+                                           totalCapacity: nil, isRemovable: false)
+        try check(!unknownVolume.confidentlyMatches(unknownVolume), "Missing volume identifiers matched one another")
         let wrongVolume = VolumeIdentity(
             persistentUUID: "drive-b",
             creationDate: nil,
@@ -1320,8 +1355,8 @@ private final class ReliabilitySuite {
     }
 
     private func eTagComparisonCheck() throws {
-        try check(RemoteObject.comparableETag("\"ABC123\"") == "abc123", "A quoted ETag was not made comparable")
-        try check(RemoteObject.comparableETag("W/\"abc123\"") == "abc123", "A weak ETag was not made comparable")
+        try check(RemoteObject.comparableETag("\"ABC123\"") == "ABC123", "A quoted ETag was not made comparable")
+        try check(RemoteObject.comparableETag("W/\"abc123\"") == nil, "A weak ETag was accepted as a byte identity")
         try check(RemoteObject.comparableETag(" abc123 ") == "abc123", "An unquoted ETag was not made comparable")
         try check(RemoteObject.comparableETag("\"\"") == nil, "An empty quoted ETag was treated as an identity")
         let baseline = ReconciliationBaseline(
@@ -1353,6 +1388,12 @@ private final class ReliabilitySuite {
             }
             let prefix = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
                 .first(where: { $0.name == "prefix" })?.value
+            if prefix == "wrong-root" {
+                return (response, Data("<html><body>Login</body></html>".utf8))
+            }
+            if prefix == "invalid-entry" {
+                return (response, Data("<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>real</Key><Size>oops</Size></Contents></ListBucketResult>".utf8))
+            }
             if prefix == "raw/" {
                 // A provider that ignored encoding-type: its keys are raw and
                 // must not be decoded, and their whitespace is part of them.
@@ -1401,6 +1442,12 @@ private final class ReliabilitySuite {
             session: session
         )
 
+        for prefix in ["wrong-root", "invalid-entry"] {
+            do {
+                _ = try await store.list(prefix: prefix, continuationToken: nil)
+                throw CheckFailure.failed("An incomplete inventory was accepted for \(prefix)")
+            } catch ObjectStoreError.invalidResponse {}
+        }
         let encoded = try await store.list(prefix: "album/", continuationToken: nil)
         try check(
             encoded.objects.map(\.key) == ["album/a b+c.jpg", "album/trailing.jpg ", "album/control\u{1}.jpg"],
@@ -1677,6 +1724,163 @@ private final class ReliabilitySuite {
         }
         let outsideItems = try FileManager.default.contentsOfDirectory(atPath: outside.path)
         try check(outsideItems.isEmpty, "A download partial escaped through a symlinked internal directory")
+    }
+
+    private func selectedFolderCheckpointCheck() async throws {
+        let fixture = try Fixture.make(direction: .upload)
+        defer { fixture.cleanup() }
+        var job = fixture.job
+        try await fixture.repository.saveJob(job)
+        let key = "backup/photo"
+        let uploadID = try await fixture.store.createMultipartUpload(key: key, metadata: [:])
+        let earlier = Data("oldbytes".utf8)
+        _ = try await fixture.store.uploadPart(key: key, uploadID: uploadID, partNumber: 1, data: earlier)
+        job.localRoot.bookmarkReference = "explicitly-reselected-folder"
+        try await fixture.repository.saveJob(job)
+        guard let moved = try await fixture.repository.job(id: job.id), moved.multipartGeneration != nil else {
+            throw CheckFailure.failed("Folder reselection did not invalidate old multipart work")
+        }
+        let file = fixture.root.appendingPathComponent("photo")
+        try Data("newbytesnewbytes".utf8).write(to: file)
+        let fingerprint = try LocalScanner().fingerprint(url: file, relativePath: "photo")
+        let legacy = TransferRecord(jobID: job.id, relativePath: "photo", kind: .upload, totalBytes: fingerprint.size,
+                                    sourceFingerprint: fingerprint, remoteKey: key, multipartUploadID: uploadID)
+        try await fixture.repository.saveTransfer(legacy)
+        guard case .superseded = await fixture.executor().execute(legacy, job: moved, root: fixture.root) else {
+            throw CheckFailure.failed("A reselected folder reused multipart bytes from the previous folder")
+        }
+        let remaining = await fixture.store.activeUploadCount()
+        let published = await fixture.store.data(for: key)
+        try check(remaining == 0 && published == nil, "The old folder's upload was completed or leaked")
+    }
+
+    private func partialLeafSafetyCheck() async throws {
+        let fixture = try Fixture.make(direction: .download)
+        defer { fixture.cleanup() }
+        let outside = fixture.directory.appendingPathComponent("keep")
+        let original = Data("irreplaceable".utf8)
+        try original.write(to: outside)
+        let dir = fixture.root.appendingPathComponent(ReservedName.partialsDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        let remote = await fixture.store.seed(key: "restore/photo", data: Data("new".utf8))
+        for kind in ["symlink", "hardlink", "directory"] {
+            let transfer = TransferRecord(jobID: fixture.job.id, relativePath: "photo", kind: .download,
+                                          totalBytes: remote.size, remoteSource: remote, remoteKey: remote.key)
+            let leaf = dir.appendingPathComponent(transfer.id.description + ".partial")
+            switch kind {
+            case "symlink": try FileManager.default.createSymbolicLink(at: leaf, withDestinationURL: outside)
+            case "hardlink": try FileManager.default.linkItem(at: outside, to: leaf)
+            default:
+                try FileManager.default.createDirectory(at: leaf, withIntermediateDirectories: false)
+                try original.write(to: leaf.appendingPathComponent("keep"))
+            }
+            try await fixture.repository.saveTransfer(transfer)
+            guard case .attention = await fixture.executor().execute(transfer, job: fixture.job, root: fixture.root) else {
+                throw CheckFailure.failed("A \(kind) partial was written or published")
+            }
+            try check(try Data(contentsOf: outside) == original, "The \(kind) partial modified an outside file")
+            if kind == "directory" {
+                try check(try Data(contentsOf: leaf.appendingPathComponent("keep")) == original, "Cleanup recursed into a directory")
+            }
+        }
+    }
+
+    private func coordinatorBehaviorCheck(direction: SyncDirection) async throws {
+        let f = try Fixture.make(direction: direction)
+        defer { f.cleanup() }
+        let bookmarks = try BookmarkStore(directory: f.directory.appendingPathComponent("bookmarks"))
+        try await f.repository.saveConnection(S3Connection(id: f.job.connectionID, name: "Test",
+            endpoint: URL(string: "https://example.test")!, region: "test", bucket: "test", credentialReference: "test"))
+        let path = "photo"
+        let key = f.job.remotePrefix + "/" + path
+        let url = f.root.appendingPathComponent(path)
+        func write(_ data: Data?, source: Bool) async throws {
+            if (direction == .upload) == source {
+                if let data { try data.write(to: url) } else { try FileManager.default.removeItem(at: url) }
+            } else if let data {
+                _ = await f.store.seed(key: key, data: data)
+            } else {
+                await f.store.removeFixtureObject(key)
+            }
+        }
+        func destination() async throws -> Data? {
+            if direction == .upload { return await f.store.data(for: key) }
+            return try FileManager.default.fileExists(atPath: url.path) ? Data(contentsOf: url) : nil
+        }
+        func scan(attention: Bool = false) async throws {
+            let coordinator = SyncCoordinator(repository: f.repository, bookmarks: bookmarks,
+                keychain: KeychainStore(service: "storagesync.fixture"), objectStoreFactory: FixtureProvider(store: f.store))
+            try await f.repository.setSnapshot(SyncSnapshot(jobID: f.job.id, phase: .idle))
+            try await coordinator.save(job: f.job)
+            for _ in 0..<1000 {
+                if let snapshot = try await f.repository.snapshot(jobID: f.job.id),
+                   [.watching, .attention].contains(snapshot.phase) {
+                    await coordinator.stop()
+                    try check(snapshot.phase == (attention ? .attention : .watching) && snapshot.blockers.isEmpty,
+                              "Unexpected \(direction) scan result: \(snapshot.message)")
+                    if attention { try check(snapshot.lastSuccessfulSync == nil, "A conflict was recorded as a successful copy") }
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            await coordinator.stop()
+            throw CheckFailure.failed("Coordinator fixture timed out")
+        }
+        let original = Data("111".utf8), different = Data("222".utf8), edited = Data("updated".utf8)
+        try await write(original, source: true)
+        try await write(different, source: false)
+        try await scan()
+        var bytes = try await destination()
+        try check(bytes == different, "First pairing replaced different same-size destination bytes")
+        try await write(edited, source: true)
+        try await scan()
+        bytes = try await destination()
+        try check(bytes == edited, "A source edit did not reach the destination")
+        try await write(original, source: false)
+        try await scan(attention: true)
+        bytes = try await destination()
+        try check(bytes == original, "A destination-only edit was overwritten")
+        try await write(different, source: true)
+        try await scan()
+        bytes = try await destination()
+        try check(bytes == different, "A changed source did not win after both sides changed")
+        try await write(nil, source: false)
+        try await scan()
+        bytes = try await destination()
+        try check(bytes == different, "A destination deletion was not repaired")
+        try await write(nil, source: true)
+        try await scan()
+        bytes = try await destination()
+        try check(bytes == different, "A source deletion removed destination bytes")
+        let baselines = try await f.repository.baselines(jobID: f.job.id)
+        try check(baselines.isEmpty, "A clean source deletion retained a baseline")
+        // Recreate the crash window between publishing and committing the first baseline.
+        let before = Data("old".utf8), after = Data("NEW".utf8)
+        try await write(before, source: direction == .upload)
+        let oldLocal = try LocalScanner().fingerprint(url: url, relativePath: path)
+        let oldRemote = await f.store.seed(key: key, data: before)
+        var attempt = TransferRecord(jobID: f.job.id, relativePath: path, kind: direction == .upload ? .upload : .download,
+                                     status: .waiting, totalBytes: 3,
+                                     sourceFingerprint: direction == .upload ? oldLocal : nil,
+                                     remoteSource: direction == .download ? oldRemote : nil, remoteKey: key)
+        if direction == .upload {
+            _ = try await f.store.put(key: key, data: before, metadata: ["storagesync-transfer-id": attempt.id.description])
+        } else {
+            attempt.verifiedDownloadChecksum = before.sha256Hexadecimal
+        }
+        try await f.repository.saveTransfer(attempt)
+        try await write(after, source: true)
+        try await scan()
+        bytes = try await destination()
+        try check(bytes == after, "A source edit after an interrupted publication was silently adopted")
+
+        if direction == .download {
+            _ = await f.store.seed(key: "restore/album", data: before)
+            _ = await f.store.seed(key: "restore/album/image", data: after)
+            try await scan(attention: true)
+            try check(!FileManager.default.fileExists(atPath: f.root.appendingPathComponent("album").path),
+                      "The scanner chose an arbitrary winner for a file/directory collision")
+        }
     }
 
     private func diskBackedManifestCheck() async throws {
@@ -4035,11 +4239,14 @@ private final class ReliabilitySuite {
         } catch ObjectStoreError.objectChanged {}
 
         let before = S3URLProtocolStub.recordedRequests().count
-        _ = try await store.put(key: "legacy.jpg", data: body, metadata: [:], precondition: .absent, progress: { _ in })
+        do {
+            _ = try await store.put(key: "legacy.jpg", data: body, metadata: [:], precondition: .absent, progress: { _ in })
+            throw CheckFailure.failed("A refused conditional write succeeded")
+        } catch ObjectStoreError.incompatible {}
         let legacyRequests = Array(S3URLProtocolStub.recordedRequests().dropFirst(before))
         try check(
-            legacyRequests.count == 2 && legacyRequests[1].value(forHTTPHeaderField: "If-None-Match") == nil,
-            "A provider without conditional writes did not get the plain write it can handle"
+            legacyRequests.count == 1 && legacyRequests[0].value(forHTTPHeaderField: "If-None-Match") == "*",
+            "A refused conditional write was retried without protection"
         )
 
         do {
@@ -4123,7 +4330,8 @@ private final class ReliabilitySuite {
         let single = TransferExecutor(
             repository: fixture.repository,
             objectStore: fixture.store,
-            retryPolicy: RetryPolicy(baseDelay: .zero, maximumDelay: .zero, maximumAttempts: 5)
+            retryPolicy: RetryPolicy(baseDelay: .zero, maximumDelay: .zero, maximumAttempts: 5),
+            verifiesETagDigests: true
         )
         func transfer(_ name: String, _ payload: Data, remote: RemoteObject) async throws -> TransferRecord {
             let source = fixture.root.appendingPathComponent(name)
@@ -4158,7 +4366,7 @@ private final class ReliabilitySuite {
         let multipartETag = "\"\(md5Hex(partDigests))-3\""
         let existingLarge = await fixture.store.seed(key: "backup/touched.raw", data: large, eTag: multipartETag)
         let second = try await transfer("touched.raw", large, remote: existingLarge)
-        guard case .completed = await fixture.executor().execute(second, job: fixture.job, root: fixture.root) else {
+        guard case .completed = await fixture.executor(verifiesETagDigests: true).execute(second, job: fixture.job, root: fixture.root) else {
             throw CheckFailure.failed("An already-present multipart object was not recognised")
         }
         let creates = await fixture.store.createCount()
@@ -4174,6 +4382,15 @@ private final class ReliabilitySuite {
         }
         let rewritten = await fixture.store.data(for: "backup/rewritten.jpg")
         try check(rewritten == different, "A same-size change with different bytes was skipped")
+
+        let opaque = await fixture.store.seed(key: "backup/opaque.jpg", data: other, eTag: md5Hex(different))
+        let fourth = try await transfer("opaque.jpg", different, remote: opaque)
+        let custom = TransferExecutor(repository: fixture.repository, objectStore: fixture.store)
+        guard case .completed = await custom.execute(fourth, job: fixture.job, root: fixture.root) else {
+            throw CheckFailure.failed("An upload with an opaque ETag did not complete")
+        }
+        let actual = await fixture.store.data(for: opaque.key)
+        try check(actual == different, "An opaque provider ETag was trusted as a content digest")
     }
 
     private func downloadOfChangedObjectReplansCheck() async throws {
@@ -4431,6 +4648,11 @@ private final class ReliabilitySuite {
     }
 }
 
+private struct FixtureProvider: ObjectStoreProviding {
+    let store: FaultInjectingObjectStore
+    func make(connection: S3Connection, credentials: S3Credentials?, timeout: TimeInterval?) async throws -> any ObjectStore { store }
+}
+
 private struct Fixture: @unchecked Sendable {
     let directory: URL
     let root: URL
@@ -4453,7 +4675,7 @@ private struct Fixture: @unchecked Sendable {
         return Fixture(directory: directory, root: root, repository: repository, store: FaultInjectingObjectStore(), job: job)
     }
 
-    func executor(maxConcurrentParts: Int = 1) -> TransferExecutor {
+    func executor(maxConcurrentParts: Int = 1, verifiesETagDigests: Bool = false) -> TransferExecutor {
         TransferExecutor(
             repository: repository,
             objectStore: store,
@@ -4465,7 +4687,8 @@ private struct Fixture: @unchecked Sendable {
                 maximumConcurrentFiles: 1,
                 maximumConcurrentPartsPerFile: maxConcurrentParts
             ),
-            retryPolicy: RetryPolicy(baseDelay: .zero, maximumDelay: .zero, maximumAttempts: 5)
+            retryPolicy: RetryPolicy(baseDelay: .zero, maximumDelay: .zero, maximumAttempts: 5),
+            verifiesETagDigests: verifiesETagDigests
         )
     }
 
@@ -4587,6 +4810,7 @@ private actor FaultInjectingObjectStore: ObjectStore {
         return remoteObject(key)!
     }
 
+    func removeFixtureObject(_ key: String) { objects.removeValue(forKey: key) }
     func data(for key: String) -> Data? { objects[key]?.data }
     func uploadCount(partNumber: Int) -> Int { totalPartUploads[partNumber, default: 0] }
     func completionCount() -> Int { completions }
@@ -4721,6 +4945,14 @@ private actor FaultInjectingObjectStore: ObjectStore {
     }
 
     func abortMultipartUpload(key: String, uploadID: String) async throws { uploads.removeValue(forKey: uploadID) }
+
+    func getRange(key: String, range: Range<Int64>, matchingETag: String?) async throws -> Data {
+        if let expected = RemoteObject.comparableETag(matchingETag),
+           RemoteObject.comparableETag(objects[key]?.eTag) != expected {
+            throw ObjectStoreError.objectChanged("The object changed before the range was read")
+        }
+        return try await getRange(key: key, range: range)
+    }
 
     func getRange(key: String, range: Range<Int64>?) async throws -> Data {
         guard let object = objects[key] else { throw ObjectStoreError.notFound }

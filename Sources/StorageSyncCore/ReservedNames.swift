@@ -18,7 +18,8 @@ public enum ReservedName {
     public static let partialsDirectory = ".storagesync-partials"
 
     public static func isReserved(_ component: some StringProtocol) -> Bool {
-        component == volumeMarker || component == partialsDirectory
+        let folded = Reconciler.canonicalLocalPath(String(component))
+        return folded == volumeMarker || folded == partialsDirectory
     }
 }
 
@@ -60,6 +61,6 @@ public enum IgnoredName {
     }
 
     public static func isIgnoredPath(_ path: String) -> Bool {
-        path.split(separator: "/", omittingEmptySubsequences: false).contains(where: isIgnored)
+        Reconciler.pathComponents(path).contains(where: isIgnored)
     }
 }
