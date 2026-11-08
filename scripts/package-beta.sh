@@ -2,12 +2,14 @@
 
 set -euo pipefail
 
-# Packages an ad-hoc signed beta archive for direct distribution.
+# Packages a beta archive for direct distribution, without notarization.
 #
 # This is not release-app.sh. That script produces a notarized, Developer ID
-# signed build and refuses to run without an Apple identity. This one produces
-# an archive anyone can install manually, accepting that Gatekeeper will warn
-# on first open because the build carries no Apple signature.
+# signed build and refuses to run without an Apple identity. This one signs
+# with whatever package-app.sh picks (a Developer ID Application identity when
+# the login keychain has one, otherwise ad hoc) and produces an archive anyone
+# can install manually, accepting that Gatekeeper blocks the first open
+# because the build is not notarized.
 #
 # The staging step is not optional. Inside iCloud Drive the file provider keeps
 # writing com.apple.FinderInfo onto the bundle, and codesign rejects that as

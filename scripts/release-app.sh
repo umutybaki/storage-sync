@@ -32,8 +32,10 @@ if ! xcrun --find stapler >/dev/null 2>&1; then
     exit 1
 fi
 
-RELEASE_SDK_PATH="${STORAGESYNC_SDK_PATH:-$(xcrun --sdk macosx --show-sdk-path)}"
-STORAGESYNC_SDK_PATH="${RELEASE_SDK_PATH}" \
+# The SDK is left to package-app.sh, which builds against the macOS 26 SDK
+# unless STORAGESYNC_SDK_PATH says otherwise. Asking xcrun would follow
+# whichever Xcode is selected, and its newer SDK is not the one the interface is
+# built and checked against.
 STORAGESYNC_SIGNING_IDENTITY="${RELEASE_SIGNING_IDENTITY}" \
     "${RELEASE_PROJECT_DIR}/scripts/package-app.sh"
 
