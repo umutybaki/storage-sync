@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 **Fixes from a review of the transfer path.** Three behavior changes: a file
 that already exists at the destination with a different size is no longer
@@ -40,8 +40,8 @@ no longer copied.
   as already copied.
 - Uploads now tell S3 what they expect to find: nothing, or the version that
   was there when the upload was planned. An object that appeared or changed in
-  the meantime is no longer replaced. Providers that do not support this get a
-  plain upload, as before.
+  the meantime is preserved. If the provider rejects conditional writes,
+  StorageSync stops the job and reports the incompatibility.
 - A file whose bytes are already in the bucket is no longer uploaded again
   just because its timestamp moved — for example after `touch`, or a daylight
   saving change on a FAT-formatted drive. The bytes are compared with the
