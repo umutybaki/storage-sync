@@ -53,9 +53,10 @@ not been verified.
 ## Credentials
 
 Keys are saved once, given a name, and reused. The sidebar's **Credentials**
-section lists every saved set with its shortened access key, when the keys were
-last replaced, and which syncs and locations depend on it. New Location offers
-them in a menu, so another bucket in the same account reuses the saved keys.
+section lists every saved set by name; selecting one shows its shortened access
+key, when the keys were last replaced, and which syncs and locations depend on
+it. New Location offers them in a menu, so another bucket in the same account
+reuses the saved keys.
 
 Sharing one set between syncs is the point, and it decides the rest of the
 behaviour. Replacing an expired key once fixes every sync using it — and because

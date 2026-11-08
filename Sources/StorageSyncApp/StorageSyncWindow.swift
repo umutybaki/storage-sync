@@ -112,16 +112,20 @@ private struct SyncSidebar: View {
     @AppStorage("sidebar.credentialsExpanded") private var credentialsExpanded = true
 
     var body: some View {
+        // Plain sections with their own header rather than
+        // `Section(isExpanded:)`: the system version hides its chevron until
+        // hover and puts it at the far edge, away from the title.
         List(selection: $model.selection) {
-            Section("Syncs", isExpanded: $syncsExpanded) {
-                ForEach(model.jobs) { job in
-                    SyncSidebarRow(
-                        job: job,
-                        status: model.status(for: job),
-                        snapshot: model.snapshot(for: job.id),
-                        connection: model.connection(for: job),
-                        credential: model.credential(for: job)
-                    )
+            Section {
+                if syncsExpanded {
+                    ForEach(model.jobs) { job in
+                        SyncSidebarRow(
+                            job: job,
+                            status: model.status(for: job),
+                            snapshot: model.snapshot(for: job.id),
+                            connection: model.connection(for: job),
+                            credential: model.credential(for: job)
+                        )
                         .tag(ManagerSelection.sync(job.id))
                         .contextMenu {
                             Button(model.isCheckingForChanges(job.id) ? "Checking for Changes…" : "Sync Now") {
@@ -139,32 +143,44 @@ private struct SyncSidebar: View {
                             Divider()
                             Button("Remove Sync…", role: .destructive) { model.requestRemoval(of: job) }
                         }
-                }
-            }
-
-            Section("Locations", isExpanded: $locationsExpanded) {
-                ForEach(model.locations) { location in
-                    Label {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(location.name).lineLimit(1)
-                            Text(location.localRoot != nil ? "Mac Folder" : "Cloud Bucket")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    } icon: { Image(systemName: location.localRoot != nil ? "folder" : "externaldrive.badge.icloud") }
-                    .tag(ManagerSelection.location(location.id))
-                    .contextMenu {
-                        Button("Create Sync with This Location…") { model.beginCreatingSync(location: location) }
-                        Divider()
-                        Button("Remove Location…", role: .destructive) { model.locationPendingRemoval = location }
-                            .disabled(!model.syncsUsing(location).isEmpty)
                     }
                 }
+            } header: {
+                SidebarSectionHeader(title: "Syncs", isExpanded: $syncsExpanded, addLabel: "New Sync") {
+                    model.beginCreatingSync()
+                }
             }
 
-            // Hidden until there is one. The first set is saved while creating
-            // a sync, so an empty section would only ever be an empty section.
-            if !model.credentials.isEmpty {
-                Section("Credentials", isExpanded: $credentialsExpanded) {
+            Section {
+                if locationsExpanded {
+                    ForEach(model.locations) { location in
+                        Label(location.name, systemImage: location.localRoot != nil ? "folder" : "externaldrive.badge.icloud")
+                            .lineLimit(1)
+                            .help(location.localRoot != nil ? "Mac folder" : "Cloud bucket")
+                            .tag(ManagerSelection.location(location.id))
+                            .contextMenu {
+                                Button("Create Sync with This Location…") { model.beginCreatingSync(location: location) }
+                                Divider()
+                                Button("Remove Location…", role: .destructive) { model.locationPendingRemoval = location }
+                                    .disabled(!model.syncsUsing(location).isEmpty)
+                            }
+                    }
+                }
+            } header: {
+                SidebarSectionHeader(
+                    title: "Locations",
+                    isExpanded: $locationsExpanded,
+                    addLabel: "New Location",
+                    canAdd: model.areLocationsAvailable
+                ) {
+                    model.isCreatingLocation = true
+                }
+            }
+
+            // Always shown, even empty: its header is now the only place to
+            // save credentials without creating a sync.
+            Section {
+                if credentialsExpanded {
                     ForEach(model.credentials) { credential in
                         CredentialSidebarRow(
                             credential: credential,
@@ -182,6 +198,10 @@ private struct SyncSidebar: View {
                         }
                     }
                 }
+            } header: {
+                SidebarSectionHeader(title: "Credentials", isExpanded: $credentialsExpanded, addLabel: "New Credentials") {
+                    model.beginCreatingCredential()
+                }
             }
         }
         .listStyle(.sidebar)
@@ -194,47 +214,78 @@ private struct SyncSidebar: View {
                 openLoginItems: { model.openLoginItemsSettings() }
             )
         }
-        .toolbar {
-            ToolbarItem {
-                Menu {
-                    Button("New Sync…") { model.beginCreatingSync() }
-                    Button("New Location…") { model.isCreatingLocation = true }
-                        .disabled(!model.areLocationsAvailable)
-                    Button("New Credentials…") { model.beginCreatingCredential() }
-                } label: {
-                    Label("New", systemImage: "plus")
-                }
-                .menuIndicator(.hidden)
-                .accessibilityLabel("New")
-                .help("Create a sync, location, or saved credentials")
-            }
-        }
     }
 }
 
-/// Saved keys read as one line: what they are called, and the shortened access
-/// key that tells two sets from the same provider apart.
+/// A group title that reads as a heading rather than another row: smaller and
+/// quieter than the items under it, with a chevron that is always visible
+/// beside the name and a create button at the trailing edge.
+private struct SidebarSectionHeader: View {
+    let title: String
+    @Binding var isExpanded: Bool
+    let addLabel: String
+    var canAdd = true
+    let add: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button {
+                withAnimation(.snappy(duration: 0.2)) { isExpanded.toggle() }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(title)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityAddTraits(.isHeader)
+            .help(isExpanded ? "Hide \(title)" : "Show \(title)")
+
+            Spacer(minLength: 0)
+
+            // Sized to the title's line so the button cannot make the header
+            // taller than its text and pad it unevenly.
+            Button(action: add) {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 14)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .disabled(!canAdd)
+            .help("\(addLabel)…")
+            .accessibilityLabel(addLabel)
+        }
+        // Quieter than the rows it labels, like Finder's sidebar headings.
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(.secondary)
+        // The list already separates sections above the header; this keeps the
+        // first row from touching the title while staying under that gap.
+        .padding(.bottom, Self.spaceBelowTitle)
+        // Lines the plus up with the trailing accessories of the rows below.
+        .padding(.trailing, Self.trailingInset)
+    }
+
+    private static let spaceBelowTitle: CGFloat = 4
+    private static let trailingInset: CGFloat = 14
+}
+
+/// Saved keys read as one line: what they are called. The shortened access key
+/// that tells two sets from the same provider apart lives in the tooltip.
 private struct CredentialSidebarRow: View {
     let credential: StoredCredential
     let usedByCount: Int
 
     var body: some View {
         HStack(spacing: 6) {
-            Label {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(credential.name)
-                        .lineLimit(1)
-                    if let summary = credential.accessKeySummary {
-                        Text(summary)
-                            .font(.caption)
-                            .monospaced()
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-            } icon: {
-                Image(systemName: credential.hasSessionToken ? "key.slash" : "key")
-            }
+            Label(credential.name, systemImage: credential.hasSessionToken ? "key.slash" : "key")
+                .lineLimit(1)
             Spacer(minLength: 4)
             if usedByCount > 0 {
                 Text("\(usedByCount)")
@@ -248,11 +299,13 @@ private struct CredentialSidebarRow: View {
     }
 
     private var helpText: String {
-        switch usedByCount {
+        let usage = switch usedByCount {
         case 0: "Not used by any sync yet"
         case 1: "Used by one sync"
         default: "Used by \(usedByCount) syncs"
         }
+        guard let summary = credential.accessKeySummary else { return usage }
+        return "\(summary) · \(usage)"
     }
 }
 
@@ -265,20 +318,16 @@ private struct SyncSidebarRow: View {
     @State private var showsInfo = false
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: status.symbol)
-                .foregroundStyle(status.tint)
-                .frame(width: 18)
-                .accessibilityLabel(status.title)
-
-            VStack(alignment: .leading, spacing: 2) {
+        // A Label, like the location and credential rows, so every item's
+        // icon and name sit on the same columns across sections.
+        HStack(spacing: 6) {
+            Label {
                 Text(job.name)
                     .lineLimit(1)
-                Text(SyncRoute.text(job, connection: connection))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            } icon: {
+                Image(systemName: status.symbol)
+                    .foregroundStyle(status.tint)
+                    .accessibilityLabel(status.title)
             }
 
             Spacer(minLength: 2)
@@ -303,7 +352,6 @@ private struct SyncSidebarRow: View {
             }
         }
         .contentShape(Rectangle())
-        .padding(.vertical, 2)
         .help(status.title)
     }
 }

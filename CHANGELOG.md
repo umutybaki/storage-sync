@@ -6,11 +6,14 @@
   storage bars on the right. Hover tooltips hold location details and byte
   totals; file issues stay visible. Removed the routine copying instructions,
   activity breakdown, and empty-list message.
-- Added Finder-style collapsible sidebar sections that remember their state.
-  Removed the sidebar toolbar button and the New menu's arrow; sidebar
-  toggling remains available through the View menu and keyboard shortcut.
-  Location creation is available from the plus menu without a duplicate
-  sidebar button.
+- Added collapsible sidebar sections that remember their state. Each section
+  title is a small secondary heading with an always-visible chevron beside it
+  and its own plus button for a new sync, location, or credentials, replacing
+  the toolbar New menu. Sidebar items are a single line with names aligned
+  across sections; sync details stay in the info popover. The Credentials
+  section now shows even when empty, so keys can be saved before creating a
+  sync. Sidebar toggling remains available through the View menu and keyboard
+  shortcut.
 
 - Replaced the separate Transfers panel and filter tabs with a compact native
   list directly below the sync summary. Column headers sort the full activity
