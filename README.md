@@ -125,11 +125,11 @@ Signing with an Apple-issued identity is optional for local use and required onl
 STORAGESYNC_SIGNING_IDENTITY="Apple Development: Your Name (TEAMID)" ./scripts/package-app.sh
 ```
 
-## Installing a downloaded beta
+## Installing a downloaded release
 
-Beta archives on the [Releases page](https://github.com/umutybaki/storage-sync/releases) are ad-hoc signed, not notarized, because the project has no Apple Developer ID yet. macOS quarantines them on download and will refuse the first open with a message about being unable to verify the developer.
+Releases on the [Releases page](https://github.com/umutybaki/storage-sync/releases) from 0.6.0-beta.1 onward are signed with a Developer ID and notarized by Apple. Unzip, move `StorageSync.app` to `/Applications`, and open it. Verify the download against the SHA-256 published in the release notes first.
 
-Unzip, move `StorageSync.app` to `/Applications`, then either open **System Settings → Privacy & Security**, scroll to the blocked-app notice and choose **Open Anyway** — or clear the quarantine flag directly:
+Betas up to 0.4.2 were ad-hoc signed and not notarized. macOS refuses their first open with a message about being unable to verify the developer. To open one, open **System Settings → Privacy & Security**, scroll to the blocked-app notice and choose **Open Anyway** — or clear the quarantine flag directly:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/StorageSync.app
@@ -137,7 +137,7 @@ xattr -dr com.apple.quarantine /Applications/StorageSync.app
 
 The right-click → Open shortcut that used to work no longer does on macOS 15 and later. Verify the download against the SHA-256 published in the release notes before doing either.
 
-Build a beta archive yourself with:
+Build an unnotarized beta archive yourself with:
 
 ```sh
 ./scripts/package-beta.sh
@@ -167,7 +167,7 @@ After producing a signed build, complete the production-background checks in [th
 
 ## Project status
 
-Working and used against real buckets and real external drives, but not yet distributed as a notarized release. The notarization and public-release path in `scripts/release-app.sh` is written but unproven — it has not been run end to end, because that requires an Apple-issued Developer ID. Treat that script as untested until someone does.
+Working and used against real buckets and real external drives. Releases are notarized from 0.6.0-beta.1 onward: `scripts/release-app.sh` first ran end to end on 8 November 2026, through Apple's notary service, stapling, and a Gatekeeper assessment. Surviving a login restart and replacing the background helper during an update have not been verified yet; the [runbook](docs/REAL-WORLD-TEST.md#signed-release-validation) covers both.
 
 The app was originally built as a photo-specific tool named PhotoSync, and was generalized without changing its behaviour. Reverse-DNS identifiers in the source still read `app.photosync.*` — the Keychain service, the launchd label, the Mach service name, and the bundle identifier. That is deliberate: those strings are bound to existing installs' credentials and resume state, and renaming them would orphan both. The on-disk state directory is `~/Library/Application Support/PhotoSync/` for the same reason.
 

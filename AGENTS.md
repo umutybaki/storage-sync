@@ -14,14 +14,14 @@ Small native macOS menu-bar app for durable one-way sync between a local folder 
 - Resume only when the same external volume is confidently identified.
 - Credentials live in the macOS Keychain only. Never print, copy, log, or ask for them.
 
-Do not declare the app complete from automated tests alone. Notarization and the public release path remain unproven and must not be implied as tested.
+Do not declare the app complete from automated tests alone. Notarization works (first run end to end on 2026-11-08), but login-restart survival and helper replacement across an update remain unproven and must not be implied as tested.
 
 ## Workspace and toolchain
 
 - Full Xcode is installed and selected (`xcode-select -p`), but every build still passes the Command Line Tools' macOS 26 SDK explicitly, as below. Check `xcode-select -p` rather than trusting this line.
 - **Build against `MacOSX26.sdk`.** macOS picks its interface from the SDK in `LC_BUILD_VERSION`, so an older one silently produces a dated-looking app, and `StorageSyncApp` uses `ToolbarSpacer`, absent before macOS 26. Deployment target stays macOS 14.
 - Pass **`--build-system native`** to SwiftPM. The current default Swift Build engine ignores the requested SDK: it compiled with SDK 27.2 and stamped SDK 14.0, breaking the menu-bar layout. Packaging checks the executable's SDK version before signing.
-- **`codesign --verify --strict` on `.build/StorageSync.app` always fails, and that is not a real failure.** iCloud's file provider re-adds `com.apple.FinderInfo` and `xattr -cr` cannot keep it off. Copy the bundle out with `ditto --noextattr --norsrc` first, or check what `install-app.sh` put in `/Applications` — that is the copy that matters.
+- **`codesign --verify --strict` on `.build/StorageSync.app` fails whenever the workspace sits in iCloud Drive**, and that is not a real failure: the file provider re-adds `com.apple.FinderInfo` and `xattr -cr` cannot keep it off. This checkout is outside iCloud and the check passed on 2026-11-08; `release-app.sh` verifies and staples `.build` in place, so it relies on that. If the check fails, look for that xattr before suspecting the signature, and verify a copy made with `ditto --noextattr --norsrc` or the one `install-app.sh` put in `/Applications`.
 - This **is** a Git repository (earlier versions of this file said it was not). Tracked files have an undo; untracked ones do not, so copy those outside the tree before replacing them.
 - Moving the workspace invalidates the module cache; clear `.build/*/ModuleCache`.
 
@@ -40,6 +40,16 @@ swift run --build-system native --disable-sandbox \
 Package with `./scripts/package-app.sh`, install with `./scripts/install-app.sh`. Packaging signs and verifies in `$TMPDIR` before moving the bundle into `.build`, so a clean run means the signature was good.
 
 Packaging picks its signing identity from the login keychain — Developer ID Application, then Apple Development — and signs ad hoc, with a warning, when neither exists. `STORAGESYNC_SIGNING_IDENTITY` overrides it (`-` forces ad hoc). Apple Distribution is refused: it signs App Store submissions only. Switching from ad hoc to a team identity changes the helper's Keychain identity once, so expect one more **Always Allow** prompt; after that rebuilds keep the same identity and stop prompting. Codesign itself may ask once for access to the signing key.
+
+Notarized releases come from `release-app.sh`, which needs a Developer ID Application identity and a notarytool Keychain profile. The user created that profile as `storagesync`; never ask for, store, or handle its password.
+
+```sh
+STORAGESYNC_SIGNING_IDENTITY="Developer ID Application: …" \
+STORAGESYNC_NOTARY_PROFILE=storagesync \
+./scripts/release-app.sh
+```
+
+It first ran end to end on 2026-11-08 for v0.6.0-beta.1: Apple accepted the submission with no issues, the ticket was stapled, and Gatekeeper accepted the extracted archive with a quarantine flag set. Publish with `gh release`; betas are tagged `vX.Y.Z-beta.N`, marked pre-release, and carry the archive's SHA-256 in their notes. `package-beta.sh` makes an unnotarized archive, which macOS refuses to open from a download.
 
 ## Live state — read it, never quote it
 
@@ -95,7 +105,7 @@ Activity subscription begins with the first incoming command on the requirement-
 
 ## Known gaps
 
-- Notarization, stapling, Gatekeeper assessment, login-restart survival, and helper replacement across an update are all unproven and each needs an Apple identity. `scripts/release-app.sh` implements a fail-closed workflow for it but has never run end to end.
+- Login-restart survival and replacing the background helper across an update are unproven. Notarization, stapling, and Gatekeeper assessment were proven on 2026-11-08 (see Workspace and toolchain).
 - The two-bar storage display and menu-bar popover were visually verified in the installed app on 2026-11-08 using computer use. Other UI flows have not had that visual verification.
 
 ## Safety while resuming
