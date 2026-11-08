@@ -125,7 +125,7 @@ extension SyncStatus {
                     self = SyncStatus(
                         tone: .caughtUp,
                         title: engineMessage.isEmpty ? "All caught up" : engineMessage,
-                        detail: "Click Sync Now whenever you want to check for new and changed files."
+                        detail: ""
                     )
                 }
             }

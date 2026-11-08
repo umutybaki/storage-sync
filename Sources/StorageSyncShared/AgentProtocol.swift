@@ -5,6 +5,9 @@ public enum AgentCommandKind: String, Codable, Sendable {
     case snapshots
     case jobs
     case connections
+    case locations
+    case saveLocation
+    case removeLocation
     /// One bounded page from the selected sync's durable activity batch.
     case transferActivityPage
     case saveConnection
@@ -84,6 +87,11 @@ public struct JobCommandPayload: Codable, Sendable {
     public init(jobID: SyncJobID) {
         self.jobID = jobID
     }
+}
+
+public struct LocationCommandPayload: Codable, Sendable {
+    public var locationID: LocationID
+    public init(locationID: LocationID) { self.locationID = locationID }
 }
 
 @objc public protocol StorageSyncAgentXPCProtocol {

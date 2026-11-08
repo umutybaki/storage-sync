@@ -55,7 +55,8 @@ public actor SyncRepository {
         if needsTransferMetricsBackfill {
             try Self.backfillTransferMetrics(database: database, decoder: decoder)
         }
-        try database.execute("PRAGMA user_version=3")
+        try Self.adoptLocations(database: database, encoder: encoder, decoder: decoder)
+        try database.execute("PRAGMA user_version=4")
         try Self.recoverInterruptedTransfers(database: database, encoder: encoder, decoder: decoder)
         try Self.backfillTransferActivityIfNeeded(database: database, encoder: encoder, decoder: decoder)
     }
@@ -138,6 +139,12 @@ public actor SyncRepository {
     }
 
     public func saveConnection(_ connection: S3Connection) throws {
+        if let previous = try self.connection(id: connection.id),
+           try locations().contains(where: { $0.connectionID == connection.id }),
+           previous.endpoint != connection.endpoint || previous.region != connection.region
+            || previous.bucket != connection.bucket || previous.addressingStyle != connection.addressingStyle {
+            throw LocationError.immutableTarget
+        }
         try upsert(
             table: "connections",
             id: connection.id.description,
@@ -152,6 +159,38 @@ public actor SyncRepository {
 
     public func connection(id: ConnectionID) throws -> S3Connection? {
         try load(table: "connections", id: id.description, as: S3Connection.self)
+    }
+
+    public func locations() throws -> [StorageLocation] {
+        try loadAll(table: "locations", as: StorageLocation.self)
+    }
+
+    public func location(id: LocationID) throws -> StorageLocation? {
+        try load(table: "locations", id: id.description, as: StorageLocation.self)
+    }
+
+    public func saveLocation(_ location: StorageLocation) throws {
+        var stored = location
+        stored.name = location.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stored.name.isEmpty else { throw LocationError.invalidName }
+        guard try !locations().contains(where: {
+            $0.id != stored.id && $0.name.localizedCaseInsensitiveCompare(stored.name) == .orderedSame
+        }) else { throw LocationError.duplicateName }
+        if let previous = try self.location(id: stored.id), previous.target != stored.target {
+            throw LocationError.immutableTarget
+        }
+        if let connectionID = stored.connectionID, try connection(id: connectionID) == nil {
+            throw LocationError.missingConnection
+        }
+        try upsert(table: "locations", id: stored.id.description, payload: encoder.encode(stored))
+        publishStateUpdate()
+    }
+
+    public func removeLocation(id: LocationID) throws {
+        let dependents = try jobs().filter { $0.sourceLocationID == id || $0.destinationLocationID == id }
+        guard dependents.isEmpty else { throw LocationError.inUse(dependents.map(\.name)) }
+        try database.execute("DELETE FROM locations WHERE id = ?", bindings: [.text(id.description)])
+        publishStateUpdate()
     }
 
     /// Saved provider keys, described without their secrets. The secret itself
@@ -184,8 +223,27 @@ public actor SyncRepository {
 
     public func saveJob(_ job: SyncJob) throws {
         var stored = job
+        if job.sourceLocationID != nil || job.destinationLocationID != nil {
+            guard let sourceID = job.sourceLocationID, let destinationID = job.destinationLocationID,
+                  let source = try location(id: sourceID), let destination = try location(id: destinationID) else {
+                throw LocationError.missingLocation
+            }
+            try stored.resolveRoute(source: source, destination: destination)
+            guard try connection(id: stored.connectionID) != nil else { throw LocationError.missingConnection }
+        }
         if let previous = try self.job(id: job.id) {
-            stored.multipartGeneration = previous.localRoot == job.localRoot ? previous.multipartGeneration : UUID()
+            if previous.sourceLocationID != nil {
+                guard stored.sourceLocationID != nil, stored.destinationLocationID != nil else {
+                    throw LocationError.missingLocation
+                }
+                // Reversing a job or changing its bucket would reinterpret
+                // existing baselines and multipart checkpoints. A new sync
+                // establishes that pairing explicitly instead.
+                guard previous.direction == stored.direction,
+                      previous.connectionID == stored.connectionID,
+                      previous.remotePrefix == stored.remotePrefix else { throw LocationError.immutableTarget }
+            }
+            stored.multipartGeneration = previous.localRoot == stored.localRoot ? previous.multipartGeneration : UUID()
         }
         try upsert(table: "jobs", id: job.id.description, payload: encoder.encode(stored))
         publishStateUpdate()
@@ -248,6 +306,10 @@ public actor SyncRepository {
     }
 
     public func removeConnection(id: ConnectionID) throws {
+        guard try !locations().contains(where: { $0.connectionID == id }),
+              try !jobs().contains(where: { $0.connectionID == id }) else {
+            throw LocationError.immutableTarget
+        }
         try database.execute(
             "DELETE FROM connections WHERE id = ?",
             bindings: [.text(id.description)]
@@ -460,13 +522,34 @@ public actor SyncRepository {
 
         var cursorClause = ""
         var bindings: [SQLiteValue] = [.text(request.jobID.description), .text(state.batchID.uuidString)]
-        if let cursor = request.cursor {
-            cursorClause = "AND (updated_at_ms < ? OR (updated_at_ms = ? AND id < ?))"
-            bindings += [
-                .integer(cursor.updatedAtMilliseconds),
-                .integer(cursor.updatedAtMilliseconds),
-                .text(cursor.transferID.description)
-            ]
+        let orderClause: String
+        let offsetClause: String
+        if let sort = request.sort {
+            // Whitelisted SQL identifiers only. Values remain bound parameters.
+            let column: String
+            switch sort.column {
+            case .name: column = "file_name COLLATE filename"
+            case .status: column = "status"
+            case .progress: column = "progress"
+            case .size: column = "total_bytes"
+            case .updated: column = "updated_at_ms"
+            }
+            let direction = sort.ascending ? "ASC" : "DESC"
+            orderClause = "\(column) \(direction), id \(direction)"
+            offsetClause = "OFFSET ?"
+            bindings.append(.integer(Int64(max(0, request.offset ?? 0))))
+        } else {
+            // Preserve the legacy keyset API for older clients and engine tests.
+            orderClause = "updated_at_ms DESC, id DESC"
+            offsetClause = ""
+            if let cursor = request.cursor {
+                cursorClause = "AND (updated_at_ms < ? OR (updated_at_ms = ? AND id < ?))"
+                bindings += [
+                    .integer(cursor.updatedAtMilliseconds),
+                    .integer(cursor.updatedAtMilliseconds),
+                    .text(cursor.transferID.description)
+                ]
+            }
         }
 
         var items: [TransferActivityItem] = []
@@ -476,8 +559,8 @@ public actor SyncRepository {
             SELECT updated_at_ms, id, payload
             FROM transfer_activity
             WHERE job_id = ? AND batch_id = ? AND \(statusClause) \(cursorClause)
-            ORDER BY updated_at_ms DESC, id DESC
-            LIMIT \(limit + 1)
+            ORDER BY \(orderClause)
+            LIMIT \(limit + 1) \(offsetClause)
             """,
             bindings: bindings
         ) { statement in
@@ -1133,11 +1216,60 @@ public actor SyncRepository {
         try setSnapshot(value)
     }
 
+    /// Additive, transactional upgrade of the presentation ledger only. Decode
+    /// at most 500 old rows at a time; no queue/checkpoint payload is rewritten.
+    private static func migrateActivitySorting(database: SQLiteDatabase) throws {
+        var columns: Set<String> = []
+        try database.query("PRAGMA table_info(transfer_activity)") { statement in
+            if let name = database.text(statement, column: 1) { columns.insert(name) }
+        }
+        try database.transaction {
+            let needsBackfill = !columns.contains("file_name")
+            if needsBackfill {
+                try database.execute("ALTER TABLE transfer_activity ADD COLUMN file_name TEXT NOT NULL DEFAULT ''")
+                try database.execute("ALTER TABLE transfer_activity ADD COLUMN total_bytes INTEGER NOT NULL DEFAULT 0")
+                try database.execute("ALTER TABLE transfer_activity ADD COLUMN progress REAL NOT NULL DEFAULT 0")
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .millisecondsSince1970
+                var lastRowID: Int64 = 0
+                while true {
+                    var rows: [(Int64, TransferActivityItem)] = []
+                    try database.query(
+                        "SELECT rowid, payload FROM transfer_activity WHERE rowid > ? ORDER BY rowid LIMIT 500",
+                        bindings: [.integer(lastRowID)]
+                    ) { statement in
+                        guard let payload = database.blob(statement, column: 1) else { return }
+                        rows.append((database.integer(statement, column: 0), try decoder.decode(TransferActivityItem.self, from: payload)))
+                    }
+                    guard !rows.isEmpty else { break }
+                    for (rowID, item) in rows {
+                        try database.execute(
+                            "UPDATE transfer_activity SET file_name = ?, total_bytes = ?, progress = ? WHERE rowid = ?",
+                            bindings: [.text(item.fileName), .integer(item.totalBytes), .real(item.progressFraction), .integer(rowID)]
+                        )
+                    }
+                    lastRowID = rows.last!.0
+                }
+            }
+            for (name, column) in [
+                ("name", "file_name COLLATE filename"),
+                ("size", "total_bytes"),
+                ("progress", "progress"),
+                ("state", "status")
+            ] {
+                try database.execute("CREATE INDEX IF NOT EXISTS activity_sort_\(name) ON transfer_activity(job_id, batch_id, \(column), id)")
+            }
+        }
+    }
+
     private static func migrate(database: SQLiteDatabase) throws -> Bool {
         var previousVersion: Int64 = 0
         try database.query("PRAGMA user_version") { statement in
             previousVersion = database.integer(statement, column: 0)
         }
+        try database.execute(
+            "CREATE TABLE IF NOT EXISTS locations(id TEXT PRIMARY KEY, payload BLOB NOT NULL)"
+        )
         try database.execute(
             """
             CREATE TABLE IF NOT EXISTS connections(
@@ -1229,6 +1361,7 @@ public actor SyncRepository {
         try database.execute(
             "CREATE INDEX IF NOT EXISTS transfer_activity_path ON transfer_activity(job_id, relative_path)"
         )
+        try migrateActivitySorting(database: database)
         try database.execute(
             """
             CREATE TABLE IF NOT EXISTS manifest(
@@ -1370,14 +1503,17 @@ public actor SyncRepository {
                 try database.execute(
                     """
                     INSERT INTO transfer_activity(
-                      job_id, batch_id, id, relative_path, status, updated_at_ms, payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                      job_id, batch_id, id, relative_path, status, updated_at_ms, payload, file_name, total_bytes, progress
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(job_id, id) DO UPDATE SET
                       batch_id = excluded.batch_id,
                       relative_path = excluded.relative_path,
                       status = excluded.status,
                       updated_at_ms = excluded.updated_at_ms,
-                      payload = excluded.payload
+                      payload = excluded.payload,
+                      file_name = excluded.file_name,
+                      total_bytes = excluded.total_bytes,
+                      progress = excluded.progress
                     """,
                     bindings: [
                         .text(transfer.jobID.description),
@@ -1386,7 +1522,10 @@ public actor SyncRepository {
                         .text(transfer.relativePath),
                         .text(transfer.status.rawValue),
                         .integer(Int64((transfer.updatedAt.timeIntervalSince1970 * 1_000).rounded(.down))),
-                        .blob(try encoder.encode(item))
+                        .blob(try encoder.encode(item)),
+                        .text(item.fileName),
+                        .integer(item.totalBytes),
+                        .real(item.progressFraction)
                     ]
                 )
                 try database.execute(
@@ -1442,8 +1581,8 @@ public actor SyncRepository {
                     try database.execute(
                         """
                         INSERT INTO transfer_activity(
-                          job_id, batch_id, id, relative_path, status, updated_at_ms, payload
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                          job_id, batch_id, id, relative_path, status, updated_at_ms, payload, file_name, total_bytes, progress
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         bindings: [
                             .text(jobID.description),
@@ -1452,7 +1591,10 @@ public actor SyncRepository {
                             .text(transfer.relativePath),
                             .text(transfer.status.rawValue),
                             .integer(Int64((transfer.updatedAt.timeIntervalSince1970 * 1_000).rounded(.down))),
-                            .blob(try encoder.encode(item))
+                            .blob(try encoder.encode(item)),
+                            .text(item.fileName),
+                            .integer(item.totalBytes),
+                            .real(item.progressFraction)
                         ]
                     )
                 }
@@ -1463,7 +1605,43 @@ public actor SyncRepository {
     /// Tables that hold one JSON document per row and are addressed by name in
     /// interpolated SQL. Kept in one place so a caller cannot reach a table
     /// that is not shaped this way, and so adding one is a single edit.
-    private static let documentTables: Set<String> = ["connections", "credentials", "jobs", "snapshots"]
+    /// Additive, transactional adoption. Only configuration payloads change;
+    /// job IDs, bookmarks, volume identities, baselines and checkpoints survive.
+    /// Exact targets are reused; similar paths on different volumes are not.
+    private static func adoptLocations(database: SQLiteDatabase, encoder: JSONEncoder, decoder: JSONDecoder) throws {
+        try database.transaction {
+            var locations: [StorageLocation] = []
+            var jobs: [SyncJob] = []
+            var connections: [S3Connection] = []
+            try database.query("SELECT payload FROM locations") { statement in
+                if let data = database.blob(statement, column: 0) { locations.append(try decoder.decode(StorageLocation.self, from: data)) }
+            }
+            try database.query("SELECT payload FROM connections") { statement in
+                if let data = database.blob(statement, column: 0) { connections.append(try decoder.decode(S3Connection.self, from: data)) }
+            }
+            try database.query("SELECT payload FROM jobs ORDER BY id") { statement in
+                if let data = database.blob(statement, column: 0) { jobs.append(try decoder.decode(SyncJob.self, from: data)) }
+            }
+            func adopt(_ target: StorageLocationTarget, name: String) throws -> StorageLocation {
+                if let existing = locations.first(where: { $0.target == target }) { return existing }
+                let location = StorageLocation(name: StorageLocation.uniqueName(name, avoiding: locations.map(\.name)), target: target)
+                try database.execute("INSERT INTO locations(id, payload) VALUES (?, ?)", bindings: [.text(location.id.description), .blob(try encoder.encode(location))])
+                locations.append(location)
+                return location
+            }
+            for var job in jobs where job.sourceLocationID == nil && job.destinationLocationID == nil {
+                guard let connection = connections.first(where: { $0.id == job.connectionID }) else { continue }
+                let local = try adopt(.local(job.localRoot), name: job.localRoot.displayName)
+                let prefix = SyncJob.normalizedPrefix(job.remotePrefix)
+                let remote = try adopt(.s3(connectionID: job.connectionID, prefix: prefix), name: prefix.isEmpty ? connection.bucket : "\(connection.bucket)/\(prefix)")
+                job.sourceLocationID = job.direction == .upload ? local.id : remote.id
+                job.destinationLocationID = job.direction == .upload ? remote.id : local.id
+                try database.execute("UPDATE jobs SET payload = ? WHERE id = ?", bindings: [.blob(try encoder.encode(job)), .text(job.id.description)])
+            }
+        }
+    }
+
+    private static let documentTables: Set<String> = ["connections", "credentials", "jobs", "snapshots", "locations"]
 
     private static func milliseconds(since1970 date: Date) -> Int64 {
         Int64((date.timeIntervalSince1970 * 1_000).rounded(.down))
@@ -1522,15 +1700,18 @@ public actor SyncRepository {
         try database.execute(
             """
             INSERT INTO transfer_activity(
-              job_id, batch_id, id, relative_path, status, updated_at_ms, payload
+              job_id, batch_id, id, relative_path, status, updated_at_ms, payload, file_name, total_bytes, progress
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_id, id) DO UPDATE SET
               batch_id = excluded.batch_id,
               relative_path = excluded.relative_path,
               status = excluded.status,
               updated_at_ms = excluded.updated_at_ms,
-              payload = excluded.payload
+              payload = excluded.payload,
+              file_name = excluded.file_name,
+              total_bytes = excluded.total_bytes,
+              progress = excluded.progress
             """,
             bindings: [
                 .text(transfer.jobID.description),
@@ -1539,7 +1720,10 @@ public actor SyncRepository {
                 .text(transfer.relativePath),
                 .text(transfer.status.rawValue),
                 .integer(Self.milliseconds(since1970: transfer.updatedAt)),
-                .blob(try encoder.encode(item))
+                .blob(try encoder.encode(item)),
+                .text(item.fileName),
+                .integer(item.totalBytes),
+                .real(item.progressFraction)
             ]
         )
     }

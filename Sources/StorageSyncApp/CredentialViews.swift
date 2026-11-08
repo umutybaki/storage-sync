@@ -12,6 +12,7 @@ struct CredentialDetailView: View {
     @ObservedObject var model: AppModel
 
     private var dependents: [SyncJob] { model.syncsUsing(credential) }
+    private var locationUsers: [StorageLocation] { model.locationsUsing(credential) }
 
     var body: some View {
         Form {
@@ -59,8 +60,8 @@ struct CredentialDetailView: View {
             }
 
             Section {
-                if dependents.isEmpty {
-                    Text("No syncs are using these credentials yet.")
+                if dependents.isEmpty && locationUsers.isEmpty {
+                    Text("No syncs or locations use these credentials yet.")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(dependents) { job in
@@ -77,6 +78,9 @@ struct CredentialDetailView: View {
                             Image(systemName: SyncRoute.symbol(job))
                         }
                     }
+                }
+                ForEach(locationUsers) { location in
+                    Button(location.name) { model.selection = .location(location.id) }.buttonStyle(.link)
                 }
                 Button("Create Sync with These Credentials…") {
                     model.beginCreatingSync(using: credential)
@@ -122,7 +126,7 @@ struct CredentialDetailView: View {
                 Button("Delete Credentials…", role: .destructive) {
                     model.requestRemoval(of: credential)
                 }
-                .disabled(!dependents.isEmpty)
+                .disabled(!dependents.isEmpty || !locationUsers.isEmpty)
             } label: {
                 Label("More", systemImage: "ellipsis")
             }

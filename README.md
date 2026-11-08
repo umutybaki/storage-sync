@@ -25,20 +25,44 @@ The manager shows where a sync's storage actually is, as three lines on one shar
 
 See [Sync behavior](docs/SYNC-BEHAVIOR.md) for the upload and download rules, including deletions, renames, conflicting edits, and interrupted transfers.
 
+## Reusable locations
+
+Save a Mac folder or cloud bucket once in **Locations**, then choose **From** and
+**To** when creating a sync. A bucket location includes its optional folder
+(prefix), so the same bucket can have several separately named locations.
+Locations can be renamed, show the syncs that use them, and remain saved when a
+sync is removed. A location cannot be removed while a sync depends on it.
+Removing an unused location never removes completed files or saved credentials.
+
+**New Location…** is also available inside Create Sync. Cloud setup offers
+**Amazon S3**, **Cloudflare R2**, and **Other S3-compatible** presets. R2 asks for
+the Cloudflare account ID and derives the endpoint, signing region (`auto`), and
+addressing style. Custom endpoints remain available for other providers and
+jurisdiction-specific configurations.
+
+Existing syncs adopt locations automatically without changing their job IDs,
+folder permissions, volume identities, baselines, or transfer checkpoints.
+Folder reselection creates a new location for that sync; other syncs keep the
+previous selection. Saved location targets cannot be edited in place.
+
+This release still requires one Mac folder and one cloud bucket per sync.
+Cloud-to-cloud transfers, mirroring, and two-way sync are not implemented.
+The R2 preset is covered by local configuration tests; live R2 transfers have
+not been verified.
+
 ## Credentials
 
 Keys are saved once, given a name, and reused. The sidebar's **Credentials**
 section lists every saved set with its shortened access key, when the keys were
-last replaced, and which syncs depend on it; the Create Sync sheet offers them in
-a menu, so a second bucket in the same account asks for nothing that was already
-typed.
+last replaced, and which syncs and locations depend on it. New Location offers
+them in a menu, so another bucket in the same account reuses the saved keys.
 
 Sharing one set between syncs is the point, and it decides the rest of the
 behaviour. Replacing an expired key once fixes every sync using it — and because
 that is a change several syncs feel at once, the new keys are tried against a
 bucket one of them already uses before anything is saved. Deleting is refused
-while a sync still depends on the keys, and names the syncs rather than breaking
-them. Removing a sync leaves saved credentials alone: they are yours, not the
+while a sync or saved location still depends on the keys, and names the users
+rather than breaking them. Removing a sync leaves saved credentials alone: they are yours, not the
 sync's, and are deleted from the Credentials list only.
 
 The keys themselves are in the Keychain and nowhere else. StorageSync's database

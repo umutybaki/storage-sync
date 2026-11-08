@@ -58,6 +58,14 @@ final class SQLiteDatabase {
         try execute("PRAGMA journal_mode=WAL")
         try execute("PRAGMA synchronous=FULL")
         try execute("PRAGMA foreign_keys=ON")
+        // Deterministic numeric filename ordering: file2 precedes file10.
+        // A fixed locale keeps persisted index order valid across launches.
+        sqlite3_create_collation(handle, "filename", SQLITE_UTF8, nil) { _, leftCount, left, rightCount, right in
+            guard let left, let right else { return 0 }
+            let lhs = String(decoding: UnsafeBufferPointer(start: left.assumingMemoryBound(to: UInt8.self), count: Int(leftCount)), as: UTF8.self)
+            let rhs = String(decoding: UnsafeBufferPointer(start: right.assumingMemoryBound(to: UInt8.self), count: Int(rightCount)), as: UTF8.self)
+            return Int32(lhs.compare(rhs, options: [.numeric, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX")).rawValue)
+        }
         // Large manifest joins may spill while reconciling millions of paths.
         // Keep that spill on disk instead of letting SQLite grow the process
         // without bound.

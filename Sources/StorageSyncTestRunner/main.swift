@@ -18,6 +18,11 @@ struct StorageSyncTestRunner {
         }
         let suite = ReliabilitySuite()
         do {
+            if CommandLine.arguments.contains("--transfer-activity-only") {
+                try await suite.runTransferActivityChecks()
+                print("PASS: transfer activity, migration, and 100,000-item sorting/paging checks")
+                return
+            }
             try await suite.run()
             print("PASS: all StorageSync reliability checks completed")
         } catch {
@@ -168,7 +173,14 @@ private final class S3URLProtocolStub: URLProtocol, @unchecked Sendable {
 }
 
 private final class ReliabilitySuite {
+    func runTransferActivityChecks() async throws {
+        try await transferActivityCheck()
+        try await largeTransferActivityCheck()
+    }
+
     func run() async throws {
+        try storageProviderPresetCheck()
+        try await reusableLocationsCheck()
         try transferPolicyCheck()
         try signatureVersion4Check()
         try await s3HTTPTransportCheck()
@@ -211,6 +223,7 @@ private final class ReliabilitySuite {
         try await persistenceRecoveryCheck()
         try await failedTransferQueueSemanticsCheck()
         try await transferActivityCheck()
+        try await largeTransferActivityCheck()
         try await persistenceJobRemovalCheck()
         try await credentialStoreCheck()
         try await gracefulUnmountPreparationCheck()
@@ -2834,6 +2847,164 @@ private final class ReliabilitySuite {
         try check(nextBatch?.items.isEmpty == true, "A fresh scan retained completed activity from the prior batch")
     }
 
+    private func largeTransferActivityCheck() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("large-activity.sqlite")
+        let jobID = SyncJobID()
+        let batchID = UUID()
+        let count = 100_000
+        try writeLegacyActivityFixture(at: url, jobID: jobID, batchID: batchID, count: count)
+        let clock = ContinuousClock()
+        let start = clock.now
+        var repository: SyncRepository? = try SyncRepository(databaseURL: url)
+        let migrationTime = start.duration(to: clock.now)
+
+        // Walk all 200 pages, retaining just a page and a set of IDs. Name
+        // ordering is independently predictable even across folder boundaries.
+        var identifiers: Set<TransferID> = []
+        var revision: Int64?
+        for offset in stride(from: 0, to: count, by: 500) {
+            let page = try await repository!.transferActivityPage(
+                TransferActivityPageRequest(jobID: jobID, limit: 500, sort: TransferActivitySort(), offset: offset)
+            )
+            try check(page.batchID == batchID && page.counts.all == count, "Sorting migration replaced the batch or lost ledger rows")
+            if let revision { try check(page.revision == revision, "Reading a page mutated activity") }
+            revision = page.revision
+            try check(page.items.count == 500, "A large activity page violated the 500-row bound")
+            for (index, item) in page.items.enumerated() {
+                try check(item.fileName == "File\(offset + index + 1).raw", "Name sort did not use numeric filenames across the full result set")
+                try check(identifiers.insert(item.id).inserted, "Sorted pages repeated a transfer")
+            }
+        }
+        try check(identifiers.count == count, "Sorted pages omitted transfers")
+
+        // Every header sorts the whole result set in both directions. Probe
+        // the first, middle, and last page, checking internal and page order.
+        for column in TransferActivitySortColumn.allCases {
+            for ascending in [true, false] {
+                var previous: TransferActivityItem?
+                for offset in [0, 50_000, 99_500] {
+                    let page = try await repository!.transferActivityPage(
+                        TransferActivityPageRequest(jobID: jobID, limit: 500, sort: TransferActivitySort(column: column, ascending: ascending), offset: offset)
+                    )
+                    try check(page.items.count == 500, "A column sort lost a page")
+                    for item in page.items {
+                        if let previous {
+                            let comparison: ComparisonResult
+                            switch column {
+                            case .name:
+                                comparison = previous.fileName.compare(item.fileName, options: [.numeric, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+                            case .status: comparison = previous.status.rawValue.compare(item.status.rawValue)
+                            case .progress:
+                                comparison = previous.progressFraction == item.progressFraction ? .orderedSame : previous.progressFraction < item.progressFraction ? .orderedAscending : .orderedDescending
+                            case .size:
+                                comparison = previous.totalBytes == item.totalBytes ? .orderedSame : previous.totalBytes < item.totalBytes ? .orderedAscending : .orderedDescending
+                            case .updated:
+                                comparison = previous.updatedAt == item.updatedAt ? .orderedSame : previous.updatedAt < item.updatedAt ? .orderedAscending : .orderedDescending
+                            }
+                            if comparison == .orderedSame {
+                                try check(ascending ? previous.id.description < item.id.description : previous.id.description > item.id.description, "Equal sort values did not use a stable ID tie-breaker")
+                            } else {
+                                try check(comparison == (ascending ? .orderedAscending : .orderedDescending), "Column sort was local to a page or used the wrong value: \(column)")
+                            }
+                        }
+                        previous = item
+                    }
+                }
+            }
+        }
+        let overLimit = try await repository!.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, limit: 100_000, sort: TransferActivitySort(), offset: 99_750)
+        )
+        try check(overLimit.items.count == 250 && overLimit.nextCursor == nil, "The final partial page was not bounded correctly")
+        let empty = try await repository!.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, sort: TransferActivitySort(), offset: count)
+        )
+        try check(empty.items.isEmpty && empty.counts.all == count, "An out-of-range page erased the total")
+        // Reopening must preserve the original batch/revision and indexed keys.
+        repository = nil
+        repository = try SyncRepository(databaseURL: url)
+        let restored = try await repository!.transferActivityPage(
+            TransferActivityPageRequest(jobID: jobID, sort: TransferActivitySort(column: .size, ascending: false))
+        )
+        try check(restored.batchID == batchID && restored.revision == revision && restored.items.first?.totalBytes == Int64(count), "Reopening changed migrated activity or its sort values")
+        try activitySortIndexCheck(at: url)
+        print("100,000-item activity: migration \(migrationTime), paging/sorting \(start.duration(to: clock.now)) total")
+    }
+
+    private func writeLegacyActivityFixture(at url: URL, jobID: SyncJobID, batchID: UUID, count: Int) throws {
+        // The old schema deliberately has no sort columns. Payloads and batch
+        // identity must survive the upgrade without rebuilding from the queue.
+        try executeSQLiteStatements(at: url, [
+            "CREATE TABLE transfer_activity_state(job_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, revision INTEGER NOT NULL)",
+            "INSERT INTO transfer_activity_state VALUES ('\(jobID.description)', '\(batchID.uuidString)', 42)",
+            "CREATE TABLE transfer_activity(job_id TEXT NOT NULL, batch_id TEXT NOT NULL, id TEXT NOT NULL, relative_path TEXT NOT NULL, status TEXT NOT NULL, updated_at_ms INTEGER NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(job_id, id))"
+        ])
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let handle else {
+            throw CheckFailure.failed("Could not open the large activity fixture")
+        }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "INSERT INTO transfer_activity VALUES (?, ?, ?, ?, ?, ?, ?)", -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw CheckFailure.failed("Could not prepare the large activity fixture")
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_exec(handle, "BEGIN", nil, nil, nil) == SQLITE_OK else {
+            throw CheckFailure.failed("Could not begin the fixture transaction")
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let statuses: [TransferStatus] = [.queued, .running, .waiting, .completed, .failed, .verifying, .superseded]
+        for index in 0..<count {
+            let path = "Folder\(index % 10)/File\(count - index).raw"
+            var transfer = TransferRecord(jobID: jobID, relativePath: path, kind: .upload, status: statuses[index % statuses.count], totalBytes: Int64(index + 1), remoteKey: path)
+            transfer.completedBytes = Int64(index + 1) * Int64(index % 101) / 100
+            transfer.updatedAt = Date(timeIntervalSince1970: Double(index))
+            let item = TransferActivityItem(transfer: transfer, batchID: batchID)
+            let payload = try encoder.encode(item)
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, jobID.description, -1, transient)
+            sqlite3_bind_text(statement, 2, batchID.uuidString, -1, transient)
+            sqlite3_bind_text(statement, 3, item.id.description, -1, transient)
+            sqlite3_bind_text(statement, 4, path, -1, transient)
+            sqlite3_bind_text(statement, 5, item.status.rawValue, -1, transient)
+            sqlite3_bind_int64(statement, 6, Int64(index) * 1_000)
+            _ = payload.withUnsafeBytes { bytes in
+                sqlite3_bind_blob(statement, 7, bytes.baseAddress, Int32(bytes.count), transient)
+            }
+            try check(sqlite3_step(statement) == SQLITE_DONE, "Could not insert a large activity fixture row")
+        }
+        try check(sqlite3_exec(handle, "COMMIT", nil, nil, nil) == SQLITE_OK, "Could not commit the large activity fixture")
+    }
+
+    private func activitySortIndexCheck(at url: URL) throws {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let handle else {
+            throw CheckFailure.failed("Could not inspect activity indexes")
+        }
+        defer { sqlite3_close(handle) }
+        // EXPLAIN needs the collation name registered; this connection never
+        // executes the sorted query or writes/rebuilds any index.
+        sqlite3_create_collation(handle, "filename", SQLITE_UTF8, nil) { _, _, _, _, _ in 0 }
+        for column in ["file_name COLLATE filename", "status", "progress", "total_bytes", "updated_at_ms"] {
+            for direction in ["ASC", "DESC"] {
+                var statement: OpaquePointer?
+                let sql = "EXPLAIN QUERY PLAN SELECT payload FROM transfer_activity WHERE job_id = 'x' AND batch_id = 'y' ORDER BY \(column) \(direction), id \(direction) LIMIT 501 OFFSET 99500"
+                try check(sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, "Could not explain activity sorting")
+                defer { sqlite3_finalize(statement) }
+                var plan = ""
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    if let detail = sqlite3_column_text(statement, 3) { plan += String(cString: detail) }
+                }
+                try check(plan.contains("USING INDEX") && !plan.contains("TEMP B-TREE"), "A sort performed a full temporary sort instead of reading an index: \(plan)")
+            }
+        }
+    }
+
     private func persistenceJobRemovalCheck() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -4571,6 +4742,133 @@ private final class ReliabilitySuite {
             snapshot?.blockers == [.localVolumeUnavailable],
             "A drive that mounted under a different name was ejected without checkpointing its sync"
         )
+        await coordinator.stop()
+    }
+
+    private func storageProviderPresetCheck() throws {
+        let account = String(repeating: "a", count: 32)
+        let r2 = try StorageProvider.cloudflareR2.preset(region: "ignored", accountID: " \(account.uppercased())\n", endpoint: "ignored", bucket: "photos")
+        try check(r2.endpoint.absoluteString == "https://\(account).r2.cloudflarestorage.com", "R2 did not derive its account endpoint")
+        try check(r2.region == "auto" && r2.addressingStyle == .path, "R2 did not use its region and addressing preset")
+        try check(StorageProvider.identify(endpoint: r2.endpoint) == .cloudflareR2, "An existing R2 endpoint was not recognised")
+        do {
+            _ = try StorageProvider.cloudflareR2.preset(region: "", accountID: "bad/host", endpoint: "", bucket: "photos")
+            throw CheckFailure.failed("An invalid R2 account ID became an endpoint")
+        } catch StoragePresetError.invalidAccountID {}
+        let china = try StorageProvider.amazon.preset(region: " CN-NORTH-1 ", accountID: "", endpoint: "", bucket: "photo.archive")
+        try check(china.endpoint.host == "s3.cn-north-1.amazonaws.com.cn" && china.addressingStyle == .path, "AWS preset lost China or dotted-bucket support")
+        for endpoint in ["http://storage.example.com", "https://user:password@example.com", "https://example.com?key=value", "https://example.com#fragment", ""] {
+            do {
+                _ = try StorageProvider.compatible.preset(region: "auto", accountID: "", endpoint: endpoint, bucket: "photos")
+                throw CheckFailure.failed("An unsafe endpoint passed preset validation")
+            } catch StoragePresetError.invalidEndpoint {}
+        }
+        _ = try StorageProvider.compatible.preset(region: "test", accountID: "", endpoint: "http://127.0.0.1:9000", bucket: "photos")
+    }
+
+    /// Exercises a pre-location database, then reopens it twice. No real
+    /// credentials, external drives, or network connections participate.
+    private func reusableLocationsCheck() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("locations.sqlite")
+        let bookmarks = try BookmarkStore(directory: directory.appendingPathComponent("bookmarks"))
+        let folder = directory.appendingPathComponent("Photos")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let reference = try await bookmarks.create(for: folder)
+        let root = LocalRoot(displayName: "Photos", fallbackPath: folder.path, bookmarkReference: reference)
+        let connection = S3Connection(name: "S3", endpoint: URL(string: "https://s3.eu-north-1.amazonaws.com")!, region: "eu-north-1", bucket: "archive", credentialReference: "unused-test-reference")
+        var original = SyncJob(name: "Upload", direction: .upload, localRoot: root, connectionID: connection.id, remotePrefix: "photos", isPaused: true, createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        original.multipartGeneration = UUID()
+        let download = SyncJob(name: "Download", direction: .download, localRoot: root, connectionID: connection.id, remotePrefix: "photos", isPaused: true)
+        let fingerprint = FileFingerprint(relativePath: "photo.jpg", size: 100, modificationTimeNanoseconds: 1)
+        let baseline = ReconciliationBaseline(relativePath: "photo.jpg", localFingerprint: fingerprint, remoteETag: "etag", remoteChecksum: nil, remoteSize: 100)
+        let transfer = TransferRecord(jobID: original.id, relativePath: "photo.jpg", kind: .upload, status: .waiting, totalBytes: 100, remoteKey: "photos/photo.jpg", multipartUploadID: "existing-upload")
+        let part = TransferPart(transferID: transfer.id, number: 1, offset: 0, length: 50, checksum: "checkpoint", eTag: "etag", isComplete: true)
+        do {
+            let repository = try SyncRepository(databaseURL: databaseURL)
+            try await repository.saveConnection(connection)
+            try await repository.saveJob(original)
+            try await repository.saveJob(download)
+            try await repository.saveBaseline(baseline, jobID: original.id)
+            try await repository.saveTransfer(transfer)
+            try await repository.savePart(part)
+        }
+        try executeSQLiteStatements(at: databaseURL, ["DROP TABLE locations", "PRAGMA user_version=3"])
+        let repository = try SyncRepository(databaseURL: databaseURL)
+        let migrated = try await repository.jobs()
+        let locations = try await repository.locations()
+        try check(locations.count == 2, "Migration duplicated shared folder or bucket locations")
+        guard let adopted = migrated.first(where: { $0.id == original.id }),
+              let restored = migrated.first(where: { $0.id == download.id }),
+              let local = locations.first(where: { $0.localRoot != nil }),
+              let remote = locations.first(where: { $0.connectionID != nil }) else { throw CheckFailure.failed("Migration lost a job or location") }
+        try check(adopted.sourceLocationID == local.id && adopted.destinationLocationID == remote.id, "Upload route was not adopted")
+        try check(restored.sourceLocationID == remote.id && restored.destinationLocationID == local.id, "Download route was not adopted")
+        try check(adopted.localRoot == original.localRoot && adopted.multipartGeneration == original.multipartGeneration && adopted.createdAt == original.createdAt, "Migration changed a pairing or multipart identity")
+        let savedTransfer = try await repository.transfer(id: transfer.id)
+        let savedParts = try await repository.parts(transferID: transfer.id)
+        let savedBaselines = try await repository.baselines(jobID: original.id)
+        try check(savedTransfer?.multipartUploadID == "existing-upload" && savedParts.count == 1 && savedBaselines == [baseline], "Migration lost resumable work or baselines")
+        let reopened = try SyncRepository(databaseURL: databaseURL)
+        let again = try await reopened.locations()
+        try check(Set(again.map(\.id)) == Set(locations.map(\.id)), "Location migration was not idempotent")
+
+        var renamed = remote
+        renamed.name = "Cloud archive"
+        try await repository.saveLocation(renamed)
+        let afterRename = try await repository.job(id: adopted.id)
+        try check(afterRename == adopted, "Renaming a location changed a job or progress")
+        do {
+            try await repository.removeLocation(id: local.id)
+            throw CheckFailure.failed("A referenced location was removed")
+        } catch LocationError.inUse {}
+        do {
+            try await repository.saveLocation(StorageLocation(id: remote.id, name: remote.name, target: .s3(connectionID: connection.id, prefix: "other")))
+            throw CheckFailure.failed("A saved location was silently retargeted")
+        } catch LocationError.immutableTarget {}
+        do {
+            try await repository.saveLocation(StorageLocation(name: " cloud ARCHIVE ", target: .local(root)))
+            throw CheckFailure.failed("Duplicate location names were accepted")
+        } catch LocationError.duplicateName {}
+        do {
+            _ = try SyncJob(name: "Unsupported", source: remote, destination: remote)
+            throw CheckFailure.failed("An unsupported route was accepted")
+        } catch LocationError.unsupportedRoute {}
+        var resolved = try SyncJob(name: "Shared", source: local, destination: remote)
+        resolved.localRoot.fallbackPath = "/incorrect-manager-snapshot"
+        resolved.remotePrefix = "incorrect"
+        resolved.isPaused = true
+        try await repository.saveJob(resolved)
+        let canonical = try await repository.job(id: resolved.id)
+        try check(canonical?.localRoot == root && canonical?.remotePrefix == "photos", "Job save trusted copied route fields over saved locations")
+        var reversed = adopted
+        reversed.sourceLocationID = remote.id
+        reversed.destinationLocationID = local.id
+        do {
+            try await repository.saveJob(reversed)
+            throw CheckFailure.failed("A route reversal reused an existing job's transfer history")
+        } catch LocationError.immutableTarget {}
+        var changedBucket = connection
+        changedBucket.bucket = "other-bucket"
+        do {
+            try await repository.saveConnection(changedBucket)
+            throw CheckFailure.failed("A location's connection was silently retargeted")
+        } catch LocationError.immutableTarget {}
+        let coordinator = SyncCoordinator(repository: repository, bookmarks: bookmarks,
+            keychain: KeychainStore(service: "storagesync.fixture"), objectStoreFactory: FixtureProvider(store: FaultInjectingObjectStore()))
+        try await coordinator.remove(jobID: original.id)
+        try await coordinator.remove(jobID: download.id)
+        try await coordinator.remove(jobID: resolved.id)
+        let remainingLocations = try await repository.locations()
+        let remainingConnection = try await repository.connection(id: connection.id)
+        _ = try await bookmarks.resolve(reference: reference)
+        try check(remainingLocations.count == 2 && remainingConnection != nil, "Removing the last sync removed reusable configuration")
+        try await coordinator.remove(locationID: local.id)
+        do {
+            _ = try await bookmarks.resolve(reference: reference)
+            throw CheckFailure.failed("Removing the last bookmark owner leaked its bookmark")
+        } catch BookmarkStoreError.notFound {}
         await coordinator.stop()
     }
 

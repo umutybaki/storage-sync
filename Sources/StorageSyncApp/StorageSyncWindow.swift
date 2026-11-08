@@ -18,6 +18,8 @@ struct StorageSyncWindow: View {
                 // Rebuild the detail pane when the selection changes so the
                 // scroll position does not carry over between syncs.
                 .id(job.id)
+            } else if let location = model.selectedLocation {
+                LocationDetailView(location: location, model: model).id(location.id)
             } else if let credential = model.selectedCredential {
                 CredentialDetailView(credential: credential, model: model)
                     .id(credential.id)
@@ -28,14 +30,27 @@ struct StorageSyncWindow: View {
                 ) { model.beginCreatingSync() }
             }
         }
+        .toolbar(removing: .sidebarToggle)
         .sheet(isPresented: $model.isCreatingSync) {
             CreateSyncView(model: model)
+        }
+        .sheet(isPresented: $model.isCreatingLocation) {
+            LocationEditorView(model: model) { location in model.selection = .location(location.id) }
         }
         .sheet(item: $model.credentialsJob) { job in
             UpdateCredentialsView(job: job, model: model)
         }
         .sheet(item: $model.credentialEditor) { request in
             CredentialEditorView(request: request, model: model)
+        }
+        .alert("Remove This Location?", isPresented: Binding(
+            get: { model.locationPendingRemoval != nil },
+            set: { if !$0 { model.locationPendingRemoval = nil } }
+        ), presenting: model.locationPendingRemoval) { location in
+            Button("Remove Location", role: .destructive) { Task { await model.removeLocation(location) } }
+            Button("Cancel", role: .cancel) { model.locationPendingRemoval = nil }
+        } message: { location in
+            Text("StorageSync forgets “\(location.name)”. Files and saved credentials stay where they are.")
         }
         .alert(
             "Delete These Credentials?",
@@ -92,10 +107,13 @@ struct StorageSyncWindow: View {
 
 private struct SyncSidebar: View {
     @ObservedObject var model: AppModel
+    @AppStorage("sidebar.syncsExpanded") private var syncsExpanded = true
+    @AppStorage("sidebar.locationsExpanded") private var locationsExpanded = true
+    @AppStorage("sidebar.credentialsExpanded") private var credentialsExpanded = true
 
     var body: some View {
         List(selection: $model.selection) {
-            Section("Syncs") {
+            Section("Syncs", isExpanded: $syncsExpanded) {
                 ForEach(model.jobs) { job in
                     SyncSidebarRow(
                         job: job,
@@ -124,10 +142,29 @@ private struct SyncSidebar: View {
                 }
             }
 
+            Section("Locations", isExpanded: $locationsExpanded) {
+                ForEach(model.locations) { location in
+                    Label {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(location.name).lineLimit(1)
+                            Text(location.localRoot != nil ? "Mac Folder" : "Cloud Bucket")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    } icon: { Image(systemName: location.localRoot != nil ? "folder" : "externaldrive.badge.icloud") }
+                    .tag(ManagerSelection.location(location.id))
+                    .contextMenu {
+                        Button("Create Sync with This Location…") { model.beginCreatingSync(location: location) }
+                        Divider()
+                        Button("Remove Location…", role: .destructive) { model.locationPendingRemoval = location }
+                            .disabled(!model.syncsUsing(location).isEmpty)
+                    }
+                }
+            }
+
             // Hidden until there is one. The first set is saved while creating
             // a sync, so an empty section would only ever be an empty section.
             if !model.credentials.isEmpty {
-                Section("Credentials") {
+                Section("Credentials", isExpanded: $credentialsExpanded) {
                     ForEach(model.credentials) { credential in
                         CredentialSidebarRow(
                             credential: credential,
@@ -141,13 +178,14 @@ private struct SyncSidebar: View {
                             Button("Delete Credentials…", role: .destructive) {
                                 model.requestRemoval(of: credential)
                             }
-                            .disabled(!model.syncsUsing(credential).isEmpty)
+                            .disabled(!model.syncsUsing(credential).isEmpty || !model.locationsUsing(credential).isEmpty)
                         }
                     }
                 }
             }
         }
         .listStyle(.sidebar)
+        .toolbar(removing: .sidebarToggle)
         .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             AgentStatusBar(
@@ -160,11 +198,15 @@ private struct SyncSidebar: View {
             ToolbarItem {
                 Menu {
                     Button("New Sync…") { model.beginCreatingSync() }
+                    Button("New Location…") { model.isCreatingLocation = true }
+                        .disabled(!model.areLocationsAvailable)
                     Button("New Credentials…") { model.beginCreatingCredential() }
                 } label: {
                     Label("New", systemImage: "plus")
                 }
-                .help("Create a sync, or save credentials to reuse")
+                .menuIndicator(.hidden)
+                .accessibilityLabel("New")
+                .help("Create a sync, location, or saved credentials")
             }
         }
     }
@@ -419,20 +461,18 @@ private struct SyncDetail: View {
     private var status: SyncStatus { SyncStatus(job: job, snapshot: snapshot) }
 
     var body: some View {
-        VStack(spacing: 0) {
-            ScrollView {
-                StatusHeader(job: job, snapshot: snapshot, status: status, model: model)
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                StatusHeader(job: job, snapshot: snapshot, status: status, model: model, barWidth: min(320, geometry.size.width * 0.32))
                     .padding(18)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                TransferActivityView(job: job, model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxHeight: 310)
-            .background(.background.secondary)
-
-            Divider()
-
-            TransferActivityView(job: job, model: model)
-                .padding(16)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
         }
+        .background(.background)
         .navigationTitle(job.name)
         .navigationSubtitle(SyncRoute.text(job, connection: connection))
         .toolbar { toolbarContent }
@@ -490,125 +530,118 @@ private struct StatusHeader: View {
     let snapshot: SyncSnapshot
     let status: SyncStatus
     @ObservedObject var model: AppModel
+    let barWidth: CGFloat
+
+    private var reading: BalanceReading? { model.balanceReading(for: job) }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            Image(systemName: status.symbol)
-                .font(.system(size: 26))
-                .foregroundStyle(status.tint)
-                .frame(width: 30)
-                .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 24) {
+                HStack(alignment: .top, spacing: 14) {
+                    Image(systemName: status.symbol)
+                        .font(.system(size: 26))
+                        .foregroundStyle(status.tint)
+                        .frame(width: 30)
+                        .accessibilityHidden(true)
 
-            VStack(alignment: .leading, spacing: 5) {
-                Text(status.title)
-                    .font(.headline)
-                Text(status.detail)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(status.title)
+                            .font(.headline)
+                        if let inventory {
+                            Text("\(inventory.found.formatted()) files · \(inventory.present.formatted()) already present · \(inventory.remaining.formatted()) remaining")
+                                .help(inventoryTooltip(inventory))
+                                .font(.subheadline)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if !status.detail.isEmpty, status.tone == .attention || status.tone == .waiting {
+                            Text(status.detail)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                if let reading = model.balanceReading(for: job) {
+                if let reading {
                     StorageBalanceView(
                         reading: reading,
+                        style: .barsOnly,
                         isTransferring: snapshot.phase == .transferring
                     )
-                    .padding(.top, 8)
-                }
-
-                if model.transferActivityCounts.all > 0 {
-                    ActivityCountSummary(counts: model.transferActivityCounts)
-                        .padding(.top, 3)
-                }
-
-                if let count = snapshot.recentlyQueuedCount, count > 0,
-                   let paths = snapshot.recentlyQueuedPaths,
-                   let queuedAt = snapshot.recentlyQueuedAt {
-                    RecentlyQueuedView(count: count, paths: paths, queuedAt: queuedAt)
-                        .padding(.top, 4)
-                }
-
-                if let notice = snapshot.sourceChangeNotice {
-                    Label(notice, systemImage: "exclamationmark.arrow.triangle.2.circlepath")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 2)
-                }
-
-                if snapshot.blockers.contains(.credentialsUnavailable) {
-                    Button("Fix Credentials…") { model.credentialsJob = job }
-                        .padding(.top, 6)
+                    .frame(width: barWidth)
                 }
             }
 
-            Spacer(minLength: 0)
+            if model.transferActivityCounts.issues > 0 {
+                Label("\(model.transferActivityCounts.issues.formatted()) files to review", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.leading, 44)
+            }
+
+            if let notice = snapshot.sourceChangeNotice {
+                Label(notice, systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 44)
+            }
+
+            if snapshot.blockers.contains(.credentialsUnavailable) {
+                Button("Fix Credentials…") { model.credentialsJob = job }
+                    .padding(.leading, 44)
+            }
         }
         .padding(.vertical, 6)
         .accessibilityElement(children: .contain)
     }
-}
 
-private struct ActivityCountSummary: View {
-    let counts: TransferActivityCounts
+    private typealias Inventory = (found: Int, present: Int, remaining: Int, source: String, destination: String)
 
-    var body: some View {
-        Text(parts.joined(separator: "  ·  "))
-            .font(.caption)
-            .monospacedDigit()
-            .foregroundStyle(.secondary)
-            .accessibilityLabel(parts.joined(separator: ", "))
-    }
-
-    private var parts: [String] {
-        var values: [String] = []
-        if counts.active > 0 { values.append("\(counts.active.formatted()) active") }
-        if counts.waiting > 0 { values.append("\(counts.waiting.formatted()) waiting") }
-        if counts.completed > 0 { values.append("\(counts.completed.formatted()) done") }
-        if counts.issues > 0 { values.append("\(counts.issues.formatted()) issues") }
-        return values
-    }
-}
-
-/// A scan result the user can verify directly. Only a bounded path sample is
-/// carried in the snapshot, so this remains small on an initial pairing with
-/// millions of files.
-private struct RecentlyQueuedView: View {
-    let count: Int
-    let paths: [String]
-    let queuedAt: Date
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 7) {
-            Image(systemName: "tray.and.arrow.down.fill")
-                .foregroundStyle(.secondary)
-                .frame(width: 14)
-                .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Latest check queued \(count.formatted()) new or changed \(count == 1 ? "file" : "files")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                ForEach(Array(paths.enumerated()), id: \.offset) { _, path in
-                    Text(path)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
-
-                if count > paths.count {
-                    Text("and \((count - paths.count).formatted()) more")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-
-                Text("Detected \(queuedAt, style: .relative)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+    private var inventory: Inventory? {
+        // Location names follow the configured route, including download jobs
+        // whose source is the cloud. Legacy jobs fall back to their endpoints.
+        let localName = job.localRoot.displayName
+        let remoteName = SyncRoute.remoteLabel(job, connection: model.connection(for: job))
+        let sourceName = model.locations.first { $0.id == job.sourceLocationID }?.name
+            ?? (job.direction == .upload ? localName : remoteName)
+        let destinationName = model.locations.first { $0.id == job.destinationLocationID }?.name
+            ?? (job.direction == .upload ? remoteName : localName)
+        let sourceFiles: Int
+        let alreadyPresent: Int
+        let remaining: Int
+        if let balance = reading?.balance {
+            sourceFiles = job.direction == .upload ? balance.localFiles : balance.cloudFiles
+            alreadyPresent = balance.sharedFiles
+            remaining = balance.pendingFiles
+        } else if let found = snapshot.sourceFilesFound, let present = snapshot.filesAlreadyPresent {
+            sourceFiles = found
+            alreadyPresent = present
+            remaining = max(0, snapshot.filesTotal - snapshot.filesCompleted)
+        } else {
+            return nil
         }
-        .accessibilityElement(children: .combine)
+        return (sourceFiles, alreadyPresent, remaining, sourceName, destinationName)
+    }
+
+    private func inventoryTooltip(_ inventory: Inventory) -> String {
+        var lines = [
+            "\(inventory.found.formatted()) files in \(inventory.source)",
+            "\(inventory.present.formatted()) already in \(inventory.destination)",
+            "\(inventory.remaining.formatted()) left to \(job.direction == .upload ? "upload" : "download")"
+        ]
+        let counts = model.transferActivityCounts
+        if counts.all > 0 {
+            lines.append("\(counts.active.formatted()) active · \(counts.waiting.formatted()) waiting · \(counts.completed.formatted()) done")
+        }
+        if let count = snapshot.recentlyQueuedCount, count > 0 {
+            lines.append("Latest check queued \(count.formatted()) new or changed files")
+            lines += snapshot.recentlyQueuedPaths ?? []
+        }
+        return lines.joined(separator: "\n")
     }
 }

@@ -46,6 +46,16 @@ final class AgentService: NSObject, StorageSyncAgentXPCProtocol, @unchecked Send
             return try JSONEncoder().encode(try await coordinator.jobs())
         case .connections:
             return try JSONEncoder().encode(try await coordinator.connections())
+        case .locations:
+            return try JSONEncoder().encode(try await coordinator.locations())
+        case .saveLocation:
+            let location = try JSONDecoder().decode(StorageLocation.self, from: requiredPayload(command))
+            try await coordinator.save(location: location)
+            return nil
+        case .removeLocation:
+            let payload = try JSONDecoder().decode(LocationCommandPayload.self, from: requiredPayload(command))
+            try await coordinator.remove(locationID: payload.locationID)
+            return nil
         case .transferActivityPage:
             let request = try JSONDecoder().decode(
                 TransferActivityPageRequest.self,

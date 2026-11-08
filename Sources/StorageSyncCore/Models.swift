@@ -148,6 +148,11 @@ public struct SyncJob: Codable, Hashable, Sendable, Identifiable {
     public var localRoot: LocalRoot
     public var connectionID: ConnectionID
     public var remotePrefix: String
+    /// Authoritative route for location-backed jobs. The folder/connection
+    /// fields above remain resolved execution inputs for the existing engine.
+    /// Both are nil only in payloads written before reusable locations.
+    public var sourceLocationID: LocationID?
+    public var destinationLocationID: LocationID?
     public var deletionPolicy: DeletionPolicy
     public var isPaused: Bool
     /// Changes only when the user explicitly selects a different folder pairing.
@@ -472,6 +477,32 @@ public enum TransferActivityFilter: String, Codable, CaseIterable, Sendable {
     case issues
 }
 
+public enum TransferActivitySortColumn: String, Codable, CaseIterable, Sendable {
+    case name, status, progress, size, updated
+}
+
+public struct TransferActivitySort: Codable, Hashable, Sendable {
+    public var column: TransferActivitySortColumn
+    public var ascending: Bool
+
+    public init(column: TransferActivitySortColumn = .name, ascending: Bool = true) {
+        self.column = column
+        self.ascending = ascending
+    }
+}
+
+extension TransferActivityItem {
+    public var fileName: String { (relativePath as NSString).lastPathComponent }
+
+    /// Sort on committed progress. Live network bytes must not reorder rows
+    /// several times a second while the user is reading them.
+    public var progressFraction: Double {
+        if status == .completed { return 1 }
+        guard totalBytes > 0 else { return 0 }
+        return min(1, max(0, Double(completedBytes) / Double(totalBytes)))
+    }
+}
+
 /// Keyset pagination remains stable without reading a full activity manifest.
 public struct TransferActivityCursor: Codable, Hashable, Sendable {
     public var updatedAtMilliseconds: Int64
@@ -514,17 +545,25 @@ public struct TransferActivityPageRequest: Codable, Hashable, Sendable {
     public var filter: TransferActivityFilter
     public var cursor: TransferActivityCursor?
     public var limit: Int
+    /// Nil preserves the original updated-descending keyset API. The manager
+    /// requests bounded, independently addressable pages with an explicit sort.
+    public var sort: TransferActivitySort?
+    public var offset: Int?
 
     public init(
         jobID: SyncJobID,
         filter: TransferActivityFilter = .all,
         cursor: TransferActivityCursor? = nil,
-        limit: Int = 150
+        limit: Int = 150,
+        sort: TransferActivitySort? = nil,
+        offset: Int? = nil
     ) {
         self.jobID = jobID
         self.filter = filter
         self.cursor = cursor
         self.limit = limit
+        self.sort = sort
+        self.offset = offset
     }
 }
 

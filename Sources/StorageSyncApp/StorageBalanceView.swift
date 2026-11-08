@@ -3,11 +3,12 @@ import SwiftUI
 
 /// Local and cloud storage share one scale across two bars. The destination
 /// combines its existing bytes with the yellow pending segment; the three
-/// colors are explained by a legend below the bars.
+/// colors are explained by a legend or a hover tooltip.
 struct StorageBalanceView: View {
     enum Style {
         case full
         case compact
+        case barsOnly
     }
 
     let reading: BalanceReading
@@ -22,8 +23,10 @@ struct StorageBalanceView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: style == .full ? 7 : 4) {
             bars
-            legend
-            caption
+            if style != .barsOnly {
+                legend
+                caption
+            }
         }
         // Snapshots arrive once a second, so the bars are told to glide between
         // samples rather than step. Anything faster reads as flicker on a sync
@@ -129,13 +132,22 @@ struct StorageBalanceView: View {
             .frame(maxHeight: .infinity)
         }
         .frame(height: rowHeight)
-        .help(isDestination ? "\(help(for: line)) · \(help(for: .sync))" : help(for: line))
+        .help(style == .barsOnly ? storageTooltip : isDestination ? "\(help(for: line)) · \(help(for: .sync))" : help(for: line))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title(for: line))
         .accessibilityValue(
             "\(bytes(for: line).formattedByteCount), \(percentage(for: line)) percent of everything"
                 + (isDestination ? ", \(help(for: .sync))" : "")
         )
+    }
+
+    private var storageTooltip: String {
+        var lines = Line.allCases.map { "\(title(for: $0)): \(bytes(for: $0).formattedByteCount)" }
+        if isTransferring, balance.runBytes > 0 { lines.append(runProgress) }
+        if !reading.isCurrent, let asOf = reading.asOf {
+            lines.append("Last checked \(asOf.formatted(date: .abbreviated, time: .shortened))")
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// The boundary the sync is working at: where the destination's fill ends
@@ -299,9 +311,9 @@ struct StorageBalanceView: View {
 
     // MARK: - Metrics
 
-    private var barHeight: CGFloat { style == .full ? 8 : 4 }
-    private var rowHeight: CGFloat { style == .full ? 16 : 4 }
-    private var rowSpacing: CGFloat { style == .full ? 5 : 3 }
+    private var barHeight: CGFloat { style == .compact ? 4 : 8 }
+    private var rowHeight: CGFloat { style == .compact ? 4 : 16 }
+    private var rowSpacing: CGFloat { style == .compact ? 3 : 5 }
 }
 
 /// A highlight that crosses the pending segment while bytes are actually moving, so

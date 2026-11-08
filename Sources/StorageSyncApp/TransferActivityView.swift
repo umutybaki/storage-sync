@@ -7,220 +7,223 @@ struct TransferActivityView: View {
     let job: SyncJob
     @ObservedObject var model: AppModel
     @State private var selection: Set<TransferID> = []
+    @State private var sortOrder: [KeyPathComparator<TransferActivityItem>]
+    @State private var pageNumber = "1"
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Transfers")
-                    .font(.headline)
-                Spacer()
-                Picker("Transfer filter", selection: $model.transferActivityFilter) {
-                    ForEach(TransferActivityFilter.allCases, id: \.self) { filter in
-                        Text(filter.title(count: model.transferActivityCounts[filter]))
-                            .tag(filter)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(minWidth: 410, idealWidth: 500, maxWidth: 620)
-            }
-
-            activityContent
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.background)
-                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .stroke(.separator, lineWidth: 1)
-                }
-
-            if model.transferActivityNextCursor != nil {
-                HStack {
-                    Spacer()
-                    Button(model.isLoadingTransferActivity ? "Loading…" : "Load More") {
-                        model.loadMoreTransferActivity()
-                    }
-                    .disabled(model.isLoadingTransferActivity)
-                    Spacer()
-                }
-            }
-        }
+    init(job: SyncJob, model: AppModel) {
+        self.job = job
+        self.model = model
+        _sortOrder = State(initialValue: [Self.comparator(for: model.transferActivitySort)])
     }
 
-    @ViewBuilder
-    private var activityContent: some View {
-        if model.transferActivityItems.isEmpty {
-            emptyState
-        } else {
-            Table(model.transferActivityItems, selection: $selection) {
-                TableColumn("Name") { item in
+    var body: some View {
+        VStack(spacing: 0) {
+            Table(model.transferActivityItems, selection: $selection, sortOrder: $sortOrder) {
+                TableColumn("Name", value: \.fileName) { item in
                     TransferNameCell(item: item)
                 }
-                .width(min: 220, ideal: 360)
+                .width(min: 160, ideal: 340)
 
-                TableColumn("Status") { item in
-                    TransferStatusCell(item: item)
+                TableColumn("Status", value: \.status.rawValue) { item in
+                    Label(item.activityStatusTitle, systemImage: item.activityStatusSymbol)
+                        .foregroundStyle(item.activityStatusColor)
+                        .lineLimit(1)
+                        .help(item.lastError ?? item.activityStatusTitle)
                 }
-                .width(min: 130, ideal: 160)
+                .width(min: 130, ideal: 150)
 
-                TableColumn("Progress") { item in
+                TableColumn("Progress", value: \.progressFraction) { item in
                     TransferProgressCell(item: item)
                 }
-                .width(min: 145, ideal: 185)
+                .width(min: 85, ideal: 100)
 
-                TableColumn("Size") { item in
+                TableColumn("Size", value: \.totalBytes) { item in
                     Text(ByteCountFormatter.string(fromByteCount: item.totalBytes, countStyle: .file))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
-                .width(min: 75, ideal: 95)
+                .width(min: 65, ideal: 85)
 
-                TableColumn("Updated") { item in
-                    Text(item.updatedAt.formatted(date: .omitted, time: .shortened))
-                        .monospacedDigit()
+                TableColumn("Updated", value: \.updatedAt) { item in
+                    Text(item.updatedAt.formatted(.dateTime.day().month(.abbreviated).hour().minute()))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(item.updatedAt.formatted(date: .complete, time: .standard))
                 }
-                .width(min: 72, ideal: 82)
+                .width(min: 125, ideal: 140)
             }
+            .controlSize(.small)
+            .font(.system(size: 12))
+            .tableStyle(.inset(alternatesRowBackgrounds: true))
+            .tableColumnHeaders(.visible)
+            .frame(minHeight: 0, maxHeight: .infinity)
+            .layoutPriority(-1)
             .contextMenu(forSelectionType: TransferID.self) { identifiers in
                 if let item = selectedItem(in: identifiers) {
-                    Button("Show in Finder") {
-                        model.revealInFinder(item, for: job)
-                    }
-                    .disabled(!model.canRevealInFinder(item, for: job))
+                    Button("Show in Finder") { model.revealInFinder(item, for: job) }
+                        .disabled(!model.canRevealInFinder(item, for: job))
                     Divider()
-                    Button("Copy Relative Path") {
-                        model.copyRelativePath(item.relativePath)
-                    }
+                    Button("Copy Relative Path") { model.copyRelativePath(item.relativePath) }
                 }
             } primaryAction: { identifiers in
                 guard let item = selectedItem(in: identifiers),
                       model.canRevealInFinder(item, for: job) else { return }
                 model.revealInFinder(item, for: job)
             }
+            // A new page/sort starts at its first row. Progress and revision
+            // updates preserve the current scroll position and selection.
+            .id("\(model.transferActivityPageIndex)-\(model.transferActivitySort.column.rawValue)-\(model.transferActivitySort.ascending)")
+            .overlay(alignment: .top) {
+                if model.transferActivityItems.isEmpty {
+                    emptyState.padding(.top, 48)
+                }
+            }
+
+            if model.transferActivityCounts.all > AppModel.transferActivityPageSize {
+                pagination
+            } else if model.transferActivityError != nil && !model.transferActivityItems.isEmpty {
+                errorNotice
+            }
+        }
+        .onChange(of: sortOrder) { _, order in
+            guard let first = order.first else { return }
+            let column: TransferActivitySortColumn
+            switch first.keyPath {
+            case \TransferActivityItem.fileName: column = .name
+            case \TransferActivityItem.status.rawValue: column = .status
+            case \TransferActivityItem.progressFraction: column = .progress
+            case \TransferActivityItem.totalBytes: column = .size
+            default: column = .updated
+            }
+            selection = []
+            model.transferActivitySort = TransferActivitySort(column: column, ascending: first.order == .forward)
+        }
+        .onChange(of: model.transferActivityPageIndex) { _, index in
+            selection = []
+            pageNumber = String(index + 1)
         }
     }
 
-    private var emptyState: some View {
-        ContentUnavailableView {
-            if model.isLoadingTransferActivity {
-                ProgressView()
-                Text("Loading Transfers…")
-            } else if let error = model.transferActivityError {
-                Label("Transfers Unavailable", systemImage: "exclamationmark.triangle")
-                Text(error)
+    private var pagination: some View {
+        HStack(spacing: 10) {
+            if let error = model.transferActivityError {
+                Label("Couldn’t load this page", systemImage: "exclamationmark.triangle")
+                    .help(error)
+                Button("Retry") { model.showTransferActivityPage(model.transferActivityPageIndex) }
             } else {
-                Label(emptyTitle, systemImage: emptySymbol)
+                Text(model.transferActivityItems.isEmpty && model.isLoadingTransferActivity
+                     ? "Loading page…"
+                     : "\(firstVisible.formatted())–\(lastVisible.formatted()) of \(model.transferActivityCounts.all.formatted()) items")
             }
-        } description: {
-            if model.transferActivityError == nil, !model.isLoadingTransferActivity {
-                Text(emptyDescription)
+            Spacer(minLength: 8)
+            if model.isLoadingTransferActivity {
+                ProgressView().controlSize(.mini)
+                    .accessibilityLabel("Loading page")
             }
+            Button {
+                model.showTransferActivityPage(model.transferActivityPageIndex - 1)
+            } label: { Image(systemName: "chevron.left") }
+                .disabled(model.transferActivityPageIndex == 0 || model.isLoadingTransferActivity)
+                .help("Previous page")
+                .accessibilityLabel("Previous page")
+            Text("Page")
+            TextField("Page", text: $pageNumber)
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 44)
+                .disabled(model.isLoadingTransferActivity)
+                .onSubmit {
+                    let requested = Int(pageNumber) ?? (model.transferActivityPageIndex + 1)
+                    model.showTransferActivityPage(requested > 0 ? requested - 1 : 0)
+                    pageNumber = String(model.transferActivityPageIndex + 1)
+                }
+            Text("of \(model.transferActivityPageCount.formatted())")
+            Button {
+                model.showTransferActivityPage(model.transferActivityPageIndex + 1)
+            } label: { Image(systemName: "chevron.right") }
+                .disabled(model.transferActivityPageIndex + 1 >= model.transferActivityPageCount || model.isLoadingTransferActivity)
+                .help("Next page")
+                .accessibilityLabel("Next page")
+        }
+        .font(.caption)
+        .monospacedDigit()
+        .foregroundStyle(.secondary)
+        .controlSize(.small)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    private var firstVisible: Int {
+        model.transferActivityItems.isEmpty ? 0 : model.transferActivityPageIndex * AppModel.transferActivityPageSize + 1
+    }
+
+    private var lastVisible: Int {
+        model.transferActivityPageIndex * AppModel.transferActivityPageSize + model.transferActivityItems.count
+    }
+
+    @ViewBuilder private var emptyState: some View {
+        if model.isLoadingTransferActivity {
+            ProgressView("Loading items…").controlSize(.small)
+        } else if model.transferActivityError != nil {
+            errorNotice
         }
     }
 
-    private var emptyTitle: String {
-        switch model.transferActivityFilter {
-        case .all: "No Transfers in This Check"
-        case .active: "Nothing Transferring Now"
-        case .waiting: "Nothing Waiting"
-        case .completed: "Nothing Completed Yet"
-        case .issues: "No Issues"
+    private var errorNotice: some View {
+        HStack(spacing: 8) {
+            Label("Couldn’t load items", systemImage: "exclamationmark.triangle")
+                .help(model.transferActivityError ?? "")
+            Button("Retry") { model.showTransferActivityPage(model.transferActivityPageIndex) }
         }
-    }
-
-    private var emptySymbol: String {
-        model.transferActivityFilter == .issues ? "checkmark.circle" : "tray"
-    }
-
-    private var emptyDescription: String {
-        switch model.transferActivityFilter {
-        case .all:
-            "When a check finds new or changed files, they appear here before transfer begins."
-        case .active:
-            "Files being uploaded, downloaded, or verified appear here."
-        case .waiting:
-            "Queued files and interrupted transfers appear here."
-        case .completed:
-            "Completed files remain visible until the next check begins."
-        case .issues:
-            "This check has no files that need attention or rechecking."
-        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .padding(8)
     }
 
     private func selectedItem(in identifiers: Set<TransferID>) -> TransferActivityItem? {
         guard let id = identifiers.first else { return nil }
         return model.transferActivityItems.first { $0.id == id }
     }
+
+    private static func comparator(for sort: TransferActivitySort) -> KeyPathComparator<TransferActivityItem> {
+        let order: SortOrder = sort.ascending ? .forward : .reverse
+        switch sort.column {
+        case .name: return KeyPathComparator(\.fileName, order: order)
+        case .status: return KeyPathComparator(\.status.rawValue, order: order)
+        case .progress: return KeyPathComparator(\.progressFraction, order: order)
+        case .size: return KeyPathComparator(\.totalBytes, order: order)
+        case .updated: return KeyPathComparator(\.updatedAt, order: order)
+        }
+    }
 }
 
 private struct TransferNameCell: View {
     let item: TransferActivityItem
-
-    /// Live progress republishes the whole item array many times a second, so
-    /// every visible row is rebuilt that often, and resolving a type identifier
-    /// and asking the workspace for its icon costs far more than drawing the
-    /// row does. The result only depends on the extension, so each distinct one
-    /// is looked up once. `View.body` is main-actor isolated, which is what
-    /// makes an unsynchronized dictionary safe here.
     @MainActor private static var iconsByExtension: [String: NSImage] = [:]
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(nsImage: Self.icon(forExtension: fileExtension))
+        HStack(spacing: 6) {
+            Image(nsImage: Self.icon(forExtension: (item.relativePath as NSString).pathExtension))
                 .resizable()
                 .scaledToFit()
-                .frame(width: 20, height: 20)
+                .frame(width: 16, height: 16)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(fileName)
-                    .lineLimit(1)
-                if !folder.isEmpty {
-                    Text(folder)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
+            Text(item.fileName)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
         .help(item.relativePath)
+        .accessibilityLabel(item.relativePath)
     }
 
-    private var path: NSString { item.relativePath as NSString }
-    private var fileName: String { path.lastPathComponent }
-    private var folder: String {
-        let value = path.deletingLastPathComponent
-        return value == "." ? "" : value
-    }
-    private var fileExtension: String {
-        let value = path.pathExtension
-        return value.isEmpty ? "public.data" : value
-    }
-
-    /// Extensions the workspace does not recognize are cached with the generic
-    /// icon they fall back to, so a folder full of unknown files does not repeat
-    /// the failed lookup on every emit.
-    @MainActor
-    private static func icon(forExtension fileExtension: String) -> NSImage {
-        // Filename extensions are matched case-insensitively, so folding the
-        // key keeps one entry per type rather than one per spelling.
+    @MainActor private static func icon(forExtension fileExtension: String) -> NSImage {
         let key = fileExtension.lowercased()
         if let cached = iconsByExtension[key] { return cached }
         let icon = NSWorkspace.shared.icon(for: UTType(filenameExtension: key) ?? .data)
-        iconsByExtension[key] = icon
+        // Bound the cache even when every file has a different extension.
+        if iconsByExtension.count < 256 { iconsByExtension[key] = icon }
         return icon
-    }
-}
-
-private struct TransferStatusCell: View {
-    let item: TransferActivityItem
-
-    var body: some View {
-        Label(item.activityStatusTitle, systemImage: item.activityStatusSymbol)
-            .foregroundStyle(item.activityStatusColor)
-            .lineLimit(1)
-            .help(item.lastError ?? item.activityStatusTitle)
     }
 }
 
@@ -228,78 +231,29 @@ private struct TransferProgressCell: View {
     let item: TransferActivityItem
 
     var body: some View {
-        switch item.status {
-        case .running where visibleBytes == 0 && item.totalBytes > 0:
-            HStack(spacing: 7) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("In progress")
+        if item.status == .running || (item.status == .waiting && item.completedBytes > 0) {
+            HStack(spacing: 6) {
+                ProgressView(value: Double(visibleBytes), total: Double(max(1, item.totalBytes)))
+                    .frame(width: 40)
+                Text(fraction.formatted(.percent.precision(.fractionLength(0))))
+                    .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
-            .accessibilityElement(children: .combine)
-        case .running:
-            progress
-        case .verifying:
-            Text("Verifying")
+            .help("\(ByteCountFormatter.string(fromByteCount: visibleBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: item.totalBytes, countStyle: .file))\(item.kind == .upload ? " sent" : " completed")")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(visibleBytes.formatted()) of \(item.totalBytes.formatted()) bytes \(item.kind == .upload ? "sent" : "completed")")
+        } else {
+            Text(item.status == .completed ? "100%" : item.status == .verifying ? "Verifying" : "—")
                 .foregroundStyle(.secondary)
-        case .completed:
-            Label("Complete", systemImage: "checkmark")
-                .foregroundStyle(.secondary)
-        case .waiting where item.completedBytes > 0:
-            progress
-        default:
-            Text("—")
-                .foregroundStyle(.tertiary)
-                .accessibilityLabel("No progress yet")
+                .monospacedDigit()
+                .lineLimit(1)
         }
-    }
-
-    private var progress: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            ProgressView(
-                value: Double(visibleBytes),
-                total: Double(max(1, item.totalBytes))
-            )
-            Text(
-                "\(ByteCountFormatter.string(fromByteCount: visibleBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: item.totalBytes, countStyle: .file))\(progressSuffix)"
-            )
-            .font(.caption2)
-            .monospacedDigit()
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-        }
-        .accessibilityLabel(
-            "\(visibleBytes.formatted()) of \(item.totalBytes.formatted()) bytes \(accessibilityProgressVerb)"
-        )
     }
 
     private var visibleBytes: Int64 {
-        let live = item.kind == .upload ? item.bytesSent ?? 0 : 0
-        return min(item.totalBytes, max(0, max(item.completedBytes, live)))
+        min(item.totalBytes, max(0, max(item.completedBytes, item.kind == .upload ? item.bytesSent ?? 0 : 0)))
     }
-
-    private var progressSuffix: String {
-        item.status == .running && item.kind == .upload ? " sent" : ""
-    }
-
-    private var accessibilityProgressVerb: String {
-        if item.status == .running && item.kind == .upload { return "sent" }
-        return "completed"
-    }
-}
-
-private extension TransferActivityFilter {
-    func title(count: Int) -> String {
-        let name: String
-        switch self {
-        case .all: name = "All"
-        case .active: name = "Active"
-        case .waiting: name = "Waiting"
-        case .completed: name = "Done"
-        case .issues: name = "Issues"
-        }
-        return "\(name) \(count.formatted())"
-    }
+    private var fraction: Double { Double(visibleBytes) / Double(max(1, item.totalBytes)) }
 }
 
 extension TransferActivityItem {

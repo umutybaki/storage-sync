@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.0
+
+- Simplified the sync header to a status title and compact file counts, with
+  storage bars on the right. Hover tooltips hold location details and byte
+  totals; file issues stay visible. Removed the routine copying instructions,
+  activity breakdown, and empty-list message.
+- Added Finder-style collapsible sidebar sections that remember their state.
+  Removed the sidebar toolbar button and the New menu's arrow; sidebar
+  toggling remains available through the View menu and keyboard shortcut.
+  Location creation is available from the plus menu without a duplicate
+  sidebar button.
+
+- Replaced the separate Transfers panel and filter tabs with a compact native
+  list directly below the sync summary. Column headers sort the full activity
+  batch; 500-item pages keep memory bounded, with previous/next and page jumps.
+  Added indexed numeric filename, size, progress, status, and update sorting,
+  including an additive upgrade of existing activity history.
+- Added reusable named folder and bucket locations, with automatic adoption of
+  existing syncs while preserving bookmarks, volume identities, baselines, and
+  transfer checkpoints.
+- Create Sync now chooses From and To locations, supports swapping direction,
+  and offers location setup inline. Locations can be inspected, renamed, and
+  removed when unused. Removing a sync keeps its saved locations.
+- Added a Cloudflare R2 preset that derives its endpoint and signing defaults
+  from the account ID. Live R2 transfer verification is still outstanding.
+- Saved locations now protect their shared folder permissions, bucket
+  connections, and credential dependencies from removal.
+- Copy-only behavior remains unchanged. Cloud-to-cloud transfers, mirroring,
+  and two-way sync remain future work.
+
 ## 0.5.0
 
 **Fixes from a review of the transfer path.** Three behavior changes: a file

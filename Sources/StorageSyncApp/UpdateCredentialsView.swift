@@ -98,6 +98,10 @@ struct UpdateCredentialsView: View {
                         if !isCreating {
                             Text("Leave these blank to keep using the saved keys unchanged.")
                         }
+                        let routeUsers = model.jobs.filter { $0.id != job.id && $0.connectionID == job.connectionID }
+                        if !routeUsers.isEmpty {
+                            Text("This saved bucket connection is also used by \(routeUsers.map(\.name).formatted(.list(type: .and))). Changing its credentials updates those syncs too.")
+                        }
                         if isReplacingKeys, !sharedWith.isEmpty {
                             Label(
                                 sharedWith.count == 1

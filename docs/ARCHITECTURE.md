@@ -31,6 +31,52 @@ Each job is one-way: local to S3 or S3 to local. Reconciliation never creates a 
 
 On the first pairing of a relative path, if source and destination both contain a file of the same size there, the coordinator records their observed fingerprints as the initial baseline and removes any obsolete queued copy. This lets StorageSync take over a half-completed archive without uploading or downloading the existing portion again. Once that baseline exists, later source changes are planned normally.
 
+## Locations and routes
+
+`StorageLocation` is an independently persisted configuration record with a
+`LocationID`, a name, and one immutable target:
+
+- `local(LocalRoot)` owns the folder bookmark and expected volume identity.
+- `s3(connectionID, prefix)` selects a bucket connection and its normalized prefix.
+
+`S3Connection` still owns transport configuration and a Keychain reference.
+Credentials are independent records; there is no new copy of credential material.
+`StorageProvider` supplies tested configuration presets for AWS, Cloudflare R2,
+and custom S3 endpoints. Provider labels for existing connections are inferred
+from their endpoints, so adoption does not rewrite working configurations.
+
+Jobs now carry `sourceLocationID` and `destinationLocationID`. The repository
+resolves these references when saving a job, deriving its execution direction,
+`localRoot`, `connectionID`, and `remotePrefix`. Those existing fields remain
+resolved compatibility inputs for the durable transfer engine. Saved targets
+and connection endpoints cannot be silently retargeted, so the projections do
+not diverge from their authoritative locations. Renaming a location changes no
+execution state. Reversing a job or choosing another bucket requires a new job;
+explicit folder reselection retains the existing multipart invalidation rule.
+
+The version-4 database migration creates a `locations` document table and adopts
+legacy job routes in one transaction. It reuses exact targets, preserves all job
+identities and state, and is idempotent. Similar folder paths with different
+bookmarks or volume identities are not merged. No files, bookmarks, credentials,
+manifest entries, baselines, or checkpoints are moved by this adoption.
+
+Removing a job retains saved locations, their bookmarks, and their connections.
+Removing a referenced location is refused. An unused location releases its
+bookmark only after both location and job references are checked; uncertain
+answers preserve it. Bucket connections can be removed only when neither jobs
+nor locations refer to them. Saved credentials are always retained.
+
+The XPC commands `locations`, `saveLocation`, and `removeLocation` expose
+configuration only. The UI reads locations separately so an older running agent
+does not make existing syncs disappear during an app update. New setup waits
+until the agent supports locations. The UI uses the existing native sidebar,
+grouped forms, sheets, and alerts: location setup is separate from the From/To
+sync form, and the same location editor is available inline.
+
+Only Mac-folder-to-bucket routes are executable in this version. Two cloud
+locations can be represented, but the repository rejects that route until the
+transfer engine supports it. Deletion propagation remains absent.
+
 ## Credentials
 
 A saved credential is a first-class record: an identifier, a user-chosen name, a
@@ -51,7 +97,7 @@ typed in or replaced, and the interface process never reads one back.
 
 Sharing decides the deletion rules. A saved credential outlives the syncs that
 use it and is deleted from the Credentials list only, which refuses while a sync
-still depends on it. Removing a sync cleans up a Keychain item only when no saved
+or saved location still depends on it. Removing a sync cleans up a Keychain item only when no saved
 credential owns it and no connection still refers to it; every uncertain answer
 counts as still in use, because an orphaned item is a mess and a deleted one is
 data loss.

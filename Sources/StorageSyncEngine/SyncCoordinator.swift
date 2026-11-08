@@ -272,6 +272,39 @@ public actor SyncCoordinator {
         try await repository.connections()
     }
 
+    public func locations() async throws -> [StorageLocation] {
+        try await repository.locations()
+    }
+
+    public func save(location: StorageLocation) async throws {
+        if try await repository.location(id: location.id) == nil, let root = location.localRoot {
+            let access = try await bookmarks.resolve(reference: root.bookmarkReference)
+            if let expected = root.expectedVolume {
+                _ = try VolumeInspector().validate(expected: expected, selectedURL: access.url)
+            }
+            withExtendedLifetime(access) {}
+        }
+        try await repository.saveLocation(location)
+    }
+
+    public func remove(locationID: LocationID) async throws {
+        guard let location = try await repository.location(id: locationID) else { return }
+        try await repository.removeLocation(id: locationID)
+        if let root = location.localRoot {
+            await removeBookmarkIfUnused(reference: root.bookmarkReference)
+        }
+        // The repository refuses while any other location or legacy job uses
+        // this connection. Saved credentials always outlive a location.
+        if let connectionID = location.connectionID { try? await repository.removeConnection(id: connectionID) }
+    }
+
+    private func removeBookmarkIfUnused(reference: String) async {
+        let usedByLocation = (try? await repository.locations())?.contains { $0.localRoot?.bookmarkReference == reference } ?? true
+        let usedByJob = (try? await repository.jobs())?.contains { $0.localRoot.bookmarkReference == reference } ?? true
+        guard !usedByLocation, !usedByJob else { return }
+        try? await bookmarks.remove(reference: reference)
+    }
+
     /// Proves keys and bucket work together before anything durable is written.
     ///
     /// The keys are either the ones being typed in — which is the only moment
@@ -384,8 +417,12 @@ public actor SyncCoordinator {
     public func removeCredential(id: CredentialID) async throws {
         guard let credential = try await repository.credential(id: id) else { return }
         let dependents = try await jobsUsing(credentialReference: credential.keychainReference)
-        guard dependents.isEmpty else {
-            throw CoordinatorError.credentialInUse(dependents.map(\.name))
+        let connections = try await repository.connections()
+        let locationUsers = try await repository.locations().filter { location in
+            connections.contains { $0.id == location.connectionID && $0.credentialReference == credential.keychainReference }
+        }
+        guard dependents.isEmpty && locationUsers.isEmpty else {
+            throw CoordinatorError.credentialInUse(dependents.map(\.name) + locationUsers.map(\.name))
         }
         // The secret goes first. If the record survived and the item did not,
         // the credential is visibly broken and can be deleted again; the other
@@ -570,7 +607,7 @@ public actor SyncCoordinator {
         // These cleanup operations cannot make removal fail after the durable
         // job row is gone. At worst, a harmless bookmark, credential, partial,
         // or provider-side multipart upload remains orphaned.
-        try? await bookmarks.remove(reference: job.localRoot.bookmarkReference)
+        await removeBookmarkIfUnused(reference: job.localRoot.bookmarkReference)
         if let scopedRoot {
             // The security-scoped access has to outlive the deletions, not just
             // the read of its URL, or the sandbox can revoke it mid-cleanup.
@@ -584,7 +621,8 @@ public actor SyncCoordinator {
         let connectionStillUsed = (try? await repository.jobs())?.contains {
             $0.connectionID == job.connectionID
         } ?? true
-        if !connectionStillUsed, let connection {
+        let connectionUsedByLocation = (try? await repository.locations())?.contains { $0.connectionID == job.connectionID } ?? true
+        if !connectionStillUsed && !connectionUsedByLocation, let connection {
             try? await repository.removeConnection(id: connection.id)
             await removeCredentialMaterialIfOrphaned(reference: connection.credentialReference)
         }
@@ -1891,9 +1929,9 @@ public enum CoordinatorError: Error, LocalizedError {
         case .credentialInUse(let jobNames):
             switch jobNames.count {
             case 1:
-                "“\(jobNames[0])” is using these credentials. Point that sync at other credentials, or remove it first."
+                "“\(jobNames[0])” is using these credentials. Update or remove it first."
             default:
-                "\(jobNames.count) syncs are using these credentials: \(jobNames.formatted(.list(type: .and))). Point them at other credentials, or remove them first."
+                "These syncs or locations are using these credentials: \(jobNames.formatted(.list(type: .and))). Update or remove them first."
             }
         }
     }

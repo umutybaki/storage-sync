@@ -55,6 +55,15 @@ One job exists: `Photos`, upload, `/Volumes/EXTERNAL-SSD/Camera/Photos` → buck
 
 ## Things that will bite you
 
+- **Reusable locations own folder access and bucket selections.** Jobs reference
+  source/destination location IDs; their existing `localRoot`, `connectionID`,
+  and `remotePrefix` are execution projections resolved by `saveJob`. Database
+  version 4 adopts legacy routes transactionally without touching transfer
+  state. Location targets are immutable; explicit folder reselection forks a
+  location for that job. Removing a sync must retain location-owned bookmarks
+  and connections. Removing a used location is refused. Cloud-to-cloud routes
+  remain unsupported, and the R2 preset has no live-provider verification yet.
+
 - **`manifest_conflicts` is dropped and recreated** at init when it lacks a `side` column (detected with `PRAGMA table_info`). A primary key cannot be widened in place and the table holds only state the next scan recomputes. Every installation predating 2026-08-13 takes this path on first launch.
 - **Do not set `kSecUseDataProtectionKeychain`.** It needs a team identifier this ad-hoc build does not have, and it would orphan every already-saved credential. Items are written `AfterFirstUnlockThisDeviceOnly` and non-synchronizable; the login keychain does not enforce that class, so it is a declaration, not a guarantee.
 - **`SyncCoordinator.saveCredential` is the only thing in the tree that writes a secret.** `save(connection:)` writes configuration only, so reusing saved keys sends no secret over XPC. `removeCredentialMaterialIfOrphaned` treats every uncertain answer as "still in use" — a shared credential must outlive any one sync that used it.

@@ -14,6 +14,11 @@ private struct PendingTransferProgress {
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var jobs: [SyncJob] = []
+    @Published private(set) var locations: [StorageLocation] = []
+    @Published private(set) var areLocationsAvailable = false
+    @Published var isCreatingLocation = false
+    @Published var newSyncLocation: LocationID?
+    @Published var locationPendingRemoval: StorageLocation?
     @Published private(set) var connections: [ConnectionID: S3Connection] = [:]
     @Published private(set) var snapshots: [SyncJobID: SyncSnapshot] = [:]
     /// Saved provider keys, described without their secrets. Ordered by name so
@@ -30,6 +35,8 @@ final class AppModel: ObservableObject {
             transferActivityCounts = TransferActivityCounts()
             transferActivityRevision = 0
             transferActivityNextCursor = nil
+            transferActivityPageIndex = 0
+            transferActivityBatchID = nil
             transferActivityError = nil
             requiredActivityRevision = 0
             pendingActivityRevision = nil
@@ -62,12 +69,28 @@ final class AppModel: ObservableObject {
     @Published private(set) var transferActivityNextCursor: TransferActivityCursor?
     @Published private(set) var isLoadingTransferActivity = false
     @Published private(set) var transferActivityError: String?
-    @Published var transferActivityFilter: TransferActivityFilter = .all {
+    static let transferActivityPageSize = 500
+    @Published private(set) var transferActivityPageIndex = 0
+    @Published var transferActivitySort = TransferActivitySort() {
         didSet {
-            guard transferActivityFilter != oldValue,
+            guard transferActivitySort != oldValue,
                   case .sync(let jobID) = selection else { return }
+            transferActivityPageIndex = 0
+            transferActivityItems = []
             startActivityLoad(jobID: jobID, reset: true)
         }
+    }
+
+    var transferActivityPageCount: Int {
+        max(1, (transferActivityCounts.all + Self.transferActivityPageSize - 1) / Self.transferActivityPageSize)
+    }
+
+    func showTransferActivityPage(_ index: Int) {
+        guard case .sync(let jobID) = selection, !isLoadingTransferActivity else { return }
+        transferActivityPageIndex = min(max(0, index), transferActivityPageCount - 1)
+        transferActivityItems = []
+        transferActivityError = nil
+        startActivityLoad(jobID: jobID, reset: true)
     }
 
     private let client = AgentClient()
@@ -91,6 +114,7 @@ final class AppModel: ObservableObject {
     private var activityPageWasStale = false
     private var staleActivityRetries = 0
     private var activityLoadGeneration: UInt64 = 0
+    private var transferActivityBatchID: UUID?
     private var pendingTransferProgress: [TransferID: PendingTransferProgress] = [:]
     /// When the agent first stopped answering, so a momentary gap is not
     /// mistaken for a broken registration.
@@ -152,6 +176,22 @@ final class AppModel: ObservableObject {
     var selectedJob: SyncJob? {
         guard case .sync(let id) = selection else { return nil }
         return jobs.first { $0.id == id }
+    }
+
+    var selectedLocation: StorageLocation? {
+        guard case .location(let id) = selection else { return nil }
+        return locations.first { $0.id == id }
+    }
+
+    func syncsUsing(_ location: StorageLocation) -> [SyncJob] {
+        jobs.filter { $0.sourceLocationID == location.id || $0.destinationLocationID == location.id }
+    }
+
+    func locationsUsing(_ credential: StoredCredential) -> [StorageLocation] {
+        locations.filter { location in
+            guard let id = location.connectionID else { return false }
+            return connections[id]?.credentialReference == credential.keychainReference
+        }
     }
 
     var selectedCredential: StoredCredential? {
@@ -234,33 +274,34 @@ final class AppModel: ObservableObject {
         if reset {
             transferActivityError = nil
         }
-        defer { isLoadingTransferActivity = false }
+        let loadingGeneration = activityLoadGeneration
+        defer {
+            if loadingGeneration == activityLoadGeneration { isLoadingTransferActivity = false }
+        }
 
-        let cursor = reset ? nil : transferActivityNextCursor
+        let generation = activityLoadGeneration
+        let requestedIndex = transferActivityPageIndex
+        let requestedSort = transferActivitySort
         do {
             let page = try await client.perform(
                 .transferActivityPage,
                 payload: JSONEncoder().encode(
                     TransferActivityPageRequest(
                         jobID: jobID,
-                        filter: transferActivityFilter,
-                        cursor: cursor,
-                        limit: 150
+                        limit: Self.transferActivityPageSize,
+                        sort: requestedSort,
+                        offset: requestedIndex * Self.transferActivityPageSize
                     )
                 ),
                 response: TransferActivityPage.self
             )
-            guard !Task.isCancelled,
+            guard !Task.isCancelled, generation == activityLoadGeneration,
                   case .sync(let selectedID) = selection,
                   selectedID == jobID else { return }
 
-            // A page from an older batch/revision can arrive after a push, and a
-            // continuation page can belong to a revision the list has already
-            // moved past. Neither is ever rendered, even briefly; the reload is
-            // left to `activityLoadDidFinish`, which is the only thing that
-            // starts one and is what keeps this from becoming a tight loop.
-            if page.revision < requiredActivityRevision
-                || (!reset && page.revision != transferActivityRevision) {
+            // Never render a response older than a committed revision already
+            // announced by the agent. Retry through the single load latch.
+            if page.revision < requiredActivityRevision {
                 activityPageWasStale = true
                 return
             }
@@ -268,24 +309,28 @@ final class AppModel: ObservableObject {
             transferActivityRevision = page.revision
             transferActivityCounts = page.counts
             transferActivityNextCursor = page.nextCursor
-            let loadedItems = reset
-                ? page.items
-                : Self.mergingActivityRows(transferActivityItems, page.items)
-            transferActivityItems = applyingPendingProgress(to: loadedItems)
+            let batchChanged = transferActivityBatchID != nil && transferActivityBatchID != page.batchID
+            transferActivityBatchID = page.batchID
+            let validIndex = batchChanged ? 0 : min(requestedIndex, transferActivityPageCount - 1)
+            if validIndex != requestedIndex {
+                transferActivityPageIndex = validIndex
+                transferActivityItems = []
+                activityPageWasStale = true
+                return
+            }
+            // Replace instead of append: memory stays bounded even after the
+            // user visits every page of a hundred-thousand-item check.
+            transferActivityItems = applyingPendingProgress(to: page.items)
+            let runningIDs = Set(page.items.filter { $0.status == .running }.map(\.id))
+            pendingTransferProgress = pendingTransferProgress.filter { runningIDs.contains($0.key) }
             transferActivityError = nil
         } catch is CancellationError {
             return
         } catch {
-            guard case .sync(let selectedID) = selection, selectedID == jobID else { return }
+            guard !Task.isCancelled, generation == activityLoadGeneration,
+                  case .sync(let selectedID) = selection, selectedID == jobID else { return }
             transferActivityError = error.localizedDescription
         }
-    }
-
-    func loadMoreTransferActivity() {
-        guard case .sync(let jobID) = selection,
-              transferActivityNextCursor != nil,
-              !isLoadingTransferActivity else { return }
-        startActivityLoad(jobID: jobID, reset: false)
     }
 
     private func transferActivityDidChange(jobID: SyncJobID, revision: Int64) async {
@@ -355,6 +400,13 @@ final class AppModel: ObservableObject {
               selectedID == update.jobID else { return }
         let sent = max(0, update.bytesSent)
         guard let index = transferActivityItems.firstIndex(where: { $0.id == update.transferID }) else {
+            // Retain only the small race window while a page is in flight,
+            // never live counters for every off-page file in a large job.
+            guard isLoadingTransferActivity else { return }
+            if pendingTransferProgress.count >= Self.transferActivityPageSize + 32,
+               let oldest = pendingTransferProgress.keys.first {
+                pendingTransferProgress.removeValue(forKey: oldest)
+            }
             let previous = pendingTransferProgress[update.transferID]
             pendingTransferProgress[update.transferID] = PendingTransferProgress(
                 bytesSent: max(sent, previous?.bytesSent ?? 0),
@@ -411,19 +463,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private static func mergingActivityRows(
-        _ existing: [TransferActivityItem],
-        _ next: [TransferActivityItem]
-    ) -> [TransferActivityItem] {
-        let known = Set(existing.map(\.id))
-        return existing + next.filter { !known.contains($0.id) }
-    }
-
     /// - Parameter credential: Which saved credentials the sheet should start
     ///   on. Passed when the sheet was opened from a credential, so "use these
     ///   for another sync" is one click rather than a re-selection.
-    func beginCreatingSync(using credential: StoredCredential? = nil) {
+    func beginCreatingSync(using credential: StoredCredential? = nil, location: StorageLocation? = nil) {
         newSyncCredential = credential?.id
+        newSyncLocation = location?.id
         isCreatingSync = true
     }
 
@@ -461,6 +506,7 @@ final class AppModel: ObservableObject {
             let bookmarkStore = try BookmarkStore(directory: locations.bookmarks)
             let reference = try await bookmarkStore.create(for: folderURL)
             var updated = job
+            var savedLocation = false
             do {
                 let volume = try VolumeInspector().identity(for: folderURL, createMarkerIfNeeded: true)
                 updated.localRoot = LocalRoot(
@@ -469,14 +515,23 @@ final class AppModel: ObservableObject {
                     bookmarkReference: reference,
                     expectedVolume: volume
                 )
+                let location = StorageLocation(
+                    name: StorageLocation.uniqueName(folderURL.lastPathComponent, avoiding: self.locations.map(\.name)),
+                    target: .local(updated.localRoot)
+                )
+                // A failed reply does not prove that the agent failed to
+                // commit. From here on the location may own this bookmark.
+                savedLocation = true
+                try await client.perform(.saveLocation, payload: JSONEncoder().encode(location))
+                if updated.direction == .upload { updated.sourceLocationID = location.id }
+                else { updated.destinationLocationID = location.id }
                 try await client.perform(.saveJob, payload: JSONEncoder().encode(updated))
             } catch {
-                try? await bookmarkStore.remove(reference: reference)
+                if !savedLocation { try? await bookmarkStore.remove(reference: reference) }
                 throw error
             }
-            if job.localRoot.bookmarkReference != reference {
-                try? await bookmarkStore.remove(reference: job.localRoot.bookmarkReference)
-            }
+            // The previous location owns its bookmark and can be reused by
+            // another sync. Folder reselection never revokes that access.
             await refresh()
         } catch {
             errorMessage = error.localizedDescription
@@ -540,6 +595,12 @@ final class AppModel: ObservableObject {
                     $0.name.localizedStandardCompare($1.name) == .orderedAscending
                 }
             }
+            if let loadedLocations = try? await client.perform(.locations, response: [StorageLocation].self) {
+                locations = loadedLocations.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                areLocationsAvailable = true
+            } else {
+                areLocationsAvailable = false
+            }
             rememberBalances()
             isAgentAvailable = true
             unreachableSince = nil
@@ -583,10 +644,12 @@ final class AppModel: ObservableObject {
         switch selection {
         case .sync(let id) where jobs.contains(where: { $0.id == id }):
             return
+        case .location(let id) where locations.contains(where: { $0.id == id }):
+            return
         case .credential(let id) where credentials.contains(where: { $0.id == id }):
             return
         default:
-            selection = jobs.first.map { .sync($0.id) } ?? credentials.first.map { .credential($0.id) }
+            selection = jobs.first.map { .sync($0.id) } ?? locations.first.map { .location($0.id) } ?? credentials.first.map { .credential($0.id) }
         }
     }
 
@@ -611,109 +674,93 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func createSync(_ draft: SyncDraft) async throws {
-        guard let folderURL = draft.folderURL else { throw SyncDraftError.missingFolder }
-        // Every typed field is trimmed before it is used. A value pasted from a
-        // console or a password manager often carries a trailing space or
-        // newline, and an untrimmed region or secret fails the connection test
-        // as rejected keys — the one cause the user would never suspect.
-        let region = draft.region.trimmed
-        let bucket = draft.bucket.trimmed
-        let prefix = draft.prefix.trimmed
-        let endpointText = draft.provider == .amazon ? Self.amazonEndpoint(region: region) : draft.endpoint.trimmed
-        guard let endpoint = URL(string: endpointText),
-              endpoint.user == nil,
-              endpoint.password == nil,
-              endpoint.query == nil,
-              endpoint.fragment == nil,
-              endpoint.scheme == "https" || (endpoint.scheme == "http" && endpoint.isLoopbackHost) else {
-            throw SyncDraftError.invalidEndpoint
-        }
-
-        // Keys the user is typing in now, or nothing at all when they picked
-        // credentials that are already saved. In that case the secret stays in
-        // the Keychain throughout: the agent resolves it from the reference.
-        let newKeys: S3Credentials?
-        var credentialReference: String
-        switch draft.credentialChoice {
-        case .new:
-            newKeys = S3Credentials(
-                accessKeyID: draft.accessKey.trimmingCharacters(in: .whitespacesAndNewlines),
-                secretAccessKey: draft.secretKey.trimmed,
-                sessionToken: draft.sessionToken.nilIfBlank
-            )
-            credentialReference = ""
-        case .saved(let id):
-            guard let credential = credentials.first(where: { $0.id == id }) else {
-                throw SyncDraftError.missingCredential
-            }
-            newKeys = nil
-            credentialReference = credential.keychainReference
-        }
-
-        let connectionID = ConnectionID()
-        var connection = S3Connection(
-            id: connectionID,
-            name: draft.provider == .amazon ? "Amazon S3" : endpoint.host ?? "S3 Storage",
-            endpoint: endpoint,
-            region: region,
-            bucket: bucket,
-            addressingStyle: draft.provider == .amazon && !bucket.contains(".") ? .virtualHost : .path,
-            credentialReference: credentialReference
-        )
-        // Nothing durable exists yet, so a wrong key or bucket costs only this
-        // request. New keys are checked as typed; saved ones are checked
-        // against this bucket, which is not the same question as whether they
-        // work for the sync they came from.
-        try await client.perform(
-            .testConnection,
-            payload: JSONEncoder().encode(
-                ConnectionCredentialPayload(
-                    connection: connection,
-                    credentials: newKeys,
-                    remotePrefix: SyncJob.normalizedPrefix(prefix)
-                )
-            )
-        )
-
-        let locations = try RuntimeLocations.standard()
-        try locations.prepare()
-        let bookmarkStore = try BookmarkStore(directory: locations.bookmarks)
-        let bookmarkReference = try await bookmarkStore.create(for: folderURL)
-        let volume = try VolumeInspector().identity(for: folderURL, createMarkerIfNeeded: true)
-
-        if let newKeys {
-            let saved = try await performSaveCredential(
-                id: nil,
-                name: draft.effectiveCredentialName,
-                keys: newKeys
-            )
-            connection.credentialReference = saved.keychainReference
-        }
-
-        try await client.perform(.saveConnection, payload: JSONEncoder().encode(connection))
-        let job = SyncJob(
-            name: draft.name.nilIfBlank ?? folderURL.lastPathComponent,
-            direction: draft.direction,
-            localRoot: LocalRoot(
-                displayName: folderURL.lastPathComponent,
-                fallbackPath: folderURL.path,
-                bookmarkReference: bookmarkReference,
-                expectedVolume: volume
-            ),
-            connectionID: connectionID,
-            remotePrefix: prefix
-        )
+    func createSync(name: String, sourceID: LocationID, destinationID: LocationID) async throws {
+        guard let source = locations.first(where: { $0.id == sourceID }),
+              let destination = locations.first(where: { $0.id == destinationID }) else { throw LocationError.missingLocation }
+        let local = source.localRoot != nil ? source : destination
+        let job = try SyncJob(name: name.nilIfBlank ?? local.name, source: source, destination: destination)
+        // The agent resolves the route again; the manager's snapshot is not
+        // trusted as authority for a shared folder or bucket selection.
         try await client.perform(.saveJob, payload: JSONEncoder().encode(job))
         selection = .sync(job.id)
         isCreatingSync = false
         await refresh()
     }
 
-    private static func amazonEndpoint(region: String) -> String {
-        let normalized = region.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let domain = normalized.hasPrefix("cn-") ? "amazonaws.com.cn" : "amazonaws.com"
-        return "https://s3.\(normalized).\(domain)"
+    @discardableResult
+    func createLocation(_ draft: LocationDraft) async throws -> StorageLocation {
+        guard areLocationsAvailable else { throw LocationError.missingLocation }
+        if draft.kind == .local {
+            guard let folderURL = draft.folderURL else { throw SyncDraftError.missingFolder }
+            let runtime = try RuntimeLocations.standard()
+            try runtime.prepare()
+            let bookmarks = try BookmarkStore(directory: runtime.bookmarks)
+            let reference = try await bookmarks.create(for: folderURL)
+            do {
+                let volume = try VolumeInspector().identity(for: folderURL, createMarkerIfNeeded: true)
+                let root = LocalRoot(displayName: folderURL.lastPathComponent, fallbackPath: folderURL.path,
+                                     bookmarkReference: reference, expectedVolume: volume)
+                let location = StorageLocation(name: draft.effectiveName, target: .local(root))
+                try await client.perform(.saveLocation, payload: JSONEncoder().encode(location))
+                await refresh()
+                return location
+            } catch {
+                // An XPC reply can be lost after commit. Never remove a
+                // bookmark that a saved location may already own.
+                throw error
+            }
+        }
+
+        let preset = try draft.provider.preset(region: draft.region, accountID: draft.accountID,
+                                              endpoint: draft.endpoint, bucket: draft.bucket.trimmed)
+        let newKeys: S3Credentials?
+        let credentialReference: String
+        switch draft.credentialChoice {
+        case .new:
+            newKeys = S3Credentials(accessKeyID: draft.accessKey.trimmed,
+                                   secretAccessKey: draft.secretKey.trimmed,
+                                   sessionToken: draft.sessionToken.nilIfBlank)
+            credentialReference = ""
+        case .saved(let id):
+            guard let credential = credentials.first(where: { $0.id == id }) else { throw SyncDraftError.missingCredential }
+            newKeys = nil
+            credentialReference = credential.keychainReference
+        }
+        var connection = S3Connection(name: draft.provider.displayName, endpoint: preset.endpoint,
+                                      region: preset.region, bucket: draft.bucket.trimmed,
+                                      addressingStyle: preset.addressingStyle, credentialReference: credentialReference)
+        try await test(connection: connection, credentials: newKeys, prefix: draft.prefix.trimmed)
+        if let newKeys {
+            connection.credentialReference = try await performSaveCredential(id: nil, name: draft.effectiveCredentialName, keys: newKeys).keychainReference
+        }
+        try await client.perform(.saveConnection, payload: JSONEncoder().encode(connection))
+        let location = StorageLocation(name: draft.effectiveName, target: .s3(connectionID: connection.id, prefix: draft.prefix.trimmed))
+        try await client.perform(.saveLocation, payload: JSONEncoder().encode(location))
+        await refresh()
+        return location
+    }
+
+    func locationSummary(_ location: StorageLocation) -> String {
+        if let root = location.localRoot { return root.fallbackPath }
+        guard let id = location.connectionID, let connection = connections[id] else { return "Bucket unavailable" }
+        let prefix = location.remotePrefix ?? ""
+        let path = prefix.isEmpty ? connection.bucket : "\(connection.bucket)/\(prefix)"
+        return "\(StorageProvider.identify(endpoint: connection.endpoint).displayName) · \(path)"
+    }
+
+    func renameLocation(_ location: StorageLocation, to name: String) async throws {
+        var updated = location
+        updated.name = name
+        try await client.perform(.saveLocation, payload: JSONEncoder().encode(updated))
+        await refresh()
+    }
+
+    func removeLocation(_ location: StorageLocation) async {
+        locationPendingRemoval = nil
+        do {
+            try await client.perform(.removeLocation, payload: JSONEncoder().encode(LocationCommandPayload(locationID: location.id)))
+            await refresh()
+        } catch { errorMessage = error.localizedDescription }
     }
 
     func pause(_ job: SyncJob) async {
@@ -943,6 +990,10 @@ final class AppModel: ObservableObject {
             guard let connection = connections[job.connectionID] else { continue }
             return (connection, job.remotePrefix)
         }
+        for location in locationsUsing(credential) {
+            guard let id = location.connectionID, let connection = connections[id] else { continue }
+            return (connection, location.remotePrefix ?? "")
+        }
         return nil
     }
 
@@ -1116,6 +1167,7 @@ enum ActiveAppModel {
 enum ManagerSelection: Hashable {
     case sync(SyncJobID)
     case credential(CredentialID)
+    case location(LocationID)
 }
 
 /// Which credentials a sync should use: ones already saved, or ones being
@@ -1144,73 +1196,59 @@ enum CredentialEditorRequest: Identifiable, Hashable {
     }
 }
 
-enum StorageProvider: String, CaseIterable, Identifiable {
-    case amazon = "Amazon S3"
-    case compatible = "Other S3-compatible"
+enum LocationKind: String, CaseIterable, Identifiable {
+    case local = "Mac Folder"
+    case cloud = "Cloud Bucket"
     var id: String { rawValue }
 }
 
-struct SyncDraft {
-    /// Left blank on purpose. An empty name takes the chosen folder's name,
-    /// which is what people expect and one less field to fill in.
+struct LocationDraft {
+    var kind: LocationKind = .cloud
     var name = ""
     var provider: StorageProvider = .amazon
-    var endpoint = "https://s3.amazonaws.com"
+    var endpoint = ""
     var region = "us-east-1"
+    var accountID = ""
     var bucket = ""
-    var prefix = "photos"
+    var prefix = ""
     var credentialChoice: CredentialChoice = .new
     var credentialName = ""
     var accessKey = ""
     var secretKey = ""
     var sessionToken = ""
-    var direction: SyncDirection = .upload
     var folderURL: URL?
 
     var isCreatingCredential: Bool { credentialChoice == .new }
 
-    func isComplete(existingCredentialNames: [String]) -> Bool {
-        missingRequirement(existingCredentialNames: existingCredentialNames) == nil
-    }
-
-    /// Says what is still missing instead of leaving a dimmed button with no
-    /// explanation. Ordered the same way the form is read, top to bottom.
-    func missingRequirement(existingCredentialNames: [String]) -> String? {
-        if folderURL == nil { return "Choose a folder on this Mac." }
-        if provider == .compatible && URL(string: endpoint) == nil {
-            return "Enter the storage endpoint address."
+    func missingRequirement(existingCredentialNames: [String], existingLocationNames: [String]) -> String? {
+        if kind == .local && folderURL == nil { return "Choose a folder on this Mac." }
+        if kind == .cloud {
+            if bucket.trimmed.isEmpty { return "Enter the bucket name." }
+            do { _ = try provider.preset(region: region, accountID: accountID, endpoint: endpoint, bucket: bucket.trimmed) }
+            catch { return error.localizedDescription }
         }
-        if region.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "Enter the bucket’s region."
+        if effectiveName.isEmpty { return "Enter a name for this location." }
+        if existingLocationNames.contains(where: { $0.localizedCaseInsensitiveCompare(effectiveName) == .orderedSame }) {
+            return "A location named “\(effectiveName)” already exists. Choose another name."
         }
-        if bucket.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "Enter the bucket name."
-        }
-        guard isCreatingCredential else { return nil }
-        if accessKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || secretKey.trimmed.isEmpty {
-            return "Enter the access key and secret key."
-        }
-        // The agent refuses a duplicate name rather than quietly numbering it,
-        // so the sheet has to say so before the keys are sent anywhere.
-        let name = effectiveCredentialName.lowercased()
-        if existingCredentialNames.contains(where: { $0.lowercased() == name }) {
+        guard kind == .cloud && isCreatingCredential else { return nil }
+        if accessKey.trimmed.isEmpty || secretKey.trimmed.isEmpty { return "Enter the access key and secret key." }
+        if existingCredentialNames.contains(where: { $0.localizedCaseInsensitiveCompare(effectiveCredentialName) == .orderedSame }) {
             return "Credentials named “\(effectiveCredentialName)” already exist. Choose another name."
         }
         return nil
     }
 
-    /// The name this sync will end up with, including the folder fallback.
     var effectiveName: String {
-        let typed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !typed.isEmpty { return typed }
-        return folderURL?.lastPathComponent ?? ""
+        if let name = name.nilIfBlank { return name }
+        if kind == .local { return folderURL?.lastPathComponent ?? "" }
+        let prefix = SyncJob.normalizedPrefix(prefix.trimmed)
+        return prefix.isEmpty ? bucket.trimmed : "\(bucket.trimmed)/\(prefix)"
     }
 
-    /// The name new credentials will be saved under. Falls back to the provider
-    /// so the common single-account case needs no answer at all.
     var effectiveCredentialName: String {
         let typed = StoredCredential.normalizedName(credentialName)
-        return typed.isEmpty ? provider.rawValue : typed
+        return typed.isEmpty ? provider.displayName : typed
     }
 }
 
@@ -1239,13 +1277,6 @@ enum CredentialUpdateError: Error, LocalizedError {
         case .missingCredential: "Those saved credentials are no longer available. Choose another set."
         case .missingKeys: "Enter the access key and secret key."
         }
-    }
-}
-
-private extension URL {
-    var isLoopbackHost: Bool {
-        guard let host = host?.lowercased() else { return false }
-        return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
     }
 }
 
